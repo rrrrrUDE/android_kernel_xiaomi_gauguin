@@ -24,7 +24,6 @@
  */
 /* max queue in one round of service */
 static const int cfq_quantum = 64;
->>>>>>> 31ae80c89e89 (cfq-iosched: Apply RedHat suggested tunings for fast storage)
 static const u64 cfq_fifo_expire[2] = { NSEC_PER_SEC / 4, NSEC_PER_SEC / 8 };
 /* maximum backwards seek, in KiB */
 static const int cfq_back_max = 4096;
@@ -34,7 +33,7 @@ static const u64 cfq_slice_sync = NSEC_PER_SEC / 10;
 static u64 cfq_slice_async = NSEC_PER_SEC / 25;
 static const int cfq_slice_async_rq = 2;
 static u64 cfq_slice_idle = 0;
-static u64 cfq_group_idle = NSEC_PER_SEC / 125;
+static u64 cfq_group_idle = 1;
 static const u64 cfq_target_latency = (u64)NSEC_PER_SEC * 3/10; /* 300 ms */
 static const int cfq_hist_divisor = 4;
 
