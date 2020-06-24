@@ -22,7 +22,7 @@ obj-vdso := $(addprefix $(obj)/, $(obj-vdso))
 # routines, as x86 does (see 6f121e548f83 ("x86, vdso: Reimplement vdso.so
 # preparation in build-time C")).
 ldflags-y := -shared -nostdlib -soname=linux-vdso.so.1 --hash-style=sysv \
-		-Bsymbolic --eh-frame-hdr --build-id=sha1 -n -T
+		-Bsymbolic $(call ld-option, --no-eh-frame-hdr) --build-id=sha1 -n -T
 
 ccflags-y += $(DISABLE_LTO)
 
