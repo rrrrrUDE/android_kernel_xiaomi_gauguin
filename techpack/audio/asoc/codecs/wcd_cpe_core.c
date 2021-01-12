@@ -4159,6 +4159,7 @@ static int wcd_cpe_send_afe_cal(void *core_handle,
 		struct cmi_hdr *hdr = &(obm_msg.hdr);
 		struct cmi_obm *pld = &(obm_msg.pld);
 
+		memset(&obm_msg, 0, sizeof(obm_msg));
 		rc = wcd_cpe_afe_shmem_alloc(core, port_d,
 					afe_cal->cal_data.size);
 		if (rc) {
