@@ -23,7 +23,8 @@
  * tunables
  */
 /* max queue in one round of service */
-static const int cfq_quantum = 32;
+static const int cfq_quantum = 64;
+>>>>>>> 31ae80c89e89 (cfq-iosched: Apply RedHat suggested tunings for fast storage)
 static const u64 cfq_fifo_expire[2] = { NSEC_PER_SEC / 4, NSEC_PER_SEC / 8 };
 /* maximum backwards seek, in KiB */
 static const int cfq_back_max = 4096;
