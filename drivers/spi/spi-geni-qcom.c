@@ -987,14 +987,14 @@ static int spi_geni_prepare_transfer_hardware(struct spi_master *spi)
 		if (mas->gsi_mode) {
 			mas->tx = dma_request_slave_channel(mas->dev, "tx");
 			if (IS_ERR_OR_NULL(mas->tx)) {
-				dev_info(mas->dev,
+				dev_dbg(mas->dev,
 					"Failed to get tx DMA ch %ld\n",
 							PTR_ERR(mas->tx));
 				goto setup_ipc;
 			}
 			mas->rx = dma_request_slave_channel(mas->dev, "rx");
 			if (IS_ERR_OR_NULL(mas->rx)) {
-				dev_info(mas->dev, "Failed to get rx DMA ch %ld\n",
+				dev_dbg(mas->dev, "Failed to get rx DMA ch %ld\n",
 							PTR_ERR(mas->rx));
 				dma_release_channel(mas->tx);
 				goto setup_ipc;
@@ -1038,7 +1038,7 @@ static int spi_geni_prepare_transfer_hardware(struct spi_master *spi)
 		}
 setup_ipc:
 		mas->ipc = ipc_log_context_create(4, dev_name(mas->dev), 0);
-		dev_info(mas->dev, "tx_fifo %d rx_fifo %d tx_width %d\n",
+		dev_dbg(mas->dev, "tx_fifo %d rx_fifo %d tx_width %d\n",
 			mas->tx_fifo_depth, mas->rx_fifo_depth,
 			mas->tx_fifo_width);
 		if (!mas->shared_ee)
@@ -1758,7 +1758,7 @@ static int spi_geni_probe(struct platform_device *pdev)
 		if (!of_property_read_u32(pdev->dev.of_node,
 				"qcom,miso-sampling-ctrl-val",
 				&geni_mas->miso_sampling_ctrl_val))
-			dev_info(&pdev->dev, "MISO_SAMPLING_SET: %d\n",
+			dev_dbg(&pdev->dev, "MISO_SAMPLING_SET: %d\n",
 				geni_mas->miso_sampling_ctrl_val);
 	}
 
