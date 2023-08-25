@@ -6,6 +6,12 @@ config QCA_CLD_WLAN
 	help
 	  Add support for the Qualcomm Atheros CLD WLAN module
 
+config WLAN_DEBUG
+	tristate "Debug Qualcomm WLAN Module"
+	default n
+	help
+	  Add support for the Debugging Qualcomm WLAN Module
+
 if QCA_CLD_WLAN != n
 
 config QCA_CLD_WLAN_PROFILE
