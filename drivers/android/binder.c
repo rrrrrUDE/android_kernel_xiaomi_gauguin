@@ -5063,6 +5063,7 @@ static int binder_ioctl_get_node_debug_info(struct binder_proc *proc,
 	return 0;
 }
 
+#if 0
 static bool binder_txns_pending_ilocked(struct binder_proc *proc)
 {
 	struct rb_node *n;
@@ -5156,6 +5157,7 @@ static int binder_ioctl_get_freezer_info(
 
 	return 0;
 }
+#endif
 
 static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
