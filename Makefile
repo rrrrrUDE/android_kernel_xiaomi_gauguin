@@ -798,6 +798,18 @@ KBUILD_CFLAGS += $(call cc-disable-warning, unused-but-set-variable)
 
 KBUILD_CFLAGS += $(call cc-disable-warning, unused-const-variable)
 
+KBUILD_CFLAGS += $(call cc-disable-warning, unused-variable)
+
+KBUILD_CFLAGS += $(call cc-disable-warning, unused-function)
+
+KBUILD_CFLAGS += $(call cc-disable-warning, unused-label)
+
+KBUILD_CFLAGS += $(call cc-disable-warning, unused-parameter)
+
+KBUILD_CFLAGS += $(call cc-disable-warning, unused-result)
+
+KBUILD_CFLAGS += $(call cc-disable-warning, unused-value)
+
 # These result in bogus false positives
 KBUILD_CFLAGS += $(call cc-disable-warning, dangling-pointer)
 
