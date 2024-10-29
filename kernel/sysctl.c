@@ -808,7 +808,7 @@ static struct ctl_table kern_table[] = {
 		.procname	= "sched_rr_timeslice_ms",
 		.data		= &sysctl_sched_rr_timeslice,
 		.maxlen		= sizeof(int),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= sched_rr_handler,
 	},
 #ifdef CONFIG_UCLAMP_TASK
