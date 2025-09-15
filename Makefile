@@ -810,6 +810,8 @@ KBUILD_CFLAGS += $(call cc-disable-warning, unused-result)
 
 KBUILD_CFLAGS += $(call cc-disable-warning, unused-value)
 
+KBUILD_CFLAGS += $(call cc-disable-warning, missing-attributes)
+
 # These result in bogus false positives
 KBUILD_CFLAGS += $(call cc-disable-warning, dangling-pointer)
 
