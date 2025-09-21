@@ -405,7 +405,7 @@ static void qmi_invoke_handler(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 	if (!handler->fn)
 		return;
 
-	dest = kzalloc(handler->decoded_size, GFP_KERNEL);
+	dest = kvzalloc(handler->decoded_size, GFP_KERNEL);
 	if (!dest)
 		return;
 
@@ -415,7 +415,7 @@ static void qmi_invoke_handler(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 	else
 		handler->fn(qmi, sq, txn, dest);
 
-	kfree(dest);
+	kvfree(dest);
 }
 
 /**
