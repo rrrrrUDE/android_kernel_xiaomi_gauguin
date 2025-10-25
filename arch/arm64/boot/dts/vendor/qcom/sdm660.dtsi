@@ -2409,6 +2409,7 @@
 
 	qcom_tzlog: tz-log@146bf720 {
 		compatible = "qcom,tz-log";
+		status = "disabled";
 		reg = <0x146bf720 0x3000>;
 		qcom,hyplog-enabled;
 		hyplog-address-offset = <0x410>;
