@@ -1,5 +1,14 @@
 # 正在施工中 #
 # PurpleMi Kernel #
+
+## 反馈bug或提建议（如改进内核或者添加功能）
+
+1.提交Issues
+
+2.发送邮件至xkandemo666@outlook.com或xkandemo666@gmail.com
+
+3.加入组织 tg群：@PurpleMi_Kernel_OfficialGroup, QQ目前封了没法创群😭😭😭（请输入文本）
+
 适用机型（Supported Models）：红米 Note 9 Pro（gauguinpro）
 
 系统范围（System Scope）：Android 11 - 16 QPR0（不限底子，实测ColorOS15能正常开机）
