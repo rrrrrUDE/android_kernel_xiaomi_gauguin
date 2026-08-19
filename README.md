@@ -31,6 +31,14 @@ SusFS：是（yes）
 | **尽情期待** | 尽情期待（Coming soon） |
 
 ## Bug
-## 1.应用/终端 无法正确访问 /sdcard（App/Shell can‘t access /sdcard）（严重 Critical）
+## 1.应用/终端 无法正确访问 /sdcard（App/Shell can‘t access /sdcard correctly）（严重 Critical）
+
+MT管理器可以访问/sdcard（已授权Root，没有测试普通权限）
+
+![图片](Photos/1.jpg)
+
+游戏启动时显示没有空间，部分app会显示无法访问存储卡
+
+![图片](Photos/0.png)
 
 ## 2.你告诉我
