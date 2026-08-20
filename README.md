@@ -16,8 +16,8 @@ REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 原仓库（Original Storage）：https://github.com/Fucking-Projekt/android_kernel_xiaomi_gauguin 
 
 
-> 由于精力有限 + 我是小白 + 内核有严重bug，短时间内不会发布release 
->> Due to limited time and energy + I’m a complete beginner when it comes to Android kernels + there are some critical bugs in the kernel, I won’t be releasing a release anytime soon.
+> 由于精力有限 + 我是小白 + 内核有bug，短时间内不会发布release 
+>> Due to limited time and energy + I’m a complete beginner when it comes to Android kernels + there are some bugs in the kernel, I won’t be releasing a release anytime soon.
 
 ## 内核信息与支持(Kernel Information & Support)
 
