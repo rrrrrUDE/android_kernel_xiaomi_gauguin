@@ -27,8 +27,11 @@ REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 
 
 ROOT方案（ROOT Solution）：ReSukiSU（Inline Hook）
+>尚未开工（Not Started Yet）
 
 SusFS：是（yes）
+
+>尚未开工（Not Started Yet）
 
 KPatch支持（KernelPatch Support）：是（yes）
 
