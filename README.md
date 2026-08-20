@@ -1,5 +1,6 @@
 # 正在施工中 #
 # PurpleMi Kernel #
+REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 
 ## 反馈bug或提建议（如改进内核或者添加功能）
 
@@ -7,18 +8,18 @@
 
 2.发送邮件至xkandemo666@outlook.com或xkandemo666@gmail.com
 
-3.加入组织 tg群：@PurpleMi_Kernel_OfficialGroup, QQ目前封了没法创群😭😭😭（请输入文本）
 
-适用机型（Supported Models）：红米 Note 9 Pro（gauguinpro）
+适用机型（Supported Models）：REDMI Note 9 Pro（gauguinpro）
 
 系统范围（System Scope）：Android 11 - 16 QPR0（不限底子，实测ColorOS15能正常开机）
 
 原仓库（Original Storage）：https://github.com/Fucking-Projekt/android_kernel_xiaomi_gauguin 
 
 
-## 目前只移除了原仓库中里的SukiSU Ultra + SusFS 1.5.12（为后面的ReSukiSU + SusFS做铺路）并添加了ZRAM LZO和KernelPatch支持，尽情期待
-## So far, we’ve only removed SukiSU Ultra + SusFS 1.5.12 from the original repository to pave the way for the upcoming ReSukiSU + SusFS, while also adding support for ZRAM LZO and KernelPatch. Stay tuned!
+> 由于精力有限 + 我是小白 + 内核有严重bug，短时间内不会发布release 
+>> Due to limited time and energy + I’m a complete beginner when it comes to Android kernels + there are some critical bugs in the kernel, I won’t be releasing a release anytime soon.
 
+## 内核信息与支持(Kernel Information & Support)
 
 | 内核版本（Kernel Version） | 
 |----------------|
@@ -31,6 +32,9 @@ SusFS：是（yes）
 
 支持KernelPatch（Support KernelPatch）：是（yes）
 
+内存压缩算法支持(Supported Memory Compression Algorithms)：LZ4, LZ4KD, LZO, ZSTD
+
+默认内存压缩算法(Default Memory Compression Algorithm)：LZ4KD
 
 ## 内置组件与功能（Kernel-Integrated Components & Features）
 | 功能（Function） | 状态（Status） |
@@ -38,17 +42,6 @@ SusFS：是（yes）
 | **ReKernel** | 尚未开工（Not Started Yet） |
 | **DroidSpaces** | 尚未开工（Not Started Yet） |
 | **BBG（BaseBand Guard）** | 尚未开工（Not Started Yet） |
-| **尽情期待（Stay tuned）** | 尽情期待（Stay tuned） |
+> 后续还会加入更多功能，敬请期待! 
+>> More features are coming. Stay tuned!
 
-## Bug
-## 1.应用/终端 无法正确访问 /sdcard（App/Shell can‘t access /sdcard correctly）（严重 Critical）
-
-MT管理器可以访问/sdcard（已授权Root，没有测试普通权限）
-
-![图片](Photos/1.jpg)
-
-游戏启动时显示没有空间（这里拿rhythm hive来演示），部分app会显示无法访问存储卡
-
-![图片](Photos/0.png)
-
-## 2.你告诉我 （You tell me）
