@@ -30,7 +30,7 @@ ROOT方案（ROOT Solution）：ReSukiSU（Inline Hook）
 
 SusFS：是（yes）
 
-支持KernelPatch（Support KernelPatch）：是（yes）
+KPatch支持（KernelPatch Support）：是（yes）
 
 内存压缩算法支持(Supported Memory Compression Algorithms)：LZ4, LZ4KD, LZO, ZSTD
 
