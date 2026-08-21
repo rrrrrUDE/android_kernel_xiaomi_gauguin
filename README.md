@@ -27,11 +27,8 @@ REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 
 
 ROOT方案（ROOT Solution）：ReSukiSU（Inline Hook）
->尚未开工（Not Started Yet）
 
 SusFS：是（yes）
-
->尚未开工（Not Started Yet）
 
 KPatch支持（KernelPatch Support）：是（yes）
 
@@ -42,9 +39,9 @@ KPatch支持（KernelPatch Support）：是（yes）
 ## 内置组件与功能（Kernel-Integrated Components & Features）
 | 功能（Function） | 状态（Status） |
 |---------|-------------|
-| **ReKernel** | 尚未开工（Not Started Yet） |
-| **DroidSpaces** | 尚未开工（Not Started Yet） |
-| **BBG（BaseBand Guard）** | 尚未开工（Not Started Yet） |
+| **ReKernel** | ✅ |
+| **DroidSpaces** | ✅ |
+| **BBG（BaseBand Guard）** | ✅ |
 > 后续还会加入更多功能，敬请期待! 
 >> More features are coming. Stay tuned!
 
