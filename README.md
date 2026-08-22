@@ -36,12 +36,15 @@ KPatch支持（KernelPatch Support）：是（yes）
 
 默认内存压缩算法(Default Memory Compression Algorithm)：LZ4KD
 
+CPU调度器：BORE v5.1.0-r2
+
 ## 内置组件与功能（Kernel-Integrated Components & Features）
 | 功能（Function） | 状态（Status） |
 |---------|-------------|
 | **ReKernel** | ✅ |
 | **DroidSpaces** | ⚠️ |
 | **BBG（BaseBand Guard）** | ✅ |
+| **NoMount** | ✅ |
 > ✅:已启用（Enabled） ⚠️:存在问题或不工作（Have Bugs/Didn't Work） ❌：已禁用或未内置（Disabled/None Integrate）
 >
 > 后续还会加入更多功能，敬请期待! 
