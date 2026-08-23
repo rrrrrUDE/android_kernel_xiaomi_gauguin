@@ -1,5 +1,6 @@
 # 正在施工中 #
 # PurpleMi Kernel #
+# Based on Carlotta kernel project #
 REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 
 ## 反馈bug或提建议（如改进内核或者添加功能）
