@@ -25,7 +25,7 @@ REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 |----------------|
 | 4.19.325-PurpleMiKernel-ForGauguinpro |
 
-CPU调度器：BORE v5.1.0-r2
+CPU调度器（CPU Scheduling）：BORE v5.1.0-r2(mainline分支) / EAS+WALT（waltcpuscheduling分支）
 
 ROOT方案（ROOT Solution）：ReSukiSU（Inline Hook）
 
@@ -41,7 +41,7 @@ KPatch支持（KernelPatch Support）：是（yes）
 | 功能（Function） | 状态（Status） |
 |---------|-------------|
 | **ReKernel** | ✅ |
-| **DroidSpaces** | ⚠️ |
+| **DroidSpaces** | ✅ |
 | **BBG（BaseBand Guard）** | ✅ |
 | **NoMount** | ✅ |
 > ✅:已启用（Enabled） ⚠️:正在测试（Testing） ❌：已禁用或未内置（Disabled/None Integrate）
