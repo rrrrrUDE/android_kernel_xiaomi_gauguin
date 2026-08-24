@@ -20,6 +20,29 @@ REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 > 由于精力有限 + 我是小白 + 内核有bug，短时间内不会发布release 
 >> Due to limited time and energy + I’m a complete beginner when it comes to Android kernels + there are some bugs in the kernel, I won’t be releasing a release anytime soon.
 
+## 构建（Build）
+编译环境(Build Environment)：Ubuntu 26.04 LTS
+Make: 4.4.1
+Clang: 21.1.8
+GCC: 15.2.0
+
+确认你的编译环境已经准备就绪后，执行以下命令
+
+```
+export SUBARCH=arm64
+export ARCH=arm64
+export LD=ld.lld
+export CC=clang
+export LLVM=1
+export LLVM_IAS=1
+```
+执行后如果无输出，执行以下命令编译内核
+
+```
+make O=out gauguin_defconfig
+make O=out -j2
+```
+
 ## 内核信息与支持(Kernel Information & Support)
 
 | 内核版本（Kernel Version） | 
@@ -31,8 +54,6 @@ CPU调度器（CPU Scheduling）：BORE v5.1.0-r2(mainline分支) / EAS+WALT（w
 ROOT方案（ROOT Solution）：ReSukiSU（Inline Hook）
 
 SusFS：是（yes）
-
-KPatch支持（KernelPatch Support）：是（yes）
 
 内存压缩算法支持(Supported Memory Compression Algorithms)：LZ4, LZ4KD, ZSTD
 
