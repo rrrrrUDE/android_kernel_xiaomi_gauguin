@@ -26,7 +26,7 @@ REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 |----------------|
 | 4.19.325-PurpleMiKernel-ForGauguinpro |
 
-CPU调度器（CPU Scheduling）：BORE v5.1.0-r2(mainline分支) / EAS+WALT（waltcpuscheduler分支）
+CPU调度器（CPU Scheduling）：BORE v5.1.0-r2(mainline分支) / EAS+WALT（waltsched分支）
 
 ROOT方案（ROOT Solution）：ReSukiSU（Inline Hook）
 
