@@ -100,6 +100,10 @@ extern void unlock_rename(struct dentry *, struct dentry *);
 
 extern void nd_jump_link(struct path *path);
 
+extern int filename_lookup(int dfd, struct filename *name,
+			   unsigned flags, struct path *path,
+			   struct path *root);
+
 static inline void nd_terminate_link(void *name, size_t len, size_t maxlen)
 {
 	((char *) name)[min(len, maxlen)] = '\0';
