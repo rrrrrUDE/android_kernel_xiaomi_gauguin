@@ -16,15 +16,12 @@ REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 
 原仓库（Original Storage）：https://github.com/Fucking-Projekt/android_kernel_xiaomi_gauguin 
 
-
-> 由于精力有限 + 我是小白 + 内核有bug，短时间内不会发布release 
->> Due to limited time and energy + I’m a complete beginner when it comes to Android kernels + there are some bugs in the kernel, I won’t be releasing a release anytime soon.
-
 ## 构建（Build）
 编译环境(Build Environment)：Ubuntu 26.04 LTS
 Make: 4.4.1
 Clang: 21.1.8
 GCC: 15.2.0
+(只要是最新版的clang、gcc和make就能编译)
 
 确认你的编译环境已经准备就绪后，执行以下命令
 
