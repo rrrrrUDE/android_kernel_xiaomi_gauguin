@@ -12,7 +12,7 @@ REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
 
 适用机型（Supported Models）：REDMI Note 9 Pro（gauguinpro）
 
-系统范围（System Scope）：Android 12 - 16 QPR0（不限底子，实测ColorOS15能正常开机）
+系统范围（System Scope）：Android 12 - 16 QPR0（不限底子，实测ColorOS15能正常开机，LineageOS未测试）
 
 原仓库（Original Storage）：https://github.com/Fucking-Projekt/android_kernel_xiaomi_gauguin 
 
