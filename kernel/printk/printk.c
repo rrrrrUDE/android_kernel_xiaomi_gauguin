@@ -36,6 +36,7 @@
 #include <linux/kdb.h>
 #include <linux/ratelimit.h>
 #include <linux/kmsg_dump.h>
+#include <linux/pstore_screen_log.h>
 #include <linux/syslog.h>
 #include <linux/cpu.h>
 #include <linux/rculist.h>
@@ -421,6 +422,26 @@ static u32 log_first_idx;
 /* index and sequence number of the next record to store in the buffer */
 static u64 log_next_seq;
 static u32 log_next_idx;
+
+/* 4.19 compatibility: pstore-screen reads the legacy printk ring directly. */
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_LOG_CAPTURE)
+bool pstore_screen_printk_ring_ready(void)
+{
+	return true;
+}
+
+void pstore_screen_printk_snapshot_window(struct kmsg_dumper *dumper)
+{
+	unsigned long flags;
+
+	logbuf_lock_irqsave(flags);
+	dumper->cur_seq = log_first_seq;
+	dumper->cur_idx = log_first_idx;
+	dumper->next_seq = log_next_seq;
+	dumper->next_idx = log_next_idx;
+	logbuf_unlock_irqrestore(flags);
+}
+#endif
 
 /* the next printk record to write to the console */
 static u64 console_seq;

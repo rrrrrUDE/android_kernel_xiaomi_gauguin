@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config PSTORE_SCREEN
+	bool "Panic-safe pstore screen common core"
+	help
+	  Build the allocation-free common text, layout, PSLC, QR and software
+	  rendering core used by the Android GKI pstore panic screen. Display,
+	  log capture and input providers are added by later integration patches.
+	  All panic-time work buffers are supplied by the caller and no external
+	  font or userspace service is required.
+
+config PSTORE_SCREEN_DISPLAY
+	bool "Panic-safe typed scanout and display-provider registry"
+	depends on PSTORE_SCREEN
+	help
+	  Add the allocation-free typed scanout writer and the stable-sidecar
+	  display-provider registry. Providers are prepared in normal context;
+	  panic-time reserve, final check, enter, write-span, flush and release
+	  callbacks are admitted by independent capability bits and do not acquire
+	  DRM modeset locks. Provider descriptors use a versioned known-prefix ABI.
+
+config PSTORE_SCREEN_DRM_SIDECAR
+	tristate "DRM stable-sidecar adapter"
+	depends on PSTORE_SCREEN_DISPLAY && DRM
+	help
+	  Validate and pin the description of a driver-owned, linear, single-plane
+	  DRM framebuffer whose mapping already exists. The display driver remains
+	  responsible for any panic-safe controller switch or cache flush. This
+	  does not add fields to DRM public structures and does not infer safety
+	  from an arbitrary active GEM buffer. It may be built as a module when
+	  the GKI DRM core is modular; provider callback owners remain pinned from
+	  normal-context registration through framebuffer, GEM and DRM teardown.
+	  Its descriptor also uses a versioned known-prefix ABI and propagates only
+	  the callback capabilities explicitly certified by the display driver.
+
+config PSTORE_SCREEN_LOG_CAPTURE
+	bool "Frozen panic kmsg tail"
+	depends on PSTORE_SCREEN && PRINTK
+	depends on LOG_BUF_SHIFT >= 19
+	default n
+	help
+	  Register a built-in panic kmsg dumper which consumes the 5.10 core's
+	  preinitialized sequence window with the private non-exported nolock line
+	  reader. It retains the exact final 256 KiB of canonical syslog-formatted
+	  text even when PSTORE is disabled. The printk dynamic ring must activate
+	  with at least 524288 descriptors; allocation failure leaves capture
+	  unavailable. No ramoops address is inferred or required.
+
+config PSTORE_SCREEN_PSTORE_MIRROR
+	bool "Mirror existing pstore records for the panic screen"
+	depends on PSTORE_SCREEN_LOG_CAPTURE && PSTORE
+	default y
+	help
+	  Copy existing pstore records only from normal context after decompression
+	  and ECC handling. The panic path consumes a preallocated frozen mirror and
+	  never traverses pstore, VFS or backend storage.
+
+config PSTORE_SCREEN_PANIC
+	bool "Panic screen orchestration and panic-safe key state machine"
+	depends on PSTORE_SCREEN_DISPLAY && PSTORE_SCREEN_LOG_CAPTURE
+	default n
+	help
+	  Enter the selected display provider after the panic kmsg dumper has
+	  published its immutable PSLC snapshot. The built-in renderer shows the
+	  fixed yellow title, a text projection and raw-byte PSQ1 QR pages. A
+	  pre-certified poller may override the weak key and power callbacks; the
+	  panic path never calls input core, regmap, VFS, DRM modeset locks or
+	  automatic reboot. Single power clicks are committed only after the
+	  aggregation window, double clicks are inert, triple clicks request
+	  poweroff, long press requests restart, and volume keys page text or QR.

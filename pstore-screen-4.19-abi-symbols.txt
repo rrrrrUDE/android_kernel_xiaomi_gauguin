@@ -1,0 +1,12 @@
+# Optional ABI symbol list for a 4.19/vendor ABI checker
+# These are the pstore-screen exported entry points.
+
+pstore_screen_display_register
+pstore_screen_display_unregister
+pstore_screen_panic_start
+pstore_screen_panic_wait
+
+# Add these only when CONFIG_PSTORE_SCREEN_DRM_SIDECAR=y and the
+# corresponding 4.19 DRM adaptation has been compiled:
+# pstore_screen_drm_sidecar_register
+# pstore_screen_drm_sidecar_unregister

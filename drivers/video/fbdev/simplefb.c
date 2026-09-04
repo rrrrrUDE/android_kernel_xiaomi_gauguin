@@ -26,6 +26,7 @@
 #include <linux/module.h>
 #include <linux/platform_data/simplefb.h>
 #include <linux/platform_device.h>
+#include <linux/pstore_screen.h>
 #include <linux/clk.h>
 #include <linux/of.h>
 #include <linux/of_clk.h>
@@ -77,9 +78,11 @@ static int simplefb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
 struct simplefb_par;
 static void simplefb_clocks_destroy(struct simplefb_par *par);
 static void simplefb_regulators_destroy(struct simplefb_par *par);
+static void simplefb_pstore_screen_unregister(struct fb_info *info);
 
 static void simplefb_destroy(struct fb_info *info)
 {
+	simplefb_pstore_screen_unregister(info);
 	simplefb_regulators_destroy(info->par);
 	simplefb_clocks_destroy(info->par);
 	if (info->screen_base)
@@ -179,6 +182,7 @@ static int simplefb_parse_pd(struct platform_device *pdev,
 
 struct simplefb_par {
 	u32 palette[PSEUDO_PALETTE_SIZE];
+	struct pstore_screen_display_handle *pstore_screen;
 #if defined CONFIG_OF && defined CONFIG_COMMON_CLK
 	bool clks_enabled;
 	unsigned int clk_count;
@@ -190,6 +194,53 @@ struct simplefb_par {
 	struct regulator **regulators;
 #endif
 };
+
+static void simplefb_pstore_screen_unregister(struct fb_info *info)
+{
+	struct simplefb_par *par = info->par;
+	struct pstore_screen_display_handle *handle;
+
+	handle = xchg(&par->pstore_screen, NULL);
+	pstore_screen_display_unregister(handle);
+}
+
+static void simplefb_pstore_screen_register(struct platform_device *pdev,
+					 struct fb_info *info,
+					 const struct simplefb_params *params)
+{
+	struct simplefb_par *par = info->par;
+	struct pstore_screen_display_desc desc = {
+		.size = sizeof(desc),
+		.version = PSTORE_SCREEN_DISPLAY_DESC_VERSION,
+		.name = dev_name(&pdev->dev),
+		.stage = PSTORE_SCREEN_STAGE_FIRMWARE,
+		.priority = PSTORE_SCREEN_PRIORITY_FIRMWARE,
+		.flags = PSTORE_SCREEN_PROVIDER_ACTIVE_SCANOUT,
+		.scanout = {
+			.map_kind = PSTORE_SCREEN_MAP_IOMEM,
+			.format = params->format->fourcc,
+			.width = params->width,
+			.height = params->height,
+			.pitch = params->stride,
+			.length = info->fix.smem_len,
+			.address.io = info->screen_base,
+		},
+	};
+	u32 width_mm = 0;
+	u32 height_mm = 0;
+	int ret;
+
+	if (pdev->dev.of_node) {
+		of_property_read_u32(pdev->dev.of_node, "width-mm", &width_mm);
+		of_property_read_u32(pdev->dev.of_node, "height-mm", &height_mm);
+	}
+	desc.scanout.width_mm = width_mm;
+	desc.scanout.height_mm = height_mm;
+	ret = pstore_screen_display_register(&desc, &par->pstore_screen);
+	if (ret && ret != -EOPNOTSUPP)
+		dev_warn(&pdev->dev,
+			 "pstore screen rejected simplefb scanout: %d\n", ret);
+}
 
 #if defined CONFIG_OF && defined CONFIG_COMMON_CLK
 /*
@@ -499,6 +550,7 @@ static int simplefb_probe(struct platform_device *pdev)
 		goto error_regulators;
 	}
 
+	simplefb_pstore_screen_register(pdev, info, &params);
 	dev_info(&pdev->dev, "fb%d: simplefb registered!\n", info->node);
 
 	return 0;
@@ -518,6 +570,7 @@ static int simplefb_remove(struct platform_device *pdev)
 {
 	struct fb_info *info = platform_get_drvdata(pdev);
 
+	simplefb_pstore_screen_unregister(info);
 	unregister_framebuffer(info);
 	framebuffer_release(info);
 
