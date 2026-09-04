@@ -5821,6 +5821,10 @@ CONFIG_SBITMAP=y
 #
 # Kernel hacking
 #
+# CONFIG_DEBUG_INFO is not set
+# CONFIG_DEBUG_INFO_BTF is not set
+# CONFIG_DEBUG_INFO_REDUCED is not set
+# CONFIG_DEBUG_INFO_DWARF4 is not set
 
 #
 # printk and dmesg options
