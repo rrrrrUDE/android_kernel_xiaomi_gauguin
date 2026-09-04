@@ -46,7 +46,7 @@ make O=out -j2
 |----------------|
 | 4.19.325-PurpleMiKernel-ForGauguinpro |
 
-CPU调度器（CPU Scheduling）：EAS+WALT（waltsched 分支/Branch）/ BORE v5.1.0-r2(mainline 分支/Branch)
+CPU调度器（CPU Scheduling）：BORE v5.1.0-r2
 
 ROOT方案（ROOT Solution）：ReSukiSU（Inline Hook）
 
