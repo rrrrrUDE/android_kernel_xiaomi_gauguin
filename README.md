@@ -65,7 +65,16 @@ SusFS：是（yes）
 | **NoMount** | ✅ |
 | **Pstore Screen** | ⚠️ |
 > ✅:已启用（Enabled） ⚠️:正在测试（Testing） ❌：已禁用或未内置（Disabled/None Integrate）
->
+> 
 > 后续还会加入更多功能，敬请期待! 
 >> More features are coming. Stay tuned!
+
+## 版权 (Copyright)
+- [ReSukiSU](https://github.com/ReSukiSU/ReSukiSU) - @ReSukiSU Development
+- [SuSFS for Non-GKI](https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd) - @JackA1ltman
+- [Re:Kernel](https://github.com/Sakion-Team/Re-Kernel) - @Sakion-Team
+- [Baseband Guard](https://github.com/vc-teahouse/Baseband-guard) - Telegram @qdyKernel
+- [Droidspaces](https://github.com/ravindu644/Droidspaces-OSS) - @ravindu644
+- [NoMount](https://github.com/maxsteeel/nomount) - @maxsteeel
+- [pstore-screen](https://github.com/cctv18/pstore-screen) - @cctv18
 
