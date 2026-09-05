@@ -63,6 +63,7 @@ SusFS：是（yes）
 | **DroidSpaces** | ✅ |
 | **BBG（BaseBand Guard）** | ✅ |
 | **NoMount** | ✅ |
+| **Pstore Screen** | ⚠️ |
 > ✅:已启用（Enabled） ⚠️:正在测试（Testing） ❌：已禁用或未内置（Disabled/None Integrate）
 >
 > 后续还会加入更多功能，敬请期待! 
