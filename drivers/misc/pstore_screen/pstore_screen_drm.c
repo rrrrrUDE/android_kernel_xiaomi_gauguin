@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <linux/module.h>
+#include <linux/build_bug.h>
+#include <linux/overflow.h>
+#include <linux/pstore_screen.h>
+#include <linux/slab.h>
+#include <linux/sched.h>
+
 #include <drm/drm_drv.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_pstore_screen.h>
-
-#include <linux/module.h>
-#include <linux/build_bug.h>
-#include <linux/overflow.h>
-#include <linux/pstore_screen.h>
-#include <linux/slab.h>
 
 struct pstore_screen_drm_sidecar {
 	struct drm_device *drm;
@@ -293,7 +294,8 @@ err_free:
 	kfree(sidecar);
 	return ret;
 }
-EXPORT_SYMBOL_NS_GPL(pstore_screen_drm_sidecar_register, PSTORE_SCREEN_DRM);
+
+EXPORT_SYMBOL_GPL(pstore_screen_drm_sidecar_register);
 
 void pstore_screen_drm_sidecar_unregister(
 		struct pstore_screen_drm_sidecar *sidecar)
@@ -308,8 +310,7 @@ void pstore_screen_drm_sidecar_unregister(
 		module_put(sidecar->callback_owner);
 	kfree(sidecar);
 }
-EXPORT_SYMBOL_NS_GPL(pstore_screen_drm_sidecar_unregister, PSTORE_SCREEN_DRM);
+EXPORT_SYMBOL_GPL(pstore_screen_drm_sidecar_unregister);
 
-MODULE_IMPORT_NS(PSTORE_SCREEN);
 MODULE_DESCRIPTION("Pstore screen DRM stable-sidecar adapter");
 MODULE_LICENSE("GPL");

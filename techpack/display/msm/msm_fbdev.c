@@ -20,6 +20,7 @@
 
 #include <drm/drm_crtc.h>
 #include <drm/drm_fb_helper.h>
+#include <drm/drm_pstore_screen.h>
 
 #include "msm_drv.h"
 #include "msm_kms.h"
@@ -37,6 +38,10 @@ static int msm_fbdev_mmap(struct fb_info *info, struct vm_area_struct *vma);
 struct msm_fbdev {
 	struct drm_fb_helper base;
 	struct drm_framebuffer *fb;
+
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_DRM_SIDECAR)
+	struct pstore_screen_drm_sidecar *pstore_screen;
+#endif
 };
 
 static struct fb_ops msm_fb_ops = {
@@ -138,20 +143,73 @@ static int msm_fbdev_create(struct drm_fb_helper *helper,
 	dev->mode_config.fb_base = paddr;
 
 	fbi->screen_base = msm_gem_get_vaddr(bo);
-	if (IS_ERR(fbi->screen_base)) {
-		ret = PTR_ERR(fbi->screen_base);
-		goto fail_unlock;
+    if (IS_ERR(fbi->screen_base)) {
+	    ret = PTR_ERR(fbi->screen_base);
+    	goto fail_unlock;
+    }
+
+    fbi->screen_size = bo->size;
+    fbi->fix.smem_start = paddr;
+    fbi->fix.smem_len = bo->size;
+
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_DRM_SIDECAR)
+	{
+		struct pstore_screen_drm_sidecar_desc ps_desc;
+
+		memset(&ps_desc, 0, sizeof(ps_desc));
+
+		ps_desc.size = sizeof(ps_desc);
+		ps_desc.version =
+			PSTORE_SCREEN_DRM_SIDECAR_DESC_VERSION;
+
+		ps_desc.name = "msm-fbdev";
+		ps_desc.owner = THIS_MODULE;
+
+		ps_desc.framebuffer = fb;
+		ps_desc.gem = bo;
+
+		ps_desc.priority = PSTORE_SCREEN_PRIORITY_DRM;
+
+		ps_desc.flags =
+			PSTORE_SCREEN_DRM_SIDECAR_ACTIVE_SCANOUT |
+			PSTORE_SCREEN_DRM_SIDECAR_MAPPING_PREPARED |
+			PSTORE_SCREEN_DRM_SIDECAR_RESOURCES_PINNED;
+
+		/*
+		 * No panic-safe callback is claimed here yet.
+		 * The framebuffer mapping is already prepared by
+		 * msm_gem_get_vaddr(), and the GEM object is pinned.
+		 */
+		ps_desc.capabilities = 0;
+
+		ps_desc.map_kind = PSTORE_SCREEN_MAP_SYSTEM;
+		ps_desc.map_flags = 0;
+
+		ps_desc.map_length = bo->size;
+		ps_desc.address.system = fbi->screen_base;
+
+		ret = pstore_screen_drm_sidecar_register(
+				&ps_desc,
+				&fbdev->pstore_screen);
+		if (ret) {
+			DRM_ERROR(
+				"pstore-screen: fbdev sidecar register failed: %d\n",
+				ret);
+
+			goto fail_unlock;
+		}
+
+		DRM_INFO(
+			"pstore-screen: registered msm fbdev scanout\n");
 	}
-	fbi->screen_size = bo->size;
-	fbi->fix.smem_start = paddr;
-	fbi->fix.smem_len = bo->size;
+#endif
 
-	DBG("par=%p, %dx%d", fbi->par, fbi->var.xres, fbi->var.yres);
-	DBG("allocated %dx%d fb", fbdev->fb->width, fbdev->fb->height);
+    DBG("par=%p, %dx%d", fbi->par, fbi->var.xres, fbi->var.yres);
+    DBG("allocated %dx%d fb", fbdev->fb->width, fbdev->fb->height);
 
-	mutex_unlock(&dev->struct_mutex);
+    mutex_unlock(&dev->struct_mutex);
 
-	return 0;
+    return 0;
 
 fail_unlock:
 	mutex_unlock(&dev->struct_mutex);
@@ -217,6 +275,11 @@ void msm_fbdev_free(struct drm_device *dev)
 	drm_fb_helper_fini(helper);
 
 	fbdev = to_msm_fbdev(priv->fbdev);
+
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_DRM_SIDECAR)
+	pstore_screen_drm_sidecar_unregister(fbdev->pstore_screen);
+	fbdev->pstore_screen = NULL;
+#endif
 
 	/* this will free the backing object */
 	if (fbdev->fb) {
