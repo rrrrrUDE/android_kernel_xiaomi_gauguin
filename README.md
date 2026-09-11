@@ -1,4 +1,3 @@
-# 正在施工中 #
 # PurpleMi Kernel #
 # Based on Carlotta kernel project #
 REDMI Note 9 Pro Enhanced Kernel(REDMI Note 9 Pro 增强型内核)
@@ -63,7 +62,7 @@ SusFS：是（yes）
 | **DroidSpaces** | ✅ |
 | **BBG（BaseBand Guard）** | ✅ |
 | **NoMount** | ✅ |
-| **Pstore Screen** | ⚠️ |
+| **Pstore Screen** | ❌（目前无法加入此功能，请等待作者想办法） |
 > ✅:已启用（Enabled） ⚠️:正在测试（Testing） ❌：已禁用或未内置（Disabled/None Integrate）
 > 
 > 后续还会加入更多功能，敬请期待! 
