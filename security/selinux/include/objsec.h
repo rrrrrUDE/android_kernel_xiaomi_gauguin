@@ -75,6 +75,14 @@ struct superblock_security_struct {
 	spinlock_t isec_lock;
 };
 
+extern struct lsm_blob_sizes selinux_blob_sizes;
+
+static inline struct superblock_security_struct *
+selinux_superblock(const struct super_block *sb)
+{
+	return sb->s_security + selinux_blob_sizes.lbs_superblock;
+}
+
 struct msg_security_struct {
 	u32 sid;	/* SID of message */
 };
