@@ -595,15 +595,6 @@ asmlinkage __visible void __init start_kernel(void)
 	if (!IS_ERR_OR_NULL(after_dashes))
 		parse_args("Setting init args", after_dashes, NULL, 0, -1, -1,
 			   NULL, set_init_arg);
-
-    pr_info("Kernel compiled by rrrrrUDE!\n");
-    pr_info("\n");
-    pr_info("--------------------WARNING-------------------\n");
-    pr_info("TESTING PURPOSES ONLY!!! Please do not redistribute this kernel.\nNo responsibility will be taken for any issues that may arise from its distribution or use.\n");
-    pr_info("If you are using this kernel without being aware of it, please stop using it and restore the original kernel.\n");
-    pr_info("--------------------WARNING-------------------\n");
-    pr_info("\n");
-    pr_info("Kernel will continue booting...\n");
 	
 	/*
 	 * These use large bootmem allocations and must precede
