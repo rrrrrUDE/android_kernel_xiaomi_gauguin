@@ -169,6 +169,6 @@ struct statx {
 #define STATX_ATTR_ENCRYPTED		0x00000800 /* [I] File requires key to decrypt in fs */
 #define STATX_ATTR_AUTOMOUNT		0x00001000 /* Dir: Automount trigger */
 #define STATX_ATTR_VERITY		0x00100000 /* [I] Verity protected file */
-
+#define STATX_MNT_ID			0x00001000U /* [I] Mount ID */
 
 #endif /* _UAPI_LINUX_STAT_H */
