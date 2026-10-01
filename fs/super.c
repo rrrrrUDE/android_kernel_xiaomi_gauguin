@@ -449,6 +449,7 @@ void generic_shutdown_super(struct super_block *sb)
 		cgroup_writeback_umount();
 
 		evict_inodes(sb);
+		security_sb_delete(sb);
 
 		if (sb->s_dio_done_wq) {
 			destroy_workqueue(sb->s_dio_done_wq);

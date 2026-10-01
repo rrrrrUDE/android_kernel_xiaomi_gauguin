@@ -5509,7 +5509,7 @@ CONFIG_SECURITY=y
 # CONFIG_SECURITYFS is not set
 CONFIG_SECURITY_NETWORK=y
 # CONFIG_SECURITY_NETWORK_XFRM is not set
-# CONFIG_SECURITY_PATH is not set
+CONFIG_SECURITY_PATH=y
 CONFIG_LSM_MMAP_MIN_ADDR=32768
 CONFIG_HAVE_HARDENED_USERCOPY_ALLOCATOR=y
 # CONFIG_HARDENED_USERCOPY is not set
@@ -5529,13 +5529,14 @@ CONFIG_SECURITY_SELINUX_SIDTAB_HASH_BITS=9
 # CONFIG_SECURITY_YAMA is not set
 # CONFIG_SECURITY_SAFESETID is not set
 # CONFIG_SECURITY_LOCKDOWN_LSM is not set
+CONFIG_SECURITY_LANDLOCK=y
 CONFIG_INTEGRITY=y
 # CONFIG_INTEGRITY_SIGNATURE is not set
 # CONFIG_IMA is not set
 # CONFIG_EVM is not set
 CONFIG_DEFAULT_SECURITY_SELINUX=y
 # CONFIG_DEFAULT_SECURITY_DAC is not set
-CONFIG_LSM="lockdown,yama,loadpin,safesetid,integrity,selinux,smack,tomoyo,apparmor,bpf,baseband_guard"
+CONFIG_LSM="landlock,lockdown,yama,loadpin,safesetid,integrity,selinux,smack,tomoyo,apparmor,bpf,baseband_guard"
 
 #
 # Kernel hardening options

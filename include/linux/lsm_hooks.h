@@ -1468,15 +1468,20 @@
  *     @what: kernel feature being accessed
  */
 union security_list_options {
-	#define LSM_HOOK(RET, DEFAULT, NAME, ...) RET (*NAME)(__VA_ARGS__);
-	#include "lsm_hook_defs.h"
-	#undef LSM_HOOK
+    void (*sb_delete)(struct super_block *sb);
+    int (*move_mount)(const struct path *const from_path,
+                      const struct path *const to_path);
+    #define LSM_HOOK(RET, DEFAULT, NAME, ...) RET (*NAME)(__VA_ARGS__);
+    #include "lsm_hook_defs.h"
+    #undef LSM_HOOK
 };
 
 struct security_hook_heads {
-	#define LSM_HOOK(RET, DEFAULT, NAME, ...) struct hlist_head NAME;
-	#include "lsm_hook_defs.h"
-	#undef LSM_HOOK
+    struct hlist_head sb_delete;
+    struct hlist_head move_mount;
+    #define LSM_HOOK(RET, DEFAULT, NAME, ...) struct hlist_head NAME;
+    #include "lsm_hook_defs.h"
+    #undef LSM_HOOK
 } __randomize_layout;
 
 /*
@@ -1497,6 +1502,7 @@ struct lsm_blob_sizes {
 	int	lbs_cred;
 	int	lbs_file;
 	int	lbs_inode;
+   int lbs_superblock;
 	int	lbs_ipc;
 	int	lbs_msg_msg;
 	int	lbs_task;

@@ -268,6 +268,7 @@ void security_bprm_committed_creds(struct linux_binprm *bprm);
 int security_fs_context_parse_param(struct fs_context *fc, struct fs_parameter *param);
 int security_sb_alloc(struct super_block *sb);
 void security_sb_free(struct super_block *sb);
+void security_sb_delete(struct super_block *sb);
 void security_free_mnt_opts(void **mnt_opts);
 int security_sb_eat_lsm_opts(char *options, void **mnt_opts);
 int security_sb_remount(struct super_block *sb, void *mnt_opts);
@@ -278,6 +279,8 @@ int security_sb_mount(const char *dev_name, const struct path *path,
 		      const char *type, unsigned long flags, void *data);
 int security_sb_umount(struct vfsmount *mnt, int flags);
 int security_sb_pivotroot(const struct path *old_path, const struct path *new_path);
+int security_move_mount(const struct path *const from_path,
+                        const struct path *const to_path);
 int security_sb_set_mnt_opts(struct super_block *sb,
 				void *mnt_opts,
 				unsigned long kern_flags,
@@ -582,6 +585,9 @@ static inline int security_sb_alloc(struct super_block *sb)
 {
 	return 0;
 }
+
+static inline void security_sb_delete(struct super_block *sb)
+{ }
 
 static inline void security_sb_free(struct super_block *sb)
 { }
