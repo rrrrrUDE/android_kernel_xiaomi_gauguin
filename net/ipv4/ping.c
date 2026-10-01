@@ -1182,7 +1182,7 @@ static void __net_exit ping_v4_proc_exit_net(struct net *net)
 	remove_proc_entry("icmp", net->proc_net);
 }
 
-static __initdata struct pernet_operations ping_v4_net_ops = {
+static struct pernet_operations ping_v4_net_ops = {
 	.init = ping_v4_proc_init_net,
 	.exit = ping_v4_proc_exit_net,
 };
