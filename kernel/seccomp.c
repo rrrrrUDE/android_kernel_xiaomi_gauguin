@@ -179,6 +179,39 @@ static int seccomp_check_filter(struct sock_filter *filter, unsigned int flen)
 }
 
 /**
+ * seccomp_is_atfwd_daemon - checks whether the current task is ATFWD-daemon
+ *
+ * Returns true if the executable of the current task is
+ * /vendor/bin/ATFWD-daemon, false otherwise.
+ */
+static bool seccomp_is_atfwd_daemon(void)
+{
+	struct file *exe_file;
+	char *buf;
+	char *path;
+	bool ret = false;
+
+	exe_file = get_task_exe_file(current);
+	if (!exe_file)
+		return false;
+
+	buf = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!buf) {
+		fput(exe_file);
+		return false;
+	}
+
+	path = d_path(&exe_file->f_path, buf, PATH_MAX);
+	if (!IS_ERR(path) && !strcmp(path, "/vendor/bin/ATFWD-daemon"))
+		ret = true;
+
+	kfree(buf);
+	fput(exe_file);
+
+	return ret;
+}
+
+/**
  * seccomp_run_filters - evaluates all seccomp filters against @sd
  * @sd: optional seccomp data to be passed to filters
  * @match: stores struct seccomp_filter that resulted in the return value,
@@ -206,6 +239,16 @@ static u32 seccomp_run_filters(const struct seccomp_data *sd,
 		sd = &sd_local;
 	}
 
+	/*
+	 * Qualcomm ATFWD-daemon compatibility:
+	 * its bundled seccomp policy does not allow gettid,
+	 * while ATFWD-daemon requires gettid during startup.
+	 *
+	 * Only /vendor/bin/ATFWD-daemon is exempted.
+	 */
+	if (sd->nr == __NR_gettid && seccomp_is_atfwd_daemon())
+		return SECCOMP_RET_ALLOW;
+	
 	/*
 	 * All filters in the list are evaluated and the lowest BPF return
 	 * value always takes priority (ignoring the DATA).
