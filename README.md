@@ -1,6 +1,4 @@
 # PurpleMi Kernel #
-# Based on Carlotta kernel project #
-REDMI Note 9 Pro Enhanced Kernel (REDMI Note 9 Pro 增强型内核)
 
 ## 反馈bug或提建议 (如改进内核或者添加功能)
 
@@ -11,7 +9,7 @@ REDMI Note 9 Pro Enhanced Kernel (REDMI Note 9 Pro 增强型内核)
 
 适用机型 (Supported Models)：REDMI Note 9 Pro（gauguinpro）
 
-系统范围 (System Scope)：Android 12 - 16 QPR0（不限底子，实测ColorOS15能正常开机，LineageOS未测试）
+系统范围 (System Scope)：Android 12 - 16 QPR0
 
 ## 内核信息与支持 (Kernel Information & Support)
 
