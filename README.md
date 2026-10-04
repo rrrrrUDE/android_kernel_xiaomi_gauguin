@@ -37,7 +37,8 @@ SusFS支持（SuSFS Support）：是 (yes)
 > ✅:已启用(Enabled) ⚠️:正在测试(Testing) ❌：已禁用或未内置(Disabled/None Integrate)
 > 
 > 后续还会加入更多功能，敬请期待! 
->> More features are coming. Stay tuned!
+>
+> More features are coming. Stay tuned!
 
 ## 版权 (Copyright)
 - [ReSukiSU](https://github.com/ReSukiSU/ReSukiSU) - @ReSukiSU Development
