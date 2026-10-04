@@ -1,31 +1,32 @@
-# PurpleMi Kernel #
-
-## 反馈bug或提建议 (如改进内核或者添加功能)
-
-1.提交Issues
-
-2.发送邮件至xkandemo666@outlook.com或xkandemo666@gmail.com
-
+# PurpleMi Kernel
 
 适用机型 (Supported Models)：REDMI Note 9 Pro（gauguinpro）
 
 系统范围 (System Scope)：Android 12 - 16 QPR0
-
+>⚠️ 注意：本次更新后将会暂停更新一段时间，将会准备合并linux-4.19.y-cip-rt上游 + 新的BPF，尽情期待...
+>
+>⚠️ Note: Updates will be paused for a while following this release as we prepare to merge the upstream linux-4.19.y-cip-rt + New BPF, Stay tuned...
 ## 内核信息与支持 (Kernel Information & Support)
 
-| 内核版本(Kernel Version) | 
+| 内核版本 (Kernel Version) | 
 |----------------|
 | 4.19.325-PurpleMiKernel-ForGauguinpro |
 
-ROOT方案 (ROOT Solution)：ReSukiSU (Inline Hook)
-
-SusFS：是 (yes)
-
-内存压缩算法支持 (Supported Memory Compression Algorithms)：LZ4, LZ4KD, ZSTD
-
-默认内存压缩算法 (Default Memory Compression Algorithm)：LZ4KD
+| 内核特性 (Kernel Feature) | Placeholder |
+|---------|-------------|
+| **Landlock 沙箱机制 (Landlock Sandbox Framework)** | ✅ Work well |
+| **调度器 (Scheduler)** | 🚧 WALT+EAS(Backporting and Moving to sched_ext(scx)) |
+| **io_uring 支持 (io_uring Support)** | 🚧 BACKPORT Stage... |
+| **BBRv3 TCP 拥塞控制算法 (BBRv3 TCP Congestion Control)** | 🚧 Still BACKPORT Stage... |
+> 后续版本将持续同步更多上游内核特性、性能优化与安全增强，敬请期待！
+> 
+> Future releases will continue to bring more upstream kernel features, performance improvements, and security enhancements. Stay tuned!
 
 ## 内置组件与功能 (Kernel-Integrated Components & Features)
+### 基础 (Basic)
+ROOT方案 (ROOT Solution)：BakaSU 
+
+SusFS支持（SuSFS Support）：是 (yes)
 | 功能 (Function) | 状态 (Status) |
 |---------|-------------|
 | **ReKernel** | ✅ |
