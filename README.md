@@ -41,7 +41,7 @@ SusFS支持（SuSFS Support）：是 (yes)
 > More features are coming. Stay tuned!
 
 ## 版权 (Copyright)
-- [ReSukiSU](https://github.com/ReSukiSU/ReSukiSU) - @ReSukiSU Development
+- [BakaSU](https://github.com/Baka-SU/BakaSU) - @BakaSU Development
 - [SuSFS for Non-GKI](https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd) - @JackA1ltman
 - [Re:Kernel](https://github.com/Sakion-Team/Re-Kernel) - @Sakion-Team
 - [Baseband Guard](https://github.com/vc-teahouse/Baseband-guard) - Telegram @qdyKernel
