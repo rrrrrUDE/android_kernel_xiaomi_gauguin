@@ -3907,7 +3907,6 @@ union bpf_attr {
 	FN(per_cpu_ptr),		\
 	FN(this_cpu_ptr),		\
 	FN(redirect_peer),		\
-	FN(ktime_get_coarse_ns),	\
 	/* */
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper

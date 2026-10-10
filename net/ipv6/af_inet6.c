@@ -300,8 +300,7 @@ static int __inet6_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len,
 		return -EINVAL;
 
 	snum = ntohs(addr->sin6_port);
-	if (!(flags & BIND_NO_CAP_NET_BIND_SERVICE) &&
-	    snum && snum < inet_prot_sock(net) &&
+	if (snum && snum < inet_prot_sock(net) &&
 	    !ns_capable(net->user_ns, CAP_NET_BIND_SERVICE))
 		return -EACCES;
 
@@ -445,7 +444,6 @@ out_unlock:
 int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 {
 	struct sock *sk = sock->sk;
-	u32 flags = BIND_WITH_LOCK;
 	const struct proto *prot;
 	int err = 0;
 
@@ -461,12 +459,11 @@ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	/* BPF prog is run before any checks are done so that if the prog
 	 * changes context in a wrong way it will be caught.
 	 */
-	err = BPF_CGROUP_RUN_PROG_INET_BIND_LOCK(sk, uaddr,
-						 BPF_CGROUP_INET6_BIND, &flags);
+	err = BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr);
 	if (err)
 		return err;
 
-	return __inet6_bind(sk, uaddr, addr_len, flags);
+	return __inet6_bind(sk, uaddr, addr_len, BIND_WITH_LOCK);
 }
 EXPORT_SYMBOL(inet6_bind);
 
@@ -546,19 +543,18 @@ int inet6_getname(struct socket *sock, struct sockaddr *uaddr,
 		sin->sin6_addr = sk->sk_v6_daddr;
 		if (np->sndflow)
 			sin->sin6_flowinfo = np->flow_label;
-		BPF_CGROUP_RUN_SA_PROG_LOCK(sk, (struct sockaddr *)sin,
-					    BPF_CGROUP_INET6_GETPEERNAME,
-					    NULL);
 	} else {
 		if (ipv6_addr_any(&sk->sk_v6_rcv_saddr))
 			sin->sin6_addr = np->saddr;
 		else
 			sin->sin6_addr = sk->sk_v6_rcv_saddr;
 		sin->sin6_port = inet->inet_sport;
-		BPF_CGROUP_RUN_SA_PROG_LOCK(sk, (struct sockaddr *)sin,
-					    BPF_CGROUP_INET6_GETSOCKNAME,
-					    NULL);
 	}
+	if (cgroup_bpf_enabled)
+		BPF_CGROUP_RUN_SA_PROG_LOCK(sk, (struct sockaddr *)sin,
+					    peer ? BPF_CGROUP_INET6_GETPEERNAME :
+						   BPF_CGROUP_INET6_GETSOCKNAME,
+					    NULL);
 	sin->sin6_scope_id = ipv6_iface_scope_id(&sin->sin6_addr,
 						 sk->sk_bound_dev_if);
 	return sizeof(*sin);
