@@ -1511,6 +1511,8 @@ static void sta_ps_start(struct sta_info *sta)
 		else
 			clear_bit(tid, &sta->txq_buffered_tids);
 	}
+
+	sta_info_recalc_tim(sta);
 }
 
 static void sta_ps_end(struct sta_info *sta)
@@ -3045,6 +3047,11 @@ ieee80211_rx_h_mgmt_check(struct ieee80211_rx_data *rx)
 		return RX_DROP_MONITOR;
 
 	if (!ieee80211_is_mgmt(mgmt->frame_control))
+		return RX_DROP_MONITOR;
+
+	/* Drop non-broadcast Beacon frames */
+	if (ieee80211_is_beacon(mgmt->frame_control) &&
+	    !is_broadcast_ether_addr(mgmt->da))
 		return RX_DROP_MONITOR;
 
 	if (rx->sdata->vif.type == NL80211_IFTYPE_AP &&
