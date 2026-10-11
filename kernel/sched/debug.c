@@ -991,6 +991,11 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 		   "nr_involuntary_switches", (long long)p->nivcsw);
 
 	P(se.load.weight);
+
+#ifdef CONFIG_SCHED_BORE
+	__PS("bore.score", p->bore.penalty >> 8);
+#endif
+
 	P(se.runnable_weight);
 #ifdef CONFIG_SMP
 	P(se.avg.load_sum);

@@ -73,6 +73,11 @@
 
 #include "locking/rtmutex_common.h"
 
+/* BORE tracks blocked futex waiters independently of WALT. */
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif
+
 /*
  * READ this before attempting to hack on futexes!
  *
@@ -2718,8 +2723,15 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 		 * flagged for rescheduling. Only call schedule if there
 		 * is no timeout, or if it has yet to expire.
 		 */
-		if (!timeout || timeout->task)
+		if (!timeout || timeout->task) {
+#ifdef CONFIG_SCHED_BORE
+			current->bore.futex_waiting = true;
+#endif
 			freezable_schedule();
+#ifdef CONFIG_SCHED_BORE
+			current->bore.futex_waiting = false;
+#endif
+		}
 	}
 	__set_current_state(TASK_RUNNING);
 }

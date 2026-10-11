@@ -1185,6 +1185,13 @@ config NET_NS
 
 endif # NAMESPACES
 
+config SCHED_BORE
+	bool "Burst-Oriented Response Enhancer (BORE)"
+	default y
+	help
+	  BORE adds per-task CPU burst penalties and bounded sleep credit
+	  to the classic CFS scheduler.
+
 config CHECKPOINT_RESTORE
 	bool "Checkpoint/restore support"
 	select PROC_CHILDREN

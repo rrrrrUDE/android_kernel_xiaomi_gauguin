@@ -26,6 +26,10 @@
 #include "pelt.h"
 #include "walt.h"
 
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
 
@@ -709,7 +713,11 @@ int tg_nop(struct task_group *tg, void *data)
 
 static void set_load_weight(struct task_struct *p, bool update_load)
 {
+#ifdef CONFIG_SCHED_BORE
+	int prio = effective_prio_bore(p);
+#else
 	int prio = p->static_prio - MAX_RT_PRIO;
+#endif
 	struct load_weight *load = &p->se.load;
 
 	/*
@@ -2947,6 +2955,9 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->on_rq			= 0;
 
 	p->se.on_rq			= 0;
+#ifdef CONFIG_SCHED_BORE
+	reset_task_bore(p);
+#endif
 	p->se.exec_start		= 0;
 	p->se.sum_exec_runtime		= 0;
 	p->se.prev_sum_exec_runtime	= 0;
@@ -7284,6 +7295,9 @@ void __init sched_init(void)
 
 	wait_bit_init();
 
+#ifdef CONFIG_SCHED_BORE
+	sched_init_bore();
+#endif
 	init_clusters();
 
 #ifdef CONFIG_FAIR_GROUP_SCHED

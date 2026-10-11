@@ -26,6 +26,10 @@
 
 #include "walt.h"
 
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif
+
 #ifdef CONFIG_SMP
 static inline bool task_fits_max(struct task_struct *p, int cpu);
 #endif /* CONFIG_SMP */
@@ -98,15 +102,24 @@ unsigned int sysctl_sched_cstate_aware = 1;
  *
  * (default SCHED_TUNABLESCALING_LOG = *(1+ilog(ncpus))
  */
+#ifdef CONFIG_SCHED_BORE
+enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_NONE;
+#else
 enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
+#endif
 
 /*
  * Minimal preemption granularity for CPU-bound tasks:
  *
  * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
+#ifdef CONFIG_SCHED_BORE
+unsigned int sysctl_sched_min_granularity = CONFIG_MIN_BASE_SLICE_NS;
+unsigned int normalized_sysctl_sched_min_granularity = CONFIG_MIN_BASE_SLICE_NS;
+#else
 unsigned int sysctl_sched_min_granularity		= 750000ULL;
 unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
+#endif
 
 /*
  * This value is kept at sysctl_sched_latency/sysctl_sched_min_granularity
@@ -236,7 +249,18 @@ static void update_sysctl(void)
 
 #define SET_SYSCTL(name) \
 	(sysctl_##name = (factor) * normalized_sysctl_##name)
+#ifdef CONFIG_SCHED_BORE
+	/* Round the configured minimum slice up to a full timer tick. */
+	{
+		const unsigned int tick_ns = NSEC_PER_SEC / HZ;
+
+		sysctl_sched_min_granularity = tick_ns *
+			max_t(unsigned int, 1, DIV_ROUND_UP(CONFIG_MIN_BASE_SLICE_NS, tick_ns));
+		normalized_sysctl_sched_min_granularity = sysctl_sched_min_granularity;
+	}
+#else
 	SET_SYSCTL(sched_min_granularity);
+#endif
 	SET_SYSCTL(sched_latency);
 	SET_SYSCTL(sched_wakeup_granularity);
 #undef SET_SYSCTL
@@ -904,6 +928,9 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	if (entity_is_task(curr)) {
 		struct task_struct *curtask = task_of(curr);
 
+#ifdef CONFIG_SCHED_BORE
+		update_curr_bore(curtask, delta_exec);
+#endif
 		trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
 		cgroup_account_cputime(curtask, delta_exec);
 		account_group_exec_runtime(curtask, delta_exec);
@@ -2979,6 +3006,16 @@ void reweight_task(struct task_struct *p, int prio)
 	load->inv_weight = sched_prio_to_wmult[prio];
 }
 
+#ifdef CONFIG_SCHED_BORE
+/* Keep the runnable PELT weight and CFS load accounting in sync. */
+void bore_reweight_entity(struct task_struct *p, unsigned long weight)
+{
+	struct sched_entity *se = &p->se;
+
+	reweight_entity(cfs_rq_of(se), se, weight, weight);
+}
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 #ifdef CONFIG_SMP
 /*
@@ -4129,6 +4166,28 @@ static inline bool entity_is_long_sleeper(struct sched_entity *se)
 	return false;
 }
 
+#ifdef CONFIG_SCHED_BORE
+static void bore_apply_sleep_credit(struct sched_entity *se, int initial)
+{
+	u64 credit;
+
+	if (initial || !entity_is_task(se))
+		return;
+
+	if (!static_branch_likely(&sched_bore_key) ||
+	    !static_branch_unlikely(&sched_credit_key)) {
+		/* Discard stale sleep timestamps while either switch is off. */
+		task_of(se)->bore.credit_sleep = 0;
+		return;
+	}
+
+	credit = bore_credit_ns(task_of(se));
+	if (credit)
+		/* CFS vruntime is an unsigned clock, wrapping is intentional. */
+		se->vruntime -= calc_delta_fair(credit, se);
+}
+#endif
+
 static void
 place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 {
@@ -4164,6 +4223,9 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 				vruntime -= sysctl_sched_latency;
 				vruntime -= thresh;
 				se->vruntime = vruntime;
+#ifdef CONFIG_SCHED_BORE
+				bore_apply_sleep_credit(se, initial);
+#endif
 				return;
 			}
 		}
@@ -4193,6 +4255,9 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 		se->vruntime = vruntime;
 	else
 		se->vruntime = max_vruntime(se->vruntime, vruntime);
+#ifdef CONFIG_SCHED_BORE
+	bore_apply_sleep_credit(se, initial);
+#endif
 }
 
 static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
@@ -5665,6 +5730,16 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	int task_sleep = flags & DEQUEUE_SLEEP;
 	int idle_h_nr_running = task_has_idle_policy(p);
 	bool was_sched_idle = sched_idle_rq(rq);
+
+#ifdef CONFIG_SCHED_BORE
+	if (task_sleep) {
+		/* Charge the last running slice before ending a burst. */
+		if (cfs_rq_of(se)->curr == se)
+			update_curr(cfs_rq_of(se));
+		bore_note_sleep(p, ktime_get_ns());
+		restart_burst_bore(p);
+	}
+#endif
 
 	/*
 	 * The code below (indirectly) updates schedutil which looks at
@@ -8488,6 +8563,9 @@ static void yield_task_fair(struct rq *rq)
 		rq_clock_skip_update(rq);
 	}
 
+#ifdef CONFIG_SCHED_BORE
+	restart_burst_rescale_deadline_bore(curr);
+#endif
 	set_skip_buddy(se);
 }
 
@@ -12344,6 +12422,11 @@ static void switched_from_fair(struct rq *rq, struct task_struct *p)
 static void switched_to_fair(struct rq *rq, struct task_struct *p)
 {
 	attach_task_cfs_rq(p);
+#ifdef CONFIG_SCHED_BORE
+	reset_task_bore(p);
+	if (!task_has_idle_policy(p))
+		reweight_task(p, effective_prio_bore(p));
+#endif
 
 	if (task_on_rq_queued(p)) {
 		/*

@@ -62,6 +62,9 @@
 #include <linux/capability.h>
 #include <linux/binfmts.h>
 #include <linux/sched/sysctl.h>
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif
 #include <linux/sched/coredump.h>
 #include <linux/sched/stat.h>
 #include <linux/kexec.h>
@@ -407,7 +410,83 @@ static int bpf_stats_handler(struct ctl_table *table, int write,
 }
 #endif
 
+#ifdef CONFIG_SCHED_BORE
+static int bore_zero, bore_one = 1, bore_two = 2, bore_three = 3;
+static int bore_63 = 63, bore_4095 = 4095, bore_credit_max = 1000000;
+static char bore_version[] = SCHED_BORE_VERSION "\n";
+#endif
+
 static struct ctl_table kern_table[] = {
+#ifdef CONFIG_SCHED_BORE
+	{
+		.procname = "sched_bore",
+		.data = &sched_bore,
+		.maxlen = sizeof(sched_bore),
+		.mode = 0644,
+		.proc_handler = sched_bore_update_handler,
+		.extra1 = &bore_zero,
+		.extra2 = &bore_one,
+	},
+	{
+		.procname = "sched_bore_version",
+		.data = bore_version,
+		.maxlen = sizeof(bore_version),
+		.mode = 0444,
+		.proc_handler = proc_dostring,
+	},
+	{
+		.procname = "sched_burst_inherit_type",
+		.data = &sched_burst_inherit_type,
+		.maxlen = sizeof(sched_burst_inherit_type),
+		.mode = 0644,
+		.proc_handler = sched_burst_inherit_type_update_handler,
+		.extra1 = &bore_zero,
+		.extra2 = &bore_two,
+	},
+	{
+		.procname = "sched_burst_smoothness",
+		.data = &sched_burst_smoothness,
+		.maxlen = sizeof(sched_burst_smoothness),
+		.mode = 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1 = &bore_zero,
+		.extra2 = &bore_three,
+	},
+	{
+		.procname = "sched_burst_penalty_offset",
+		.data = &sched_burst_penalty_offset,
+		.maxlen = sizeof(sched_burst_penalty_offset),
+		.mode = 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1 = &bore_zero,
+		.extra2 = &bore_63,
+	},
+	{
+		.procname = "sched_burst_penalty_scale",
+		.data = &sched_burst_penalty_scale,
+		.maxlen = sizeof(sched_burst_penalty_scale),
+		.mode = 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1 = &bore_zero,
+		.extra2 = &bore_4095,
+	},
+	{
+		.procname = "sched_burst_cache_lifetime",
+		.data = &sched_burst_cache_lifetime,
+		.maxlen = sizeof(sched_burst_cache_lifetime),
+		.mode = 0644,
+		.proc_handler = proc_dointvec,
+	},
+	{
+		.procname = "sched_credit_cap_us",
+		.data = &sched_credit_cap_us,
+		.maxlen = sizeof(sched_credit_cap_us),
+		.mode = 0644,
+		.proc_handler = sched_credit_cap_us_update_handler,
+		.extra1 = &bore_zero,
+		.extra2 = &bore_credit_max,
+	},
+#endif
 	{
 		.procname	= "sched_child_runs_first",
 		.data		= &sysctl_sched_child_runs_first,

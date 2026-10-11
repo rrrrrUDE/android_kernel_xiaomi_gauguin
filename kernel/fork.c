@@ -20,6 +20,9 @@
 #include <linux/sched/numa_balancing.h>
 #include <linux/sched/stat.h>
 #include <linux/sched/task.h>
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif
 #include <linux/sched/task_stack.h>
 #include <linux/sched/cputime.h>
 #include <linux/seq_file.h>
@@ -2124,6 +2127,10 @@ static __latent_entropy struct task_struct *copy_process(
 
 	p->start_time = ktime_get_ns();
 	p->real_start_time = ktime_get_boottime_ns();
+#ifdef CONFIG_SCHED_BORE
+	if (likely(p->pid))
+		task_fork_bore(p, current, clone_flags, p->start_time);
+#endif
 
 	/*
 	 * Make it visible to the rest of the system, but dont wake it up yet.
@@ -2192,7 +2199,11 @@ static __latent_entropy struct task_struct *copy_process(
 			 */
 			p->signal->has_child_subreaper = p->real_parent->signal->has_child_subreaper ||
 							 p->real_parent->signal->is_child_subreaper;
+#ifdef CONFIG_SCHED_BORE
+			list_add_tail_rcu(&p->sibling, &p->real_parent->children);
+#else
 			list_add_tail(&p->sibling, &p->real_parent->children);
+#endif
 			list_add_tail_rcu(&p->tasks, &init_task.tasks);
 			attach_pid(p, PIDTYPE_TGID);
 			attach_pid(p, PIDTYPE_PGID);

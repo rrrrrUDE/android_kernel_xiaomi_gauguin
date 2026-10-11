@@ -56,3 +56,11 @@ config HZ
 
 config SCHED_HRTICK
 	def_bool HIGH_RES_TIMERS
+
+config MIN_BASE_SLICE_NS
+	int "BORE CFS minimum base slice (nanoseconds)"
+	depends on SCHED_BORE
+	default 2000000
+	range 100000 1000000000
+	help
+	  Minimum granularity rounded up to a whole HZ tick.
