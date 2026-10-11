@@ -993,7 +993,8 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 	P(se.load.weight);
 
 #ifdef CONFIG_SCHED_BORE
-	__PS("bore.score", p->bore.penalty >> 8);
+	SEQ_printf(m, "%-45s:%21Ld\n", "bore.score",
+		   (long long)(p->bore.penalty >> 8));
 #endif
 
 	P(se.runnable_weight);
