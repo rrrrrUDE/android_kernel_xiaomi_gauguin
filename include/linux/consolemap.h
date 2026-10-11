@@ -22,7 +22,23 @@ extern unsigned short *set_translate(int m, struct vc_data *vc);
 extern int conv_uni_to_pc(struct vc_data *conp, long ucs);
 extern u32 conv_8bit_to_uni(unsigned char c);
 extern int conv_uni_to_8bit(u32 uni);
+
 void console_map_init(void);
+
+static inline bool ucs_is_zero_width(uint32_t cp)
+{
+	switch (cp) {
+	case 0x200B: /* ZERO WIDTH SPACE */
+	case 0x200C: /* ZERO WIDTH NON-JOINER */
+	case 0x200D: /* ZERO WIDTH JOINER */
+	case 0x2060: /* WORD JOINER */
+	case 0xFE0F: /* VARIATION SELECTOR-16 */
+		return true;
+	default:
+		return false;
+	}
+}
+
 #else
 #define inverse_translate(conp, glyph, uni) ((uint16_t)glyph)
 #define set_translate(m, vc) ((unsigned short *)NULL)

@@ -2568,6 +2568,75 @@ static int is_double_width(uint32_t ucs)
 			sizeof(struct interval), ucs_cmp) != NULL;
 }
 
+
+
+static u32 vc_uniscr_getc(struct vc_data *vc, int relative_pos)
+{
+	struct uni_screen *uniscr = get_vc_uniscr(vc);
+	int pos = vc->vc_x + vc->vc_need_wrap + relative_pos;
+
+	if (!uniscr)
+		return 0;
+
+	if (pos < 0 || pos >= vc->vc_cols)
+		return 0;
+
+	return uniscr->lines[vc->vc_y][pos];
+}
+
+
+static void vc_con_rewind(struct vc_data *vc)
+{
+	if (vc->vc_x && !vc->vc_need_wrap) {
+		vc->vc_pos -= 2;
+		vc->vc_x--;
+	}
+
+	vc->vc_need_wrap = 0;
+}
+
+
+#define UCS_VS16 0xfe0f
+
+
+static int vc_process_ucs(struct vc_data *vc, int c, int *tc)
+{
+	u32 prev_c;
+
+
+	if (is_double_width(c))
+		return 2;
+
+
+	if (!ucs_is_zero_width(c))
+		return 1;
+
+
+	if (is_double_width(vc_uniscr_getc(vc, -2))) {
+
+		vc_con_rewind(vc);
+
+		*tc = ' ';
+
+		return 1;
+	}
+
+
+	prev_c = vc_uniscr_getc(vc, -1);
+
+
+	if (c == UCS_VS16 && prev_c) {
+
+		*tc = ' ';
+
+		return 1;
+	}
+
+
+	return 0;
+}
+
+
 static void con_flush(struct vc_data *vc, unsigned long draw_from,
 		unsigned long draw_to, int *draw_x)
 {
@@ -2734,8 +2803,11 @@ rescan_last_byte:
 
 		if (vc->vc_state == ESnormal && ok) {
 			if (vc->vc_utf && !vc->vc_disp_ctrl) {
-				if (is_double_width(c))
-					width = 2;
+
+				width = vc_process_ucs(vc, c, &tc);
+
+				if (!width)
+					goto out;
 			}
 			/* Now try to find out how to display it */
 			tc = conv_uni_to_pc(vc, tc);
@@ -2810,6 +2882,7 @@ rescan_last_byte:
 				if (tc < 0) tc = ' ';
 				next_c = ' ';
 			}
+	out:
 			notify_write(vc, c);
 
 			if (inverse)
