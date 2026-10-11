@@ -57,6 +57,7 @@ struct sighand_struct;
 struct signal_struct;
 struct task_delay_info;
 struct task_group;
+struct io_uring_task;
 
 /*
  * Task state bitmask. NOTE! These bits are also
@@ -1071,6 +1072,9 @@ struct task_struct {
 	/* CLONE_CHILD_CLEARTID: */
 	int __user			*clear_child_tid;
 
+	/* io_uring worker-private state */
+	void				*pf_io_worker;
+
 	u64				utime;
 	u64				stime;
 #ifdef CONFIG_ARCH_HAS_SCALED_CPUTIME
@@ -1146,6 +1150,10 @@ struct task_struct {
 
 	/* Open file information: */
 	struct files_struct		*files;
+
+#ifdef CONFIG_IO_URING
+	struct io_uring_task		*io_uring;
+#endif
 
 	/* Namespaces: */
 	struct nsproxy			*nsproxy;

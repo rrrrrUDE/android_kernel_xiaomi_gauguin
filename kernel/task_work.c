@@ -79,6 +79,30 @@ task_work_cancel(struct task_struct *task, task_work_func_t func)
 	return work;
 }
 
+/* Cancel one queued callback selected by an io_uring-specific predicate. */
+struct callback_head *
+task_work_cancel_match(struct task_struct *task,
+		bool (*match)(struct callback_head *, void *data), void *data)
+{
+	struct callback_head **pprev = &task->task_works;
+	struct callback_head *work;
+	unsigned long flags;
+
+	if (likely(!task->task_works))
+		return NULL;
+
+	raw_spin_lock_irqsave(&task->pi_lock, flags);
+	while ((work = READ_ONCE(*pprev))) {
+		if (!match(work, data))
+			pprev = &work->next;
+		else if (cmpxchg(pprev, work, work->next) == work)
+			break;
+	}
+	raw_spin_unlock_irqrestore(&task->pi_lock, flags);
+
+	return work;
+}
+
 /**
  * task_work_run - execute the works added by task_work_add()
  *

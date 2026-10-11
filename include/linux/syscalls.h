@@ -68,6 +68,7 @@ struct perf_event_attr;
 struct file_handle;
 struct sigaltstack;
 struct rseq;
+struct io_uring_params;
 union bpf_attr;
 
 #include <linux/types.h>
@@ -346,6 +347,15 @@ asmlinkage long sys_epoll_pwait(int epfd, struct epoll_event __user *events,
 				int maxevents, int timeout,
 				const sigset_t __user *sigmask,
 				size_t sigsetsize);
+
+/* io_uring/io_uring.c */
+asmlinkage long sys_io_uring_setup(u32 entries,
+				struct io_uring_params __user *p);
+asmlinkage long sys_io_uring_enter(unsigned int fd, u32 to_submit,
+				u32 min_complete, u32 flags,
+				const void __user *argp, size_t argsz);
+asmlinkage long sys_io_uring_register(unsigned int fd, unsigned int op,
+				void __user *arg, unsigned int nr_args);
 
 /* fs/fcntl.c */
 asmlinkage long sys_dup(unsigned int fildes);

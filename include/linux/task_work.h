@@ -7,6 +7,12 @@
 
 typedef void (*task_work_func_t)(struct callback_head *);
 
+enum task_work_notify_mode {
+	TWA_NONE,
+	TWA_RESUME,
+	TWA_SIGNAL,
+};
+
 static inline void
 init_task_work(struct callback_head *twork, task_work_func_t func)
 {
@@ -15,6 +21,8 @@ init_task_work(struct callback_head *twork, task_work_func_t func)
 
 int task_work_add(struct task_struct *task, struct callback_head *twork, bool);
 struct callback_head *task_work_cancel(struct task_struct *, task_work_func_t);
+struct callback_head *task_work_cancel_match(struct task_struct *task,
+		bool (*match)(struct callback_head *, void *data), void *data);
 void task_work_run(void);
 
 static inline void exit_task_work(struct task_struct *task)

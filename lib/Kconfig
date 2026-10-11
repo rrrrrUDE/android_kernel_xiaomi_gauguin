@@ -412,6 +412,12 @@ config INTERVAL_TREE
 config RADIX_TREE_MULTIORDER
 	bool
 
+config XARRAY_MULTI
+	bool
+	help
+	  Support entries which occupy multiple consecutive indices in the
+	  XArray.
+
 config ASSOCIATIVE_ARRAY
 	bool
 	help

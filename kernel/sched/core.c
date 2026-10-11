@@ -20,6 +20,7 @@
 #include <soc/qcom/minidump.h>
 
 #include "../workqueue_internal.h"
+#include "../../io_uring/io-wq.h"
 #include "../smpboot.h"
 
 #include "pelt.h"
@@ -4343,6 +4344,8 @@ static void __sched notrace __schedule(bool preempt)
 				to_wakeup = wq_worker_sleeping(prev);
 				if (to_wakeup)
 					try_to_wake_up_local(to_wakeup, &rf);
+			} else if (prev->pf_io_worker) {
+				io_wq_worker_sleeping(prev);
 			}
 		}
 		switch_count = &prev->nvcsw;
@@ -4411,6 +4414,8 @@ static inline void sched_submit_work(struct task_struct *tsk)
 {
 	if (task_is_running(tsk) || tsk_is_pi_blocked(tsk))
 		return;
+	if (tsk->pf_io_worker)
+		io_wq_worker_sleeping(tsk);
 	/*
 	 * If we are going to sleep and we have plugged IO queued,
 	 * make sure to submit it to avoid deadlocks.
@@ -4429,6 +4434,8 @@ asmlinkage __visible void __sched schedule(void)
 		__schedule(false);
 		sched_preempt_enable_no_resched();
 	} while (need_resched());
+	if (tsk->pf_io_worker)
+		io_wq_worker_running(tsk);
 }
 EXPORT_SYMBOL(schedule);
 

@@ -95,6 +95,7 @@
 #include <linux/thread_info.h>
 #include <linux/cpufreq_times.h>
 #include <linux/scs.h>
+#include <linux/io_uring.h>
 
 #include <linux/pgtable.h>
 #include <asm/pgalloc.h>
@@ -883,6 +884,7 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	tsk->splice_pipe = NULL;
 	tsk->task_frag.page = NULL;
 	tsk->wake_q.next = NULL;
+	tsk->pf_io_worker = NULL;
 
 	account_kernel_stack(tsk, 1);
 
@@ -2097,6 +2099,9 @@ static __latent_entropy struct task_struct *copy_process(
 	p->pdeath_signal = 0;
 	INIT_LIST_HEAD(&p->thread_group);
 	p->task_works = NULL;
+#ifdef CONFIG_IO_URING
+	p->io_uring = NULL;
+#endif
 
 	cgroup_threadgroup_change_begin(current);
 	/*
@@ -2313,6 +2318,20 @@ struct task_struct *fork_idle(int cpu)
 	}
 
 	return task;
+}
+
+/* Create an io_uring worker without making it runnable. */
+struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
+{
+	unsigned long flags = CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+		CLONE_THREAD | CLONE_IO | CLONE_VM | CLONE_UNTRACED;
+	struct task_struct *p;
+
+	p = copy_process(flags, (unsigned long)fn, (unsigned long)arg,
+			 NULL, NULL, NULL, 0, 0, node);
+	if (!IS_ERR(p))
+		siginitsetinv(&p->blocked, sigmask(SIGKILL) | sigmask(SIGSTOP));
+	return p;
 }
 
 /*

@@ -78,6 +78,8 @@ extern long _do_fork(unsigned long, unsigned long, unsigned long, int __user *, 
 extern long do_fork(unsigned long, unsigned long, unsigned long, int __user *, int __user *);
 struct task_struct *fork_idle(int);
 extern pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags);
+extern struct task_struct *create_io_thread(int (*fn)(void *), void *arg,
+					      int node);
 extern long kernel_wait4(pid_t, int __user *, int, struct rusage *);
 
 extern void free_task(struct task_struct *tsk);
@@ -100,6 +102,12 @@ extern void __put_task_struct(struct task_struct *t);
 static inline void put_task_struct(struct task_struct *t)
 {
 	if (refcount_dec_and_test(&t->usage))
+		__put_task_struct(t);
+}
+
+static inline void put_task_struct_many(struct task_struct *t, int nr)
+{
+	if (refcount_sub_and_test(nr, &t->usage))
 		__put_task_struct(t);
 }
 

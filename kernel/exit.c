@@ -62,6 +62,7 @@
 #include <linux/random.h>
 #include <linux/rcuwait.h>
 #include <linux/compat.h>
+#include <linux/io_uring.h>
 #include <linux/sysfs.h>
 #include <linux/usermode_driver.h>
 
@@ -906,6 +907,7 @@ void __noreturn do_exit(long code)
 		schedule();
 	}
 
+	io_uring_files_cancel();
 	exit_signals(tsk);  /* sets PF_EXITING */
 	sched_exit(tsk);
 
