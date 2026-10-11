@@ -485,6 +485,8 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
 	struct sk_psock *psock = kzalloc_node(sizeof(*psock),
 					      GFP_ATOMIC | __GFP_NOWARN,
 					      node);
+	struct proto *prot = READ_ONCE(sk->sk_prot);
+
 	if (!psock)
 		return NULL;
 
@@ -549,13 +551,14 @@ static void sk_psock_link_destroy(struct sk_psock *psock)
 	}
 }
 
+static void sk_psock_done_strp(struct sk_psock *psock);
+
 static void sk_psock_destroy_deferred(struct work_struct *gc)
 {
 	struct sk_psock *psock = container_of(gc, struct sk_psock, gc);
 
 	/* No sk_callback_lock since already detached. */
-	if (psock->parser.enabled)
-		strp_done(&psock->parser.strp);
+	sk_psock_done_strp(psock);
 
 	cancel_work_sync(&psock->work);
 
@@ -665,14 +668,6 @@ static int sk_psock_bpf_run(struct sk_psock *psock, struct bpf_prog *prog,
 	return ret;
 }
 
-static struct sk_psock *sk_psock_from_strp(struct strparser *strp)
-{
-	struct sk_psock_parser *parser;
-
-	parser = container_of(strp, struct sk_psock_parser, strp);
-	return container_of(parser, struct sk_psock, parser);
-}
-
 static void sk_psock_skb_redirect(struct sk_psock *psock, struct sk_buff *skb)
 {
 	struct sk_psock *psock_other;
@@ -752,6 +747,15 @@ static void sk_psock_verdict_apply(struct sk_psock *psock,
 out_free:
 		kfree_skb(skb);
 	}
+}
+
+#if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
+static struct sk_psock *sk_psock_from_strp(struct strparser *strp)
+{
+	struct sk_psock_parser *parser;
+
+	parser = container_of(strp, struct sk_psock_parser, strp);
+	return container_of(parser, struct sk_psock, parser);
 }
 
 static void sk_psock_strp_read(struct strparser *strp, struct sk_buff *skb)
@@ -861,3 +865,14 @@ void sk_psock_stop_strp(struct sock *sk, struct sk_psock *psock)
 	strp_stop(&parser->strp);
 	parser->enabled = false;
 }
+
+static void sk_psock_done_strp(struct sk_psock *psock)
+{
+	if (psock->progs.skb_parser)
+		strp_done(&psock->parser.strp);
+}
+#else
+static void sk_psock_done_strp(struct sk_psock *psock)
+{
+}
+#endif /* CONFIG_BPF_STREAM_PARSER */
