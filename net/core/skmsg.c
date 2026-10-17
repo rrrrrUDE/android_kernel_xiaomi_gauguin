@@ -386,6 +386,86 @@ out:
 }
 EXPORT_SYMBOL_GPL(sk_msg_memcopy_from_iter);
 
+int sk_msg_recvmsg(struct sock *sk, struct sk_psock *psock,
+			  struct msghdr *msg, int len, int flags)
+{
+	struct list_head *p = psock->ingress_msg.next;
+	int copied = 0;
+	bool peek = flags & MSG_PEEK;
+
+	while (copied < len && p != &psock->ingress_msg) {
+		struct sk_msg *rx = list_entry(p, struct sk_msg, list);
+		struct scatterlist *sge;
+		int i, n;
+
+		i = rx->sg.start;
+		do {
+			struct page *page;
+
+			sge = sk_msg_elem(rx, i);
+			n = min_t(int, sge->length, len - copied);
+			page = sg_page(sge);
+			if (n)
+				n = copy_page_to_iter(page, sge->offset, n,
+						     &msg->msg_iter);
+			if (!n) {
+				copied = copied ? copied : -EFAULT;
+				goto out;
+			}
+
+			copied += n;
+			if (!peek) {
+				sge->offset += n;
+				sge->length -= n;
+				rx->sg.size -= n;
+				sk_mem_uncharge(sk, n);
+
+				if (!sge->length) {
+					sk_msg_iter_var_next(i);
+					if (!rx->skb)
+						put_page(page);
+				}
+			} else {
+				/* A partial peek must not advance to a later scatterlist
+				 * element: the next recvmsg call must see the same bytes.
+				 */
+				if (n != sge->length)
+					goto out;
+				sk_msg_iter_var_next(i);
+			}
+
+			if (copied == len)
+				break;
+		} while (i != rx->sg.end && !sg_is_last(sge));
+
+		if (peek) {
+			p = p->next;
+			continue;
+		}
+
+		rx->sg.start = i;
+		if (!sge->length && (i == rx->sg.end || sg_is_last(sge))) {
+			list_del(&rx->list);
+			sk_msg_free(sk, rx);
+			kfree(rx);
+		}
+		p = psock->ingress_msg.next;
+	}
+
+out:
+	if (psock->work_state.skb && copied > 0)
+		schedule_work(&psock->work);
+	return copied;
+}
+EXPORT_SYMBOL_GPL(sk_msg_recvmsg);
+
+bool sk_msg_is_readable(struct sock *sk)
+{
+	struct sk_psock *psock = sk_psock(sk);
+	return psock && !list_empty(&psock->ingress_msg);
+}
+EXPORT_SYMBOL_GPL(sk_msg_is_readable);
+
 static int sk_psock_skb_ingress(struct sk_psock *psock, struct sk_buff *skb)
 {
 	struct sock *sk = psock->sk;
@@ -482,6 +562,7 @@ end:
 
 struct sk_psock *sk_psock_init(struct sock *sk, int node)
 {
+	struct proto *prot = sk->sk_prot;
 	struct sk_psock *psock = kzalloc_node(sizeof(*psock),
 					      GFP_ATOMIC | __GFP_NOWARN,
 					      node);

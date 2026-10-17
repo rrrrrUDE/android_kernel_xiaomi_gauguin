@@ -672,14 +672,14 @@ static int unix_compat_ioctl(struct socket *sock, unsigned int cmd, unsigned lon
 #endif
 static int unix_shutdown(struct socket *, int);
 static int unix_stream_sendmsg(struct socket *, struct msghdr *, size_t);
-static int unix_stream_recvmsg(struct socket *, struct msghdr *, size_t, int);
+int unix_stream_recvmsg(struct socket *, struct msghdr *, size_t, int);
 static ssize_t unix_stream_sendpage(struct socket *, struct page *, int offset,
 				    size_t size, int flags);
 static ssize_t unix_stream_splice_read(struct socket *,  loff_t *ppos,
 				       struct pipe_inode_info *, size_t size,
 				       unsigned int flags);
 static int unix_dgram_sendmsg(struct socket *, struct msghdr *, size_t);
-static int unix_dgram_recvmsg(struct socket *, struct msghdr *, size_t, int);
+int unix_dgram_recvmsg(struct socket *, struct msghdr *, size_t, int);
 static int unix_dgram_connect(struct socket *, struct sockaddr *,
 			      int, int);
 static int unix_seqpacket_sendmsg(struct socket *, struct msghdr *, size_t);
@@ -776,7 +776,7 @@ static const struct proto_ops unix_seqpacket_ops = {
 	.set_peek_off =	unix_set_peek_off,
 };
 
-static struct proto unix_proto = {
+struct proto unix_proto = {
 	.name			= "UNIX",
 	.owner			= THIS_MODULE,
 	.obj_size		= sizeof(struct unix_sock),
@@ -2105,7 +2105,7 @@ static void unix_copy_addr(struct msghdr *msg, struct sock *sk)
 	}
 }
 
-static int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
+int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
 			      size_t size, int flags)
 {
 	struct scm_cookie scm;
@@ -2475,7 +2475,7 @@ static int unix_stream_read_actor(struct sk_buff *skb,
 	return ret ?: chunk;
 }
 
-static int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg,
+int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg,
 			       size_t size, int flags)
 {
 	struct unix_stream_read_state state = {

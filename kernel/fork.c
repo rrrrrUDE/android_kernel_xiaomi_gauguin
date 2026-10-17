@@ -95,6 +95,7 @@
 #include <linux/thread_info.h>
 #include <linux/cpufreq_times.h>
 #include <linux/scs.h>
+#include <linux/bpf.h>
 
 #include <linux/pgtable.h>
 #include <asm/pgalloc.h>
@@ -425,6 +426,9 @@ void free_task(struct task_struct *tsk)
 	arch_release_task_struct(tsk);
 	if (tsk->flags & PF_KTHREAD)
 		free_kthread_struct(tsk);
+#ifdef CONFIG_BPF_SYSCALL
+	bpf_task_storage_free(tsk);
+#endif
 	free_task_struct(tsk);
 }
 EXPORT_SYMBOL(free_task);
@@ -1964,6 +1968,11 @@ static __latent_entropy struct task_struct *copy_process(
 #endif
 
 	p->pagefault_disabled = 0;
+
+#ifdef CONFIG_BPF_SYSCALL
+	RCU_INIT_POINTER(p->bpf_storage, NULL);
+	p->bpf_ctx = NULL;
+#endif
 
 #ifdef CONFIG_LOCKDEP
 	p->lockdep_depth = 0; /* no locks held yet */

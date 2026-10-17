@@ -393,6 +393,8 @@ struct sock {
 	unsigned int		sk_ll_usec;
 	/* ===== mostly read cache line ===== */
 	unsigned int		sk_napi_id;
+	u8			sk_prefer_busy_poll;
+	u16			sk_busy_poll_budget;
 #endif
 	int			sk_rcvbuf;
 

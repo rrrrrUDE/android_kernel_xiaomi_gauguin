@@ -194,6 +194,8 @@ struct bpf_func_state {
 	 * zero == main subprog
 	 */
 	u32 subprogno;
+	/* This frame is entered by a BPF helper callback, not a BPF-to-BPF call. */
+	bool in_callback_fn;
 
 	/* The following fields should be last. See copy_func_state() */
 	int acquired_refs;
@@ -201,6 +203,7 @@ struct bpf_func_state {
 	int allocated_stack;
 	struct bpf_stack_state *stack;
 };
+
 
 struct bpf_id_pair {
 	u32 old;

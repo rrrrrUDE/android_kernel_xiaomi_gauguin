@@ -4110,7 +4110,7 @@ int dev_queue_xmit_accel(struct sk_buff *skb, struct net_device *sb_dev)
 }
 EXPORT_SYMBOL(dev_queue_xmit_accel);
 
-int dev_direct_xmit(struct sk_buff *skb, u16 queue_id)
+int __dev_direct_xmit(struct sk_buff *skb, u16 queue_id)
 {
 	struct net_device *dev = skb->dev;
 	struct sk_buff *orig_skb = skb;
@@ -4140,14 +4140,21 @@ int dev_direct_xmit(struct sk_buff *skb, u16 queue_id)
 
 	local_bh_enable();
 
-	if (!dev_xmit_complete(ret))
-		kfree_skb(skb);
-
 	return ret;
 drop:
 	atomic_long_inc(&dev->tx_dropped);
 	kfree_skb_list(skb);
 	return NET_XMIT_DROP;
+}
+EXPORT_SYMBOL(__dev_direct_xmit);
+
+int dev_direct_xmit(struct sk_buff *skb, u16 queue_id)
+{
+	int ret = __dev_direct_xmit(skb, queue_id);
+
+	if (!dev_xmit_complete(ret))
+		kfree_skb(skb);
+	return ret;
 }
 EXPORT_SYMBOL(dev_direct_xmit);
 
@@ -9178,7 +9185,7 @@ static int netif_alloc_rx_queues(struct net_device *dev)
 		rx[i].dev = dev;
 
 		/* XDP RX-queue setup */
-		err = xdp_rxq_info_reg(&rx[i].xdp_rxq, dev, i);
+		err = xdp_rxq_info_reg(&rx[i].xdp_rxq, dev, i, 0);
 		if (err < 0)
 			goto err_rxq_info;
 	}

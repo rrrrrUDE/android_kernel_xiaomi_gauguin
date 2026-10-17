@@ -650,6 +650,35 @@ static const struct bpf_iter_seq_info iter_seq_info = {
 	.seq_priv_size		= sizeof(struct bpf_iter_seq_array_map_info),
 };
 
+static int bpf_for_each_array_elem(struct bpf_map *map, void *callback_fn,
+				   void *callback_ctx, u64 flags)
+{
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+	bool is_percpu = map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY;
+	u32 i, key, num_elems = 0;
+	void *val;
+	u64 ret = 0;
+
+	if (flags)
+		return -EINVAL;
+	if (is_percpu)
+		migrate_disable();
+	for (i = 0; i < map->max_entries; i++) {
+		val = is_percpu ? this_cpu_ptr(array->pptrs[i]) :
+			array->value + array->elem_size * i;
+		key = i;
+		num_elems++;
+		ret = BPF_CAST_CALL(callback_fn)((u64)(long)map,
+			(u64)(long)&key, (u64)(long)val,
+			(u64)(long)callback_ctx, 0);
+		if (ret)
+			break;
+	}
+	if (is_percpu)
+		migrate_enable();
+	return num_elems;
+}
+
 static int array_map_btf_id;
 const struct bpf_map_ops array_map_ops = {
 	.map_meta_equal = array_map_meta_equal,
@@ -666,6 +695,7 @@ const struct bpf_map_ops array_map_ops = {
 	.map_mmap = array_map_mmap,
 	.map_seq_show_elem = array_map_seq_show_elem,
 	.map_check_btf = array_map_check_btf,
+	.map_for_each_callback = bpf_for_each_array_elem,
 	.map_lookup_batch = generic_map_lookup_batch,
 	.map_update_batch = generic_map_update_batch,
 	.map_btf_name = "bpf_array",
@@ -685,6 +715,7 @@ const struct bpf_map_ops percpu_array_map_ops = {
 	.map_delete_elem = array_map_delete_elem,
 	.map_seq_show_elem = percpu_array_map_seq_show_elem,
 	.map_check_btf = array_map_check_btf,
+	.map_for_each_callback = bpf_for_each_array_elem,
 	.map_btf_name = "bpf_array",
 	.map_btf_id = &percpu_array_map_btf_id,
 	.iter_seq_info = &iter_seq_info,

@@ -40,6 +40,7 @@ enum xdp_mem_type {
 	MEM_TYPE_PAGE_ORDER0,     /* Orig XDP full page model */
 	MEM_TYPE_PAGE_POOL,
 	MEM_TYPE_ZERO_COPY,
+	MEM_TYPE_XSK_BUFF_POOL,
 	MEM_TYPE_MAX,
 };
 
@@ -63,6 +64,7 @@ struct xdp_rxq_info {
 	u32 queue_index;
 	u32 reg_state;
 	struct xdp_mem_info mem;
+	unsigned int napi_id;
 } ____cacheline_aligned; /* perf critical, avoid false-sharing */
 
 struct xdp_txq_info {
@@ -167,7 +169,8 @@ struct xdp_frame *xdp_convert_buff_to_frame(struct xdp_buff *xdp)
 	int headroom;
 
 	/* TODO: implement clone, copy, use "native" MEM_TYPE */
-	if (xdp->rxq->mem.type == MEM_TYPE_ZERO_COPY)
+	if (xdp->rxq->mem.type == MEM_TYPE_ZERO_COPY ||
+	    xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL)
 		return NULL;
 
 	/* Assure headroom is available for storing info */
@@ -218,7 +221,8 @@ static inline void xdp_release_frame(struct xdp_frame *xdpf)
 }
 
 int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
-		     struct net_device *dev, u32 queue_index);
+		     struct net_device *dev, u32 queue_index,
+		     unsigned int napi_id);
 void xdp_rxq_info_unreg(struct xdp_rxq_info *xdp_rxq);
 void xdp_rxq_info_unused(struct xdp_rxq_info *xdp_rxq);
 bool xdp_rxq_info_is_reg(struct xdp_rxq_info *xdp_rxq);

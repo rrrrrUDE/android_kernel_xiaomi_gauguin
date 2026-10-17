@@ -13,165 +13,29 @@
 #include <linux/mm.h>
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
+#include <linux/idr.h>
+#include <linux/vmalloc.h>
 
 #include "xdp_umem.h"
 #include "xsk_queue.h"
 
 #define XDP_UMEM_MIN_CHUNK_SIZE 2048
 
-void xdp_add_sk_umem(struct xdp_umem *umem, struct xdp_sock *xs)
-{
-	unsigned long flags;
-
-	if (!xs->tx)
-		return;
-
-	spin_lock_irqsave(&umem->xsk_list_lock, flags);
-	list_add_rcu(&xs->list, &umem->xsk_list);
-	spin_unlock_irqrestore(&umem->xsk_list_lock, flags);
-}
-
-void xdp_del_sk_umem(struct xdp_umem *umem, struct xdp_sock *xs)
-{
-	unsigned long flags;
-
-	if (!xs->tx)
-		return;
-
-	spin_lock_irqsave(&umem->xsk_list_lock, flags);
-	list_del_rcu(&xs->list);
-	spin_unlock_irqrestore(&umem->xsk_list_lock, flags);
-}
-
-/* The umem is stored both in the _rx struct and the _tx struct as we do
- * not know if the device has more tx queues than rx, or the opposite.
- * This might also change during run time.
- */
-static void xdp_reg_umem_at_qid(struct net_device *dev, struct xdp_umem *umem,
-				u16 queue_id)
-{
-	if (queue_id < dev->real_num_rx_queues)
-		dev->_rx[queue_id].umem = umem;
-	if (queue_id < dev->real_num_tx_queues)
-		dev->_tx[queue_id].umem = umem;
-}
-
-static struct xdp_umem *xdp_get_umem_from_qid(struct net_device *dev,
-					      u16 queue_id)
-{
-	if (queue_id < dev->real_num_rx_queues)
-		return dev->_rx[queue_id].umem;
-	if (queue_id < dev->real_num_tx_queues)
-		return dev->_tx[queue_id].umem;
-
-	return NULL;
-}
-
-static void xdp_clear_umem_at_qid(struct net_device *dev, u16 queue_id)
-{
-	/* Zero out the entry independent on how many queues are configured
-	 * at this point in time, as it might be used in the future.
-	 */
-	if (queue_id < dev->num_rx_queues)
-		dev->_rx[queue_id].umem = NULL;
-	if (queue_id < dev->num_tx_queues)
-		dev->_tx[queue_id].umem = NULL;
-}
-
-int xdp_umem_assign_dev(struct xdp_umem *umem, struct net_device *dev,
-			u16 queue_id, u16 flags)
-{
-	bool force_zc, force_copy;
-	struct netdev_bpf bpf;
-	int err = 0;
-
-	force_zc = flags & XDP_ZEROCOPY;
-	force_copy = flags & XDP_COPY;
-
-	if (force_zc && force_copy)
-		return -EINVAL;
-
-	rtnl_lock();
-	if (xdp_get_umem_from_qid(dev, queue_id)) {
-		err = -EBUSY;
-		goto out_rtnl_unlock;
-	}
-
-	xdp_reg_umem_at_qid(dev, umem, queue_id);
-	umem->dev = dev;
-	umem->queue_id = queue_id;
-	if (force_copy)
-		/* For copy-mode, we are done. */
-		goto out_rtnl_unlock;
-
-	if (!dev->netdev_ops->ndo_bpf || !dev->netdev_ops->ndo_xsk_wakeup) {
-		err = -EOPNOTSUPP;
-		goto err_unreg_umem;
-	}
-
-	bpf.command = XDP_SETUP_XSK_UMEM;
-	bpf.xsk.umem = umem;
-	bpf.xsk.queue_id = queue_id;
-
-	err = dev->netdev_ops->ndo_bpf(dev, &bpf);
-	if (err)
-		goto err_unreg_umem;
-	rtnl_unlock();
-
-	dev_hold(dev);
-	umem->zc = true;
-	return 0;
-
-err_unreg_umem:
-	xdp_clear_umem_at_qid(dev, queue_id);
-	if (!force_zc)
-		err = 0; /* fallback to copy mode */
-out_rtnl_unlock:
-	rtnl_unlock();
-	return err;
-}
-
-void xdp_umem_clear_dev(struct xdp_umem *umem)
-{
-	struct netdev_bpf bpf;
-	int err;
-
-	ASSERT_RTNL();
-
-	if (!umem->dev)
-		return;
-
-	if (umem->zc) {
-		bpf.command = XDP_SETUP_XSK_UMEM;
-		bpf.xsk.umem = NULL;
-		bpf.xsk.queue_id = umem->queue_id;
-
-		err = umem->dev->netdev_ops->ndo_bpf(umem->dev, &bpf);
-
-		if (err)
-			WARN(1, "failed to disable umem!\n");
-	}
-
-	xdp_clear_umem_at_qid(umem->dev, umem->queue_id);
-
-	if (umem->zc) {
-		dev_put(umem->dev);
-		umem->zc = false;
-	}
-}
+static DEFINE_IDA(umem_ida);
 
 static void xdp_umem_unpin_pages(struct xdp_umem *umem)
 {
 	unsigned int i;
 
+	/* 4.19 GUP returns ordinary page references.  XDP UMEM is writable
+	 * userspace memory, so dirty each page before dropping that reference.
+	 */
 	for (i = 0; i < umem->npgs; i++) {
-		struct page *page = umem->pgs[i];
-
-		set_page_dirty_lock(page);
-		put_page(page);
+		set_page_dirty_lock(umem->pgs[i]);
+		put_page(umem->pgs[i]);
 	}
 
-	kfree(umem->pgs);
+	kvfree(umem->pgs);
 	umem->pgs = NULL;
 }
 
@@ -183,28 +47,28 @@ static void xdp_umem_unaccount_pages(struct xdp_umem *umem)
 	}
 }
 
+static void xdp_umem_addr_unmap(struct xdp_umem *umem)
+{
+	vunmap(umem->addrs);
+	umem->addrs = NULL;
+}
+
+static int xdp_umem_addr_map(struct xdp_umem *umem, struct page **pages,
+			     u32 nr_pages)
+{
+	umem->addrs = vmap(pages, nr_pages, VM_MAP, PAGE_KERNEL);
+	if (!umem->addrs)
+		return -ENOMEM;
+	return 0;
+}
+
 static void xdp_umem_release(struct xdp_umem *umem)
 {
-	rtnl_lock();
-	xdp_umem_clear_dev(umem);
-	rtnl_unlock();
+	umem->zc = false;
+	ida_simple_remove(&umem_ida, umem->id);
 
-	if (umem->fq) {
-		xskq_destroy(umem->fq);
-		umem->fq = NULL;
-	}
-
-	if (umem->cq) {
-		xskq_destroy(umem->cq);
-		umem->cq = NULL;
-	}
-
-	xsk_reuseq_destroy(umem);
-
+	xdp_umem_addr_unmap(umem);
 	xdp_umem_unpin_pages(umem);
-
-	kfree(umem->pages);
-	umem->pages = NULL;
 
 	xdp_umem_unaccount_pages(umem);
 	kfree(umem);
@@ -222,32 +86,34 @@ void xdp_get_umem(struct xdp_umem *umem)
 	refcount_inc(&umem->users);
 }
 
-void xdp_put_umem(struct xdp_umem *umem)
+void xdp_put_umem(struct xdp_umem *umem, bool defer_cleanup)
 {
 	if (!umem)
 		return;
 
 	if (refcount_dec_and_test(&umem->users)) {
-		INIT_WORK(&umem->work, xdp_umem_release_deferred);
-		schedule_work(&umem->work);
+		if (defer_cleanup) {
+			INIT_WORK(&umem->work, xdp_umem_release_deferred);
+			schedule_work(&umem->work);
+		} else {
+			xdp_umem_release(umem);
+		}
 	}
 }
 
-static int xdp_umem_pin_pages(struct xdp_umem *umem)
+static int xdp_umem_pin_pages(struct xdp_umem *umem, unsigned long address)
 {
 	unsigned int gup_flags = FOLL_WRITE;
 	long npgs;
 	int err;
 
-	umem->pgs = kcalloc(umem->npgs, sizeof(*umem->pgs),
-			    GFP_KERNEL | __GFP_NOWARN);
+	umem->pgs = kvcalloc(umem->npgs, sizeof(*umem->pgs), GFP_KERNEL | __GFP_NOWARN);
 	if (!umem->pgs)
 		return -ENOMEM;
 
-	mmap_write_lock(current->mm);
-	npgs = get_user_pages(umem->address, umem->npgs,
-			      gup_flags, &umem->pgs[0], NULL);
-	mmap_write_unlock(current->mm);
+	/* 4.19 provides the long-term GUP wrapper with the DAX lifetime check. */
+	npgs = get_user_pages_longterm(address, umem->npgs, gup_flags,
+				       &umem->pgs[0], NULL);
 
 	if (npgs != umem->npgs) {
 		if (npgs >= 0) {
@@ -263,7 +129,7 @@ static int xdp_umem_pin_pages(struct xdp_umem *umem)
 out_pin:
 	xdp_umem_unpin_pages(umem);
 out_pgs:
-	kfree(umem->pgs);
+	kvfree(umem->pgs);
 	umem->pgs = NULL;
 	return err;
 }
@@ -293,10 +159,12 @@ static int xdp_umem_account_pages(struct xdp_umem *umem)
 
 static int xdp_umem_reg(struct xdp_umem *umem, struct xdp_umem_reg *mr)
 {
+	bool unaligned_chunks = mr->flags & XDP_UMEM_UNALIGNED_CHUNK_FLAG;
 	u32 chunk_size = mr->chunk_size, headroom = mr->headroom;
-	u64 npgs, addr = mr->addr, size = mr->len;
-	unsigned int chunks, chunks_per_page;
-	int err, i;
+	u64 addr = mr->addr, size = mr->len;
+	u32 chunks_rem, npgs_rem;
+	u64 chunks, npgs;
+	int err;
 
 	if (chunk_size < XDP_UMEM_MIN_CHUNK_SIZE || chunk_size > PAGE_SIZE) {
 		/* Strictly speaking we could support this, if:
@@ -308,7 +176,10 @@ static int xdp_umem_reg(struct xdp_umem *umem, struct xdp_umem_reg *mr)
 		return -EINVAL;
 	}
 
-	if (!is_power_of_2(chunk_size))
+	if (mr->flags & ~XDP_UMEM_UNALIGNED_CHUNK_FLAG)
+		return -EINVAL;
+
+	if (!unaligned_chunks && !is_power_of_2(chunk_size))
 		return -EINVAL;
 
 	if (!PAGE_ALIGNED(addr)) {
@@ -321,57 +192,51 @@ static int xdp_umem_reg(struct xdp_umem *umem, struct xdp_umem_reg *mr)
 	if ((addr + size) < addr)
 		return -EINVAL;
 
-	npgs = div_u64(size, PAGE_SIZE);
+	npgs = div_u64_rem(size, PAGE_SIZE, &npgs_rem);
+	if (npgs_rem)
+		npgs++;
 	if (npgs > U32_MAX)
 		return -EINVAL;
 
-	chunks = (unsigned int)div_u64(size, chunk_size);
-	if (chunks == 0)
+	chunks = div_u64_rem(size, chunk_size, &chunks_rem);
+	if (!chunks || chunks > U32_MAX)
 		return -EINVAL;
 
-	chunks_per_page = PAGE_SIZE / chunk_size;
-	if (chunks < chunks_per_page || chunks % chunks_per_page)
+	if (!unaligned_chunks && chunks_rem)
 		return -EINVAL;
-
-	headroom = ALIGN(headroom, 64);
 
 	if (headroom > chunk_size - XDP_PACKET_HEADROOM -
 		       SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) - 128)
 		return -EINVAL;
 
-	umem->address = (unsigned long)addr;
-	umem->props.chunk_mask = ~((u64)chunk_size - 1);
-	umem->props.size = size;
+	umem->size = size;
 	umem->headroom = headroom;
-	umem->chunk_size_nohr = chunk_size - headroom;
-	umem->npgs = (u32)npgs;
+	umem->chunk_size = chunk_size;
+	umem->chunk_mask = ~((u64)chunk_size - 1);
+	umem->chunks = chunks;
+	umem->npgs = npgs;
 	umem->pgs = NULL;
 	umem->user = NULL;
-	INIT_LIST_HEAD(&umem->xsk_list);
-	spin_lock_init(&umem->xsk_list_lock);
+	umem->flags = mr->flags;
 
+	INIT_LIST_HEAD(&umem->xsk_dma_list);
 	refcount_set(&umem->users, 1);
 
 	err = xdp_umem_account_pages(umem);
 	if (err)
 		return err;
 
-	err = xdp_umem_pin_pages(umem);
+	err = xdp_umem_pin_pages(umem, (unsigned long)addr);
 	if (err)
 		goto out_account;
 
-	umem->pages = kcalloc(umem->npgs, sizeof(*umem->pages), GFP_KERNEL);
-	if (!umem->pages) {
-		err = -ENOMEM;
-		goto out_pin;
-	}
-
-	for (i = 0; i < umem->npgs; i++)
-		umem->pages[i].addr = page_address(umem->pgs[i]);
+	err = xdp_umem_addr_map(umem, umem->pgs, umem->npgs);
+	if (err)
+		goto out_unpin;
 
 	return 0;
 
-out_pin:
+out_unpin:
 	xdp_umem_unpin_pages(umem);
 out_account:
 	xdp_umem_unaccount_pages(umem);
@@ -387,16 +252,19 @@ struct xdp_umem *xdp_umem_create(struct xdp_umem_reg *mr)
 	if (!umem)
 		return ERR_PTR(-ENOMEM);
 
+	err = ida_simple_get(&umem_ida, 0, 0, GFP_KERNEL);
+	if (err < 0) {
+		kfree(umem);
+		return ERR_PTR(err);
+	}
+	umem->id = err;
+
 	err = xdp_umem_reg(umem, mr);
 	if (err) {
+		ida_simple_remove(&umem_ida, umem->id);
 		kfree(umem);
 		return ERR_PTR(err);
 	}
 
 	return umem;
-}
-
-bool xdp_umem_validate_queues(struct xdp_umem *umem)
-{
-	return umem->fq && umem->cq;
 }

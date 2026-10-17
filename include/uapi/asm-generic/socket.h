@@ -79,6 +79,9 @@
 
 #define SO_BUSY_POLL		46
 
+#define SO_PREFER_BUSY_POLL	69
+#define SO_BUSY_POLL_BUDGET	70
+
 #define SO_MAX_PACING_RATE	47
 
 #define SO_BPF_EXTENSIONS	48

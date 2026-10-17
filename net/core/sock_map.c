@@ -11,6 +11,7 @@
 #include <linux/list.h>
 #include <linux/jhash.h>
 #include <linux/sock_diag.h>
+#include <net/tcp.h>
 
 struct bpf_stab {
 	struct bpf_map map;

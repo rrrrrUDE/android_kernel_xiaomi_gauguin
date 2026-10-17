@@ -13,6 +13,7 @@
 #include <linux/rhashtable.h>
 #include <linux/bug.h>
 #include <net/page_pool.h>
+#include <net/xdp_sock_drv.h>
 
 #include <net/xdp.h>
 
@@ -138,7 +139,8 @@ static void xdp_rxq_info_init(struct xdp_rxq_info *xdp_rxq)
 
 /* Returns 0 on success, negative on failure */
 int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
-		     struct net_device *dev, u32 queue_index)
+		     struct net_device *dev, u32 queue_index,
+		     unsigned int napi_id)
 {
 	if (xdp_rxq->reg_state == REG_STATE_UNUSED) {
 		WARN(1, "Driver promised not to register this");
@@ -159,6 +161,7 @@ int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
 	xdp_rxq_info_init(xdp_rxq);
 	xdp_rxq->dev = dev;
 	xdp_rxq->queue_index = queue_index;
+	xdp_rxq->napi_id = napi_id;
 
 	xdp_rxq->reg_state = REG_STATE_REGISTERED;
 	return 0;
@@ -312,7 +315,7 @@ EXPORT_SYMBOL_GPL(xdp_rxq_info_reg_mem_model);
  * of xdp_frames/pages in those cases.
  */
 static void __xdp_return(void *data, struct xdp_mem_info *mem, bool napi_direct,
-			 unsigned long handle)
+			 struct xdp_buff *xdp)
 {
 	struct xdp_mem_allocator *xa;
 	struct page *page;
@@ -339,12 +342,22 @@ static void __xdp_return(void *data, struct xdp_mem_info *mem, bool napi_direct,
 		put_page(page);
 		break;
 	case MEM_TYPE_ZERO_COPY:
-		/* NB! Only valid from an xdp_buff! */
+		/* NB! Only valid from an xdp_buff. */
 		rcu_read_lock();
-		/* mem->id is valid, checked in xdp_rxq_info_reg_mem_model() */
 		xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
-		xa->zc_alloc->free(xa->zc_alloc, handle);
+		if (xa && xdp)
+			xa->zc_alloc->free(xa->zc_alloc, xdp->handle);
 		rcu_read_unlock();
+		break;
+	case MEM_TYPE_XSK_BUFF_POOL:
+		/* AF_XDP buffers can only be returned from an xdp_buff, never
+		 * from an xdp_frame.  xdp_convert_buff_to_frame() rejects this
+		 * memory model, so xdp is non-NULL on all valid paths.
+		 */
+		if (WARN_ON_ONCE(!xdp))
+			break;
+		xsk_buff_free(xdp);
+		break;
 	default:
 		/* Not possible, checked in xdp_rxq_info_reg_mem_model() */
 		break;
@@ -353,19 +366,19 @@ static void __xdp_return(void *data, struct xdp_mem_info *mem, bool napi_direct,
 
 void xdp_return_frame(struct xdp_frame *xdpf)
 {
-	__xdp_return(xdpf->data, &xdpf->mem, false, 0);
+	__xdp_return(xdpf->data, &xdpf->mem, false, NULL);
 }
 EXPORT_SYMBOL_GPL(xdp_return_frame);
 
 void xdp_return_frame_rx_napi(struct xdp_frame *xdpf)
 {
-	__xdp_return(xdpf->data, &xdpf->mem, true, 0);
+	__xdp_return(xdpf->data, &xdpf->mem, true, NULL);
 }
 EXPORT_SYMBOL_GPL(xdp_return_frame_rx_napi);
 
 void xdp_return_buff(struct xdp_buff *xdp)
 {
-	__xdp_return(xdp->data, &xdp->rxq->mem, true, xdp->handle);
+	__xdp_return(xdp->data, &xdp->rxq->mem, true, xdp);
 }
 EXPORT_SYMBOL_GPL(xdp_return_buff);
 

@@ -36,6 +36,8 @@
 struct audit_context;
 struct backing_dev_info;
 struct bio_list;
+struct bpf_local_storage;
+struct bpf_run_ctx;
 struct blk_plug;
 struct cfs_rq;
 struct fs_struct;
@@ -839,6 +841,11 @@ struct task_struct {
 	 * scheduling-critical items should be added above here.
 	 */
 	randomized_struct_fields_start
+
+#ifdef CONFIG_BPF_SYSCALL
+	struct bpf_local_storage __rcu	*bpf_storage;
+	struct bpf_run_ctx		*bpf_ctx;
+#endif
 
 	void				*stack;
 	refcount_t			usage;

@@ -445,6 +445,28 @@ struct pid_namespace *task_active_pid_ns(struct task_struct *tsk)
 }
 EXPORT_SYMBOL_GPL(task_active_pid_ns);
 
+struct pid *pidfd_get_pid(unsigned int fd, unsigned int *flags)
+{
+	struct fd f;
+	struct pid *pid;
+
+	f = fdget(fd);
+	if (!f.file)
+		return ERR_PTR(-EBADF);
+
+	if (f.file->f_op != &pidfd_fops) {
+		fdput(f);
+		return ERR_PTR(-EBADF);
+	}
+
+	pid = get_pid(f.file->private_data);
+	if (flags)
+		*flags = f.file->f_flags;
+	fdput(f);
+	return pid;
+}
+EXPORT_SYMBOL_GPL(pidfd_get_pid);
+
 /*
  * Used by proc to find the first pid that is greater than or equal to nr.
  *

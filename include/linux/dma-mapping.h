@@ -285,6 +285,22 @@ static inline const struct dma_map_ops *get_dma_ops(struct device *dev)
 }
 #endif
 
+/* Whether a mapped address requires explicit CPU/device cache ownership
+ * transitions.  Newer DMA APIs expose this helper; keep the decision local
+ * to the mapping ops on 4.19, where direct coherent mappings have no sync
+ * callbacks and non-coherent/IOMMU mappings do.
+ */
+static inline bool dma_need_sync(struct device *dev, dma_addr_t dma_addr)
+{
+#ifdef CONFIG_HAS_DMA
+	const struct dma_map_ops *ops = get_dma_ops(dev);
+
+	return ops && (ops->sync_single_for_cpu || ops->sync_single_for_device);
+#else
+	return false;
+#endif
+}
+
 static inline dma_addr_t dma_map_single_attrs(struct device *dev, void *ptr,
 					      size_t size,
 					      enum dma_data_direction dir,

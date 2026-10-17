@@ -5571,3 +5571,36 @@ bool btf_id_set_contains(const struct btf_id_set *set, u32 id)
 {
 	return bsearch(&id, set->ids, set->cnt, sizeof(u32), btf_id_cmp_func) != NULL;
 }
+
+/*
+ * The 4.19 BTF implementation only has the vmlinux BTF object: it has no
+ * module-BTF registry to walk.  Keep the 5.15 helper ABI and semantics for
+ * the BTF namespace that exists here instead of fabricating module support.
+ */
+BPF_CALL_4(bpf_btf_find_by_name_kind, char *, name, int, name_sz,
+	   u32, kind, int, flags)
+{
+	struct btf *btf;
+
+	if (flags)
+		return -EINVAL;
+	if (name_sz <= 1 || name[name_sz - 1])
+		return -EINVAL;
+
+	btf = bpf_get_btf_vmlinux();
+	if (IS_ERR(btf))
+		return PTR_ERR(btf);
+
+	return btf_find_by_name_kind(btf, name, kind);
+}
+
+const struct bpf_func_proto bpf_btf_find_by_name_kind_proto = {
+	.func		= bpf_btf_find_by_name_kind,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	/* 4.19 has no MEM_RDONLY argument modifier; the helper never writes it. */
+	.arg1_type	= ARG_PTR_TO_MEM,
+	.arg2_type	= ARG_CONST_SIZE,
+	.arg3_type	= ARG_ANYTHING,
+	.arg4_type	= ARG_ANYTHING,
+};
