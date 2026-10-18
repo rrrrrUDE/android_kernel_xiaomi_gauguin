@@ -192,6 +192,12 @@ static inline gfp_t current_gfp_context(gfp_t flags)
 	return flags;
 }
 
+/* Mark allocation sites for lockdep, as used by the XArray API. */
+static inline void might_alloc(gfp_t gfp_mask)
+{
+	might_sleep_if(gfpflags_allow_blocking(gfp_mask));
+}
+
 #ifdef CONFIG_LOCKDEP
 extern void __fs_reclaim_acquire(void);
 extern void __fs_reclaim_release(void);

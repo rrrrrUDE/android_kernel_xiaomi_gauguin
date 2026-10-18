@@ -19,6 +19,9 @@
 #include <linux/fcntl.h>
 #include <linux/types.h>
 
+/* Internal wakeup marker used by io_uring poll integration. */
+#define EPOLL_URING_WAKE	((__force __poll_t)(1U << 27))
+
 /* Flags for epoll_create1.  */
 #define EPOLL_CLOEXEC O_CLOEXEC
 

@@ -68,6 +68,7 @@ struct perf_event_attr;
 struct file_handle;
 struct sigaltstack;
 struct rseq;
+struct io_uring_params;
 union bpf_attr;
 
 #include <linux/types.h>
@@ -298,6 +299,13 @@ asmlinkage long sys_io_getevents(aio_context_t ctx_id,
 				long nr,
 				struct io_event __user *events,
 				struct timespec __user *timeout);
+asmlinkage long sys_io_uring_setup(u32 entries,
+				struct io_uring_params __user *p);
+asmlinkage long sys_io_uring_enter(unsigned int fd, u32 to_submit,
+				u32 min_complete, u32 flags,
+				const void __user *argp, size_t argsz);
+asmlinkage long sys_io_uring_register(unsigned int fd, unsigned int op,
+				void __user *arg, unsigned int nr_args);
 asmlinkage long sys_io_pgetevents(aio_context_t ctx_id,
 				long min_nr,
 				long nr,
@@ -1150,6 +1158,10 @@ int ksys_unshare(unsigned long unshare_flags);
 int ksys_setsid(void);
 int ksys_sync_file_range(int fd, loff_t offset, loff_t nbytes,
 			 unsigned int flags);
+int sync_file_range(struct file *file, loff_t offset, loff_t nbytes,
+			unsigned int flags);
+int do_statx(int dfd, const char __user *filename, unsigned flags,
+	     unsigned int mask, struct statx __user *buffer);
 ssize_t ksys_pread64(unsigned int fd, char __user *buf, size_t count,
 		     loff_t pos);
 ssize_t ksys_pwrite64(unsigned int fd, const char __user *buf,
@@ -1180,27 +1192,27 @@ static inline long ksys_unlink(const char __user *pathname)
 	return do_unlinkat(AT_FDCWD, getname(pathname));
 }
 
-extern long do_rmdir(int dfd, const char __user *pathname);
+extern long do_rmdir(int dfd, struct filename *name);
 
 static inline long ksys_rmdir(const char __user *pathname)
 {
-	return do_rmdir(AT_FDCWD, pathname);
+	return do_rmdir(AT_FDCWD, getname(pathname));
 }
 
-extern long do_mkdirat(int dfd, const char __user *pathname, umode_t mode);
+extern long do_mkdirat(int dfd, struct filename *name, umode_t mode);
 
 static inline long ksys_mkdir(const char __user *pathname, umode_t mode)
 {
-	return do_mkdirat(AT_FDCWD, pathname, mode);
+	return do_mkdirat(AT_FDCWD, getname(pathname), mode);
 }
 
-extern long do_symlinkat(const char __user *oldname, int newdfd,
-			 const char __user *newname);
+extern long do_symlinkat(struct filename *oldname, int newdfd,
+			 struct filename *newname);
 
 static inline long ksys_symlink(const char __user *oldname,
 				const char __user *newname)
 {
-	return do_symlinkat(oldname, AT_FDCWD, newname);
+	return do_symlinkat(getname(oldname), AT_FDCWD, getname(newname));
 }
 
 extern long do_mknodat(int dfd, const char __user *filename, umode_t mode,
@@ -1212,13 +1224,14 @@ static inline long ksys_mknod(const char __user *filename, umode_t mode,
 	return do_mknodat(AT_FDCWD, filename, mode, dev);
 }
 
-extern int do_linkat(int olddfd, const char __user *oldname, int newdfd,
-		     const char __user *newname, int flags);
+extern int do_linkat(int olddfd, struct filename *oldname, int newdfd,
+		     struct filename *newname, int flags);
 
 static inline long ksys_link(const char __user *oldname,
 			     const char __user *newname)
 {
-	return do_linkat(AT_FDCWD, oldname, AT_FDCWD, newname, 0);
+	return do_linkat(AT_FDCWD, getname(oldname), AT_FDCWD,
+			 getname(newname), 0);
 }
 
 extern int do_fchmodat(int dfd, const char __user *filename, umode_t mode);

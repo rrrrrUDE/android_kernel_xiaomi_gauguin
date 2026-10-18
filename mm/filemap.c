@@ -1004,18 +1004,6 @@ void __init pagecache_init(void)
 }
 
 /* This has the same layout as wait_bit_key - see fs/cachefiles/rdwr.c */
-struct wait_page_key {
-	struct page *page;
-	int bit_nr;
-	int page_match;
-};
-
-struct wait_page_queue {
-	struct page *page;
-	int bit_nr;
-	wait_queue_entry_t wait;
-};
-
 static int wake_page_function(wait_queue_entry_t *wait, unsigned mode, int sync, void *arg)
 {
 	struct wait_page_key *key = arg;
@@ -1384,6 +1372,26 @@ int __sched __lock_page_killable(struct page *__page)
 					EXCLUSIVE);
 }
 EXPORT_SYMBOL_GPL(__lock_page_killable);
+
+int __sched __lock_page_async(struct page *page, struct wait_page_queue *wait)
+{
+	struct wait_queue_head *q = page_waitqueue(page);
+	int ret;
+
+	wait->page = page;
+	wait->bit_nr = PG_locked;
+	spin_lock_irq(&q->lock);
+	__add_wait_queue_entry_tail(q, &wait->wait);
+	SetPageWaiters(page);
+	ret = !trylock_page(page);
+	if (!ret)
+		__remove_wait_queue(q, &wait->wait);
+	else
+		ret = -EIOCBQUEUED;
+	spin_unlock_irq(&q->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(__lock_page_async);
 
 /*
  * Return values:

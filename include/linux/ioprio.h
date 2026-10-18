@@ -6,6 +6,8 @@
 #include <linux/sched/rt.h>
 #include <linux/iocontext.h>
 
+#define IOPRIO_DEFAULT	IOPRIO_PRIO_VALUE(IOPRIO_CLASS_NONE, 0)
+
 /*
  * Gives us 8 prio classes with 13-bits of data for each class
  */
@@ -68,6 +70,15 @@ static inline int task_nice_ioclass(struct task_struct *task)
 		return IOPRIO_CLASS_RT;
 	else
 		return IOPRIO_CLASS_BE;
+}
+
+static inline int get_current_ioprio(void)
+{
+	struct io_context *ioc = current->io_context;
+
+	if (ioc)
+		return ioc->ioprio;
+	return IOPRIO_DEFAULT;
 }
 
 /*

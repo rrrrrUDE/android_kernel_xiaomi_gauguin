@@ -53,7 +53,7 @@ struct eventfd_ctx {
  * Returns the amount by which the counter was incremented.  This will be less
  * than @n if the counter has overflowed.
  */
-__u64 eventfd_signal(struct eventfd_ctx *ctx, __u64 n)
+__u64 eventfd_signal_mask(struct eventfd_ctx *ctx, __u64 n, unsigned int mask)
 {
 	unsigned long flags;
 
@@ -74,11 +74,17 @@ __u64 eventfd_signal(struct eventfd_ctx *ctx, __u64 n)
 		n = ULLONG_MAX - ctx->count;
 	ctx->count += n;
 	if (waitqueue_active(&ctx->wqh))
-		wake_up_locked_poll(&ctx->wqh, EPOLLIN);
+		wake_up_locked_poll(&ctx->wqh, EPOLLIN | mask);
 	this_cpu_dec(eventfd_wake_count);
 	spin_unlock_irqrestore(&ctx->wqh.lock, flags);
 
 	return n;
+}
+EXPORT_SYMBOL_GPL(eventfd_signal_mask);
+
+__u64 eventfd_signal(struct eventfd_ctx *ctx, __u64 n)
+{
+	return eventfd_signal_mask(ctx, n, 0);
 }
 EXPORT_SYMBOL_GPL(eventfd_signal);
 

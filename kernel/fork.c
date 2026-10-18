@@ -96,6 +96,7 @@
 #include <linux/cpufreq_times.h>
 #include <linux/scs.h>
 #include <linux/bpf.h>
+#include <linux/io_uring.h>
 
 #include <linux/pgtable.h>
 #include <asm/pgalloc.h>
@@ -426,6 +427,9 @@ void free_task(struct task_struct *tsk)
 	arch_release_task_struct(tsk);
 	if (tsk->flags & PF_KTHREAD)
 		free_kthread_struct(tsk);
+#ifdef CONFIG_IO_URING
+	io_uring_free(tsk);
+#endif
 #ifdef CONFIG_BPF_SYSCALL
 	bpf_task_storage_free(tsk);
 #endif
@@ -1764,7 +1768,8 @@ static __latent_entropy struct task_struct *copy_process(
 					struct pid *pid,
 					int trace,
 					unsigned long tls,
-					int node)
+					int node,
+					bool io_thread)
 {
 	int pidfd = -1, retval;
 	struct task_struct *p;
@@ -1852,6 +1857,10 @@ static __latent_entropy struct task_struct *copy_process(
 	p = dup_task_struct(current, node);
 	if (!p)
 		goto fork_out;
+	if (io_thread) {
+		p->flags |= PF_IO_WORKER;
+		siginitsetinv(&p->blocked, sigmask(SIGKILL) | sigmask(SIGSTOP));
+	}
 
 	cpufreq_task_times_init(p);
 
@@ -2104,6 +2113,10 @@ static __latent_entropy struct task_struct *copy_process(
 	p->dirty_paused_when = 0;
 
 	p->pdeath_signal = 0;
+	#ifdef CONFIG_IO_URING
+	p->io_uring = NULL;
+	#endif
+	p->pf_io_worker = NULL;
 	INIT_LIST_HEAD(&p->thread_group);
 	p->task_works = NULL;
 
@@ -2315,13 +2328,23 @@ struct task_struct *fork_idle(int cpu)
 {
 	struct task_struct *task;
 	task = copy_process(CLONE_VM, 0, 0, NULL, NULL, &init_struct_pid, 0, 0,
-			    cpu_to_node(cpu));
+			    cpu_to_node(cpu), false);
 	if (!IS_ERR(task)) {
 		init_idle_pids(task);
 		init_idle(task, cpu);
 	}
 
 	return task;
+}
+
+/* Create an inactive io_uring worker, which the caller will wake. */
+struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
+{
+	unsigned long flags = CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+				CLONE_THREAD | CLONE_IO | CLONE_VM | CLONE_UNTRACED;
+
+	return copy_process(flags, (unsigned long)fn, (unsigned long)arg,
+			   NULL, NULL, NULL, 0, 0, node, true);
 }
 
 /*
@@ -2362,7 +2385,7 @@ long _do_fork(unsigned long clone_flags,
 	}
 
 	p = copy_process(clone_flags, stack_start, stack_size, parent_tidptr,
-			 child_tidptr, NULL, trace, tls, NUMA_NO_NODE);
+			 child_tidptr, NULL, trace, tls, NUMA_NO_NODE, false);
 	add_latent_entropy();
 
 	if (IS_ERR(p))

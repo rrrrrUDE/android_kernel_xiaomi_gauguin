@@ -43,6 +43,10 @@ int compat_sock_get_timestampns(struct sock *, struct timespec __user *);
 
 int get_compat_msghdr(struct msghdr *, struct compat_msghdr __user *,
 		      struct sockaddr __user **, struct iovec **);
+int __get_compat_msghdr(struct msghdr *kmsg,
+			struct compat_msghdr __user *umsg,
+			struct sockaddr __user **save_addr,
+			compat_uptr_t *ptr, compat_size_t *len);
 int put_cmsg_compat(struct msghdr*, int, int, int, void *);
 
 int cmsghdr_from_user_compat_to_kern(struct msghdr *, struct sock *,

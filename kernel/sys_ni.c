@@ -47,6 +47,10 @@ COND_SYSCALL(io_pgetevents);
 COND_SYSCALL_COMPAT(io_getevents);
 COND_SYSCALL_COMPAT(io_pgetevents);
 
+COND_SYSCALL(io_uring_setup);
+COND_SYSCALL(io_uring_enter);
+COND_SYSCALL(io_uring_register);
+
 /* fs/xattr.c */
 
 /* fs/dcache.c */

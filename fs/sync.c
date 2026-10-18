@@ -21,6 +21,44 @@
 #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
 			SYNC_FILE_RANGE_WAIT_AFTER)
 
+int sync_file_range(struct file *file, loff_t offset, loff_t nbytes,
+			unsigned int flags)
+{
+	int ret;
+	struct address_space *mapping;
+	loff_t endbyte;
+	umode_t mode;
+
+	if (flags & ~VALID_FLAGS)
+		return -EINVAL;
+	endbyte = offset + nbytes;
+	if ((s64)offset < 0 || (s64)endbyte < 0 || endbyte < offset)
+		return -EINVAL;
+	if (sizeof(pgoff_t) == 4 && offset >= (0x100000000ULL << PAGE_SHIFT))
+		return 0;
+	if (sizeof(pgoff_t) == 4 && endbyte >= (0x100000000ULL << PAGE_SHIFT))
+		nbytes = 0;
+	endbyte = nbytes ? endbyte - 1 : LLONG_MAX;
+	mode = file_inode(file)->i_mode;
+	if (!S_ISREG(mode) && !S_ISBLK(mode) && !S_ISDIR(mode) && !S_ISLNK(mode))
+		return -ESPIPE;
+	mapping = file->f_mapping;
+	if (flags & SYNC_FILE_RANGE_WAIT_BEFORE) {
+		ret = file_fdatawait_range(file, offset, endbyte);
+		if (ret < 0)
+			return ret;
+	}
+	if (flags & SYNC_FILE_RANGE_WRITE) {
+		ret = __filemap_fdatawrite_range(mapping, offset, endbyte,
+						 WB_SYNC_NONE);
+		if (ret < 0)
+			return ret;
+	}
+	if (flags & SYNC_FILE_RANGE_WAIT_AFTER)
+		return file_fdatawait_range(file, offset, endbyte);
+	return 0;
+}
+
 /*
  * Do the filesystem syncing work. For simple filesystems
  * writeback_inodes_sb(sb) just dirties buffers with inodes so we have to

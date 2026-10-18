@@ -359,6 +359,11 @@ static inline int signal_pending(struct task_struct *p)
 	return unlikely(test_tsk_thread_flag(p,TIF_SIGPENDING));
 }
 
+static inline int task_sigpending(struct task_struct *p)
+{
+	return signal_pending(p);
+}
+
 static inline int __fatal_signal_pending(struct task_struct *p)
 {
 	return unlikely(sigismember(&p->pending.signal, SIGKILL));
@@ -499,6 +504,15 @@ static inline void restore_saved_sigmask(void)
 	if (test_and_clear_restore_sigmask())
 		__set_current_blocked(&current->saved_sigmask);
 }
+
+static inline void restore_saved_sigmask_unless(bool interrupted)
+{
+	if (!interrupted)
+		restore_saved_sigmask();
+}
+
+extern int set_user_sigmask(const sigset_t __user *umask,
+			    size_t sigsetsize);
 
 static inline sigset_t *sigmask_to_save(void)
 {

@@ -60,6 +60,7 @@ struct swap_info_struct;
 struct seq_file;
 struct workqueue_struct;
 struct iov_iter;
+struct wait_page_queue;
 struct fscrypt_info;
 struct fscrypt_operations;
 struct fsverity_info;
@@ -166,6 +167,9 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 
 /* File is capable of returning -EAGAIN if I/O will block */
 #define FMODE_NOWAIT	((__force fmode_t)0x8000000)
+
+/* File supports async buffered reads through IOCB_WAITQ. */
+#define FMODE_BUF_RASYNC	((__force fmode_t)0x40000000)
 
 /* File does not contribute to nr_files count */
 #define FMODE_NOACCOUNT	((__force fmode_t)0x20000000)
@@ -315,6 +319,8 @@ enum rw_hint {
 /* iocb->ki_waitq is valid */
 #define IOCB_WAITQ		(1 << 19)
 #define IOCB_NOIO		(1 << 20)
+/* can use bio alloc cache */
+#define IOCB_ALLOC_CACHE	(1 << 21)
 /* kiocb is a read or write operation submitted by fs/aio.c. */
 #define IOCB_AIO_RW		(1 << 23)
 
@@ -330,6 +336,10 @@ struct kiocb {
 	int			ki_flags;
 	u16			ki_hint;
 	u16			ki_ioprio; /* See linux/ioprio.h */
+	union {
+		unsigned int		ki_cookie; /* for ->iopoll */
+		struct wait_page_queue	*ki_waitq; /* for async buffered IO */
+	};
 
 	randomized_struct_fields_end
 };
@@ -1876,7 +1886,7 @@ struct file_operations {
 			u64);
 	int (*fadvise)(struct file *, loff_t, loff_t, int);
 
-	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_USE(1, int (*iopoll)(struct kiocb *kiocb, bool spin));
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
@@ -2609,6 +2619,7 @@ extern int filp_close(struct file *, fl_owner_t id);
 
 extern struct filename *getname_flags(const char __user *, int, int *);
 extern struct filename *getname(const char __user *);
+extern struct filename *getname_uflags(const char __user *, int);
 extern struct filename *getname_kernel(const char *);
 extern void putname(struct filename *name);
 
@@ -2955,6 +2966,22 @@ static inline void file_end_write(struct file *file)
 	if (!S_ISREG(file_inode(file)->i_mode))
 		return;
 	__sb_end_write(file_inode(file)->i_sb, SB_FREEZE_WRITE);
+}
+
+static inline void kiocb_start_write(struct kiocb *iocb)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+
+	sb_start_write(inode->i_sb);
+	__sb_writers_release(inode->i_sb, SB_FREEZE_WRITE);
+}
+
+static inline void kiocb_end_write(struct kiocb *iocb)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+
+	__sb_writers_acquired(inode->i_sb, SB_FREEZE_WRITE);
+	sb_end_write(inode->i_sb);
 }
 
 /*

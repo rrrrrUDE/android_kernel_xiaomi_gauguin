@@ -168,6 +168,21 @@ static inline void set_notify_resume(struct task_struct *task)
 #endif
 }
 
+/*
+ * TWA_SIGNAL is used by task work which must interrupt a task sleeping in
+ * an interruptible wait (notably io_uring workers).  Kernels predating the
+ * generic TIF_NOTIFY_SIGNAL bit can provide the same wakeup semantics by
+ * combining the existing resume notification with an explicit wakeup.
+ */
+static inline void set_notify_signal(struct task_struct *task)
+{
+#ifdef TIF_NOTIFY_RESUME
+	if (!test_and_set_tsk_thread_flag(task, TIF_NOTIFY_RESUME) &&
+	    !wake_up_state(task, TASK_INTERRUPTIBLE))
+		kick_process(task);
+#endif
+}
+
 /**
  * tracehook_notify_resume - report when about to return to user mode
  * @regs:		user-mode registers of @current task
@@ -194,6 +209,17 @@ static inline void tracehook_notify_resume(struct pt_regs *regs)
 
 	mem_cgroup_handle_over_high();
 	blkcg_maybe_throttle_current();
+}
+
+/* Compatibility implementation for kernels without TIF_NOTIFY_SIGNAL. */
+static inline void tracehook_notify_signal(void)
+{
+#ifdef TIF_NOTIFY_RESUME
+	clear_thread_flag(TIF_NOTIFY_RESUME);
+	smp_mb__after_atomic();
+	if (current->task_works)
+		task_work_run();
+#endif
 }
 
 #endif	/* <linux/tracehook.h> */

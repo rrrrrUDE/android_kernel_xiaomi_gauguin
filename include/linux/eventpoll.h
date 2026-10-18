@@ -19,9 +19,17 @@
 
 /* Forward declarations to avoid compiler errors */
 struct file;
+struct epoll_event;
 
 
 #ifdef CONFIG_EPOLL
+
+int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *epds,
+		 bool nonblock);
+static inline int ep_op_has_event(int op)
+{
+	return op != EPOLL_CTL_DEL;
+}
 
 #ifdef CONFIG_CHECKPOINT_RESTORE
 struct file *get_epoll_tfile_raw_ptr(struct file *file, int tfd, unsigned long toff);

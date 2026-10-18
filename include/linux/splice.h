@@ -87,4 +87,8 @@ extern void splice_shrink_spd(struct splice_pipe_desc *);
 
 extern const struct pipe_buf_operations page_cache_pipe_buf_ops;
 extern const struct pipe_buf_operations default_pipe_buf_ops;
+extern long do_splice(struct file *in, loff_t *off_in, struct file *out,
+		      loff_t *off_out, size_t len, unsigned int flags);
+extern long do_tee(struct file *in, struct file *out, size_t len,
+		   unsigned int flags);
 #endif

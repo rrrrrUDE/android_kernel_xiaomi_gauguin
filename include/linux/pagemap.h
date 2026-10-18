@@ -15,8 +15,30 @@
 #include <linux/bitops.h>
 #include <linux/hardirq.h> /* for in_interrupt() */
 #include <linux/hugetlb_inline.h>
+#include <linux/wait.h>
 
 struct pagevec;
+
+struct wait_page_key {
+	struct page *page;
+	int bit_nr;
+	int page_match;
+};
+
+struct wait_page_queue {
+	struct page *page;
+	int bit_nr;
+	wait_queue_entry_t wait;
+};
+
+static inline bool wake_page_match(struct wait_page_queue *wait_page,
+					  struct wait_page_key *key)
+{
+	if (wait_page->page != key->page)
+		return false;
+	key->page_match = 1;
+	return wait_page->bit_nr == key->bit_nr;
+}
 
 /*
  * Bits in mapping->flags.
@@ -504,6 +526,8 @@ static inline pgoff_t linear_page_index(struct vm_area_struct *vma,
 
 extern void __sched __lock_page(struct page *page);
 extern int __sched __lock_page_killable(struct page *page);
+extern int __sched __lock_page_async(struct page *page,
+				     struct wait_page_queue *wait);
 extern int __sched __lock_page_or_retry(struct page *page, struct mm_struct *mm,
 				unsigned int flags);
 extern void unlock_page(struct page *page);

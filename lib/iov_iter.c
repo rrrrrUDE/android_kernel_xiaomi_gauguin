@@ -1059,6 +1059,26 @@ void iov_iter_revert(struct iov_iter *i, size_t unroll)
 }
 EXPORT_SYMBOL(iov_iter_revert);
 
+void iov_iter_restore(struct iov_iter *i, struct iov_iter_state *state)
+{
+	unsigned long consumed;
+
+	if (WARN_ON_ONCE(iov_iter_type(i) != ITER_IOVEC &&
+			 iov_iter_type(i) != ITER_KVEC &&
+			 iov_iter_type(i) != ITER_BVEC))
+		return;
+
+	consumed = state->nr_segs - i->nr_segs;
+	i->iov_offset = state->iov_offset;
+	i->count = state->count;
+	if (iov_iter_is_bvec(i))
+		i->bvec -= consumed;
+	else
+		i->iov -= consumed;
+	i->nr_segs = state->nr_segs;
+}
+EXPORT_SYMBOL(iov_iter_restore);
+
 /*
  * Return the count of just the current iov_iter segment.
  */
@@ -1553,6 +1573,22 @@ int import_iovec(int type, const struct iovec __user * uvector,
 	return 0;
 }
 EXPORT_SYMBOL(import_iovec);
+
+ssize_t __import_iovec(int type, const struct iovec __user *uvec,
+		 unsigned nr_segs, unsigned fast_segs, struct iovec **iov,
+		 struct iov_iter *iter, bool compat)
+{
+#ifdef CONFIG_COMPAT
+	if (compat)
+		return compat_import_iovec(type,
+			(const struct compat_iovec __user *)uvec, nr_segs,
+			fast_segs, iov, iter);
+#else
+	if (compat)
+		return -ENOSYS;
+#endif
+	return import_iovec(type, uvec, nr_segs, fast_segs, iov, iter);
+}
 
 #ifdef CONFIG_COMPAT
 #include <linux/compat.h>

@@ -1548,6 +1548,8 @@ long get_user_pages_remote(struct task_struct *tsk, struct mm_struct *mm,
 long get_user_pages(unsigned long start, unsigned long nr_pages,
 			    unsigned int gup_flags, struct page **pages,
 			    struct vm_area_struct **vmas);
+int do_madvise(struct mm_struct *mm, unsigned long start, size_t len,
+	       int behavior);
 long get_user_pages_locked(unsigned long start, unsigned long nr_pages,
 		    unsigned int gup_flags, struct page **pages, int *locked);
 long get_user_pages_unlocked(unsigned long start, unsigned long nr_pages,
