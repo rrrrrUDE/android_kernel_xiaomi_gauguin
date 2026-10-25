@@ -2683,6 +2683,10 @@ relock:
 			do_coredump(&ksig->info);
 		}
 
+		/* io-wq workers must run io_worker_exit() before do_exit(). */
+		if (current->flags & PF_IO_WORKER)
+			goto out;
+
 		/*
 		 * Death signals, no core dump.
 		 */
@@ -2691,6 +2695,7 @@ relock:
 	}
 	spin_unlock_irq(&sighand->siglock);
 
+out:
 	ksig->sig = signr;
 	return ksig->sig > 0;
 }
