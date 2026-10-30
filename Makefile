@@ -1321,6 +1321,31 @@ prepare0: archprepare gcc-plugins
 # All the preparing..
 prepare: prepare0 prepare-objtool
 
+ifdef CONFIG_DEBUG_INFO_BTF
+prepare: prepare-resolve-btfids
+PHONY += prepare-resolve-btfids
+prepare-resolve-btfids: $(RESOLVE_BTFIDS)
+
+$(RESOLVE_BTFIDS): $(srctree)/tools/bpf/resolve_btfids/main.c \
+			   $(srctree)/tools/bpf/resolve_btfids/btf_local.c \
+			   $(srctree)/tools/bpf/resolve_btfids/btf_local.h \
+			   $(srctree)/tools/bpf/resolve_btfids/Makefile \
+			   $(srctree)/tools/lib/rbtree.c \
+			   $(srctree)/include/uapi/linux/btf.h
+	$(Q)$(MAKE) $(if $(filter 1,$(V)),,-s) -C $(srctree)/tools/bpf/resolve_btfids \
+		OUTPUT=$(abspath $(objtree))/tools/bpf/resolve_btfids \
+		HOSTCC=$(HOSTCC) KBUILD_HOSTCFLAGS="$(KBUILD_HOSTCFLAGS)" \
+		KBUILD_HOSTLDFLAGS="$(KBUILD_HOSTLDFLAGS)" \
+		KBUILD_HOSTLDLIBS="$(KBUILD_HOSTLDLIBS)"
+endif
+
+PHONY += resolve_btfids_clean
+resolve_btfids_clean:
+	$(Q)$(MAKE) -C $(srctree)/tools/bpf/resolve_btfids \
+		OUTPUT=$(abspath $(objtree))/tools/bpf/resolve_btfids clean
+
+clean: resolve_btfids_clean
+
 # Support for using generic headers in asm-generic
 PHONY += asm-generic uapi-asm-generic
 asm-generic: uapi-asm-generic

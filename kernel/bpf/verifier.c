@@ -12616,11 +12616,13 @@ static int check_attach_modify_return(unsigned long addr, const char *func_name)
  * ALLOW_ERROR_INJECTION list
  */
 BTF_SET_START(btf_non_sleepable_error_inject)
-/* Three functions below can be called from sleepable and non-sleepable context.
+/* These functions can be called from sleepable and non-sleepable context.
  * Assume non-sleepable from bpf safety point of view.
  */
 BTF_ID(func, __add_to_page_cache_locked)
+#ifdef CONFIG_FAIL_PAGE_ALLOC
 BTF_ID(func, should_fail_alloc_page)
+#endif
 BTF_ID(func, should_failslab)
 BTF_SET_END(btf_non_sleepable_error_inject)
 
