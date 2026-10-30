@@ -51,6 +51,11 @@ COND_SYSCALL(io_uring_setup);
 COND_SYSCALL(io_uring_enter);
 COND_SYSCALL(io_uring_register);
 
+/* security/landlock/syscalls.c */
+COND_SYSCALL(landlock_create_ruleset);
+COND_SYSCALL(landlock_add_rule);
+COND_SYSCALL(landlock_restrict_self);
+
 /* fs/xattr.c */
 
 /* fs/dcache.c */

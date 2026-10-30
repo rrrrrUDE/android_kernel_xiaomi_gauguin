@@ -2497,6 +2497,9 @@ static int do_move_mount(struct path *path, const char *old_name)
 	err = kern_path(old_name, LOOKUP_FOLLOW, &old_path);
 	if (err)
 		return err;
+	err = security_move_mount(&old_path, path);
+	if (err)
+		goto out;
 
 	mp = lock_mount(path);
 	err = PTR_ERR(mp);

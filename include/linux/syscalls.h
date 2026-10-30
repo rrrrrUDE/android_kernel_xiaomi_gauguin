@@ -69,6 +69,8 @@ struct file_handle;
 struct sigaltstack;
 struct rseq;
 struct io_uring_params;
+struct landlock_ruleset_attr;
+enum landlock_rule_type;
 union bpf_attr;
 
 #include <linux/types.h>
@@ -919,6 +921,13 @@ asmlinkage long sys_rseq(struct rseq __user *rseq, uint32_t rseq_len,
 asmlinkage long sys_pidfd_send_signal(int pidfd, int sig,
 				       siginfo_t __user *info,
 				       unsigned int flags);
+asmlinkage long sys_landlock_create_ruleset(
+		const struct landlock_ruleset_attr __user *attr,
+		size_t size, __u32 flags);
+asmlinkage long sys_landlock_add_rule(int ruleset_fd,
+		enum landlock_rule_type rule_type,
+		const void __user *rule_attr, __u32 flags);
+asmlinkage long sys_landlock_restrict_self(int ruleset_fd, __u32 flags);
 
 /*
  * Architecture-specific system calls

@@ -829,6 +829,12 @@ __SYSCALL(__NR_io_uring_enter, sys_io_uring_enter)
 __SYSCALL(__NR_io_uring_register, sys_io_uring_register)
 #define __NR_pidfd_open 434
 __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+#define __NR_landlock_create_ruleset 444
+__SYSCALL(__NR_landlock_create_ruleset, sys_landlock_create_ruleset)
+#define __NR_landlock_add_rule 445
+__SYSCALL(__NR_landlock_add_rule, sys_landlock_add_rule)
+#define __NR_landlock_restrict_self 446
+__SYSCALL(__NR_landlock_restrict_self, sys_landlock_restrict_self)
 
 /*
  * Please add new compat syscalls above this comment and update
