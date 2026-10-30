@@ -58,6 +58,7 @@ struct bpf_reg_state {
 		u32 btf_id; /* for PTR_TO_BTF_ID */
 
 		u32 mem_size; /* for PTR_TO_MEM | PTR_TO_MEM_OR_NULL */
+		u32 subprogno; /* for PTR_TO_FUNC */
 
 		/* Max size from any of the above. */
 		unsigned long raw;
@@ -176,6 +177,8 @@ struct bpf_reference_state {
 	 * is used purely to inform the user of a reference leak.
 	 */
 	int insn_idx;
+	/* Nonzero only for references acquired inside a map callback. */
+	int callback_ref;
 };
 
 /* state of the program:

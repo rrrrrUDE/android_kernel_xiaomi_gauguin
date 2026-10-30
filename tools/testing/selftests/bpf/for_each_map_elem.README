@@ -1,0 +1,38 @@
+Build the three BPF objects with a recent clang and the selftest helper header:
+
+  clang -O2 -g -target bpf -Itools/testing/selftests/bpf \
+    -I/usr/include/$(gcc -dumpmachine) \
+    -c tools/testing/selftests/bpf/for_each_map_elem.c \
+    -o for_each_map_elem.o
+  clang -O2 -g -target bpf -Itools/testing/selftests/bpf \
+    -I/usr/include/$(gcc -dumpmachine) \
+    -c tools/testing/selftests/bpf/for_each_map_elem_bad_return.c \
+    -o for_each_map_elem_bad_return.o
+  clang -O2 -g -target bpf -Itools/testing/selftests/bpf \
+    -I/usr/include/$(gcc -dumpmachine) \
+    -c tools/testing/selftests/bpf/for_each_map_elem_bad_ctx.c \
+    -o for_each_map_elem_bad_ctx.o
+
+On a device booted with the patched kernel, use a recent bpftool as root:
+
+  mkdir -p /sys/fs/bpf/map_callback_maps
+  bpftool prog load for_each_map_elem.o /sys/fs/bpf/map_callback_prog \
+    type classifier pinmaps /sys/fs/bpf/map_callback_maps
+  printf '\0' >/tmp/map_callback_packet
+  bpftool prog run pinned /sys/fs/bpf/map_callback_prog \
+    data_in /tmp/map_callback_packet
+  bpftool map dump pinned /sys/fs/bpf/map_callback_maps/result
+
+The first object must load. Result key 0 should contain 3: the array
+callback saw all three elements. Result key 1 should contain the number of
+entries inserted into the hash map; without insertions it should contain 0.
+
+The bad_return object must be rejected by the verifier with the message
+"map callback must return 0 or 1". The bad_ctx object must be rejected
+because callback context requires a stack pointer or NULL. Loading these
+objects on an unpatched host kernel does not validate this backport.
+
+  bpftool -d prog load for_each_map_elem_bad_return.o \
+    /sys/fs/bpf/map_callback_bad_return type classifier
+  bpftool -d prog load for_each_map_elem_bad_ctx.o \
+    /sys/fs/bpf/map_callback_bad_ctx type classifier

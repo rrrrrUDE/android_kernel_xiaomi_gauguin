@@ -238,6 +238,7 @@ struct bpf_call_arg_meta {
 	u64 msize_max_value;
 	int ref_obj_id;
 	int func_id;
+	u32 subprogno;
 	u32 btf_id;
 	u32 ret_btf_id;
 };
@@ -442,6 +443,7 @@ static bool arg_type_may_be_null(enum bpf_arg_type type)
 {
 	return type == ARG_PTR_TO_MAP_VALUE_OR_NULL ||
 	       type == ARG_PTR_TO_MEM_OR_NULL ||
+	       type == ARG_PTR_TO_STACK_OR_NULL ||
 	       type == ARG_PTR_TO_CTX_OR_NULL ||
 	       type == ARG_PTR_TO_SOCKET_OR_NULL ||
 	       type == ARG_PTR_TO_ALLOC_MEM_OR_NULL;
@@ -528,6 +530,7 @@ static const char * const reg_type_str[] = {
 	[PTR_TO_RDONLY_BUF_OR_NULL] = "rdonly_buf_or_null",
 	[PTR_TO_RDWR_BUF]	= "rdwr_buf",
 	[PTR_TO_RDWR_BUF_OR_NULL] = "rdwr_buf_or_null",
+	[PTR_TO_FUNC]		= "func",
 };
 
 static char slot_type_char[] = {
@@ -798,6 +801,8 @@ static int acquire_reference_state(struct bpf_verifier_env *env, int insn_idx)
 	id = ++env->id_gen;
 	state->refs[new_ofs].id = id;
 	state->refs[new_ofs].insn_idx = insn_idx;
+	state->refs[new_ofs].callback_ref = state->in_callback_fn ?
+					   state->frameno : 0;
 
 	return id;
 }
@@ -810,6 +815,9 @@ static int release_reference_state(struct bpf_func_state *state, int ptr_id)
 	last_idx = state->acquired_refs - 1;
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].id == ptr_id) {
+			if (state->in_callback_fn &&
+			    state->refs[i].callback_ref != state->frameno)
+				return -EINVAL;
 			if (last_idx && i != last_idx)
 				memcpy(&state->refs[i], &state->refs[last_idx],
 				       sizeof(*state->refs));
@@ -1503,9 +1511,9 @@ static int check_subprogs(struct bpf_verifier_env *env)
 
 	/* determine subprog starts. The end is one before the next starts */
 	for (i = 0; i < insn_cnt; i++) {
-		if (insn[i].code != (BPF_JMP | BPF_CALL))
-			continue;
-		if (insn[i].src_reg != BPF_PSEUDO_CALL)
+		if (!((insn[i].code == (BPF_JMP | BPF_CALL) &&
+		       insn[i].src_reg == BPF_PSEUDO_CALL) ||
+		      bpf_pseudo_func(&insn[i])))
 			continue;
 		if (!env->bpf_capable) {
 			verbose(env,
@@ -2437,6 +2445,7 @@ static bool is_spillable_regtype(enum bpf_reg_type type)
 	case PTR_TO_RDWR_BUF:
 	case PTR_TO_RDWR_BUF_OR_NULL:
 	case PTR_TO_PERCPU_BTF_ID:
+	case PTR_TO_FUNC:
 	case PTR_TO_MEM:
 	case PTR_TO_MEM_OR_NULL:
 		return true;
@@ -3589,9 +3598,9 @@ process_func:
 continue_func:
 	subprog_end = subprog[idx + 1].start;
 	for (; i < subprog_end; i++) {
-		if (insn[i].code != (BPF_JMP | BPF_CALL))
-			continue;
-		if (insn[i].src_reg != BPF_PSEUDO_CALL)
+		if (!(insn[i].code == (BPF_JMP | BPF_CALL) &&
+		      insn[i].src_reg == BPF_PSEUDO_CALL) &&
+		    !bpf_pseudo_func(&insn[i]))
 			continue;
 		/* remember insn and function to return to */
 		ret_insn[frame] = i + 1;
@@ -4716,6 +4725,9 @@ static const struct bpf_reg_types const_map_ptr_types = { .types = { CONST_PTR_T
 static const struct bpf_reg_types btf_ptr_types = { .types = { PTR_TO_BTF_ID } };
 static const struct bpf_reg_types spin_lock_types = { .types = { PTR_TO_MAP_VALUE } };
 static const struct bpf_reg_types percpu_btf_ptr_types = { .types = { PTR_TO_PERCPU_BTF_ID } };
+static const struct bpf_reg_types const_str_ptr_types = { .types = { PTR_TO_MAP_VALUE } };
+static const struct bpf_reg_types func_ptr_types = { .types = { PTR_TO_FUNC } };
+static const struct bpf_reg_types stack_ptr_types = { .types = { PTR_TO_STACK } };
 
 static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
 	[ARG_PTR_TO_MAP_KEY]		= &map_key_value_types,
@@ -4744,6 +4756,9 @@ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
 	[ARG_PTR_TO_INT]		= &int_ptr_types,
 	[ARG_PTR_TO_LONG]		= &int_ptr_types,
 	[ARG_PTR_TO_PERCPU_BTF_ID]	= &percpu_btf_ptr_types,
+	[ARG_PTR_TO_CONST_STR]		= &const_str_ptr_types,
+	[ARG_PTR_TO_FUNC]		= &func_ptr_types,
+	[ARG_PTR_TO_STACK_OR_NULL]	= &stack_ptr_types,
 };
 
 static int check_reg_type(struct bpf_verifier_env *env, u32 regno,
@@ -4991,6 +5006,33 @@ skip_type_check:
 		if (err)
 			return err;
 		err = check_ptr_alignment(env, reg, 0, size, true);
+	} else if (arg_type == ARG_PTR_TO_FUNC) {
+		meta->subprogno = reg->subprogno;
+	} else if (arg_type == ARG_PTR_TO_CONST_STR) {
+		struct bpf_map *map = reg->map_ptr;
+		int map_off;
+		u64 map_addr;
+		char *str_ptr;
+
+		if (!bpf_map_is_rdonly(map) || !tnum_is_const(reg->var_off) ||
+		    !map->ops->map_direct_value_addr) {
+			verbose(env, "R%d is not a constant string in a readonly map\n",
+				regno);
+			return -EACCES;
+		}
+		err = check_map_access(env, regno, reg->off,
+				       map->value_size - reg->off, false);
+		if (err)
+			return err;
+		map_off = reg->off + reg->var_off.value;
+		err = map->ops->map_direct_value_addr(map, &map_addr, map_off);
+		if (err)
+			return err;
+		str_ptr = (char *)(long)map_addr;
+		if (!strnchr(str_ptr + map_off, map->value_size - map_off, 0)) {
+			verbose(env, "string is not zero-terminated\n");
+			return -EINVAL;
+		}
 	}
 
 	return err;
@@ -5423,6 +5465,24 @@ static void clear_caller_saved_regs(struct bpf_verifier_env *env,
 	}
 }
 
+int map_set_for_each_callback_args(struct bpf_verifier_env *env,
+				   struct bpf_func_state *caller,
+				   struct bpf_func_state *callee)
+{
+	struct bpf_map *map = caller->regs[BPF_REG_1].map_ptr;
+
+	callee->regs[BPF_REG_1] = caller->regs[BPF_REG_1];
+	__mark_reg_known_zero(&callee->regs[BPF_REG_2]);
+	callee->regs[BPF_REG_2].type = PTR_TO_MAP_KEY;
+	callee->regs[BPF_REG_2].map_ptr = map;
+	__mark_reg_known_zero(&callee->regs[BPF_REG_3]);
+	callee->regs[BPF_REG_3].type = PTR_TO_MAP_VALUE;
+	callee->regs[BPF_REG_3].map_ptr = map;
+	callee->regs[BPF_REG_4] = caller->regs[BPF_REG_3];
+	__mark_reg_not_init(env, &callee->regs[BPF_REG_5]);
+	return 0;
+}
+
 static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			   int *insn_idx)
 {
@@ -5431,6 +5491,12 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	struct bpf_func_state *caller, *callee;
 	int i, err, subprog, target_insn;
 	bool is_global = false;
+
+	/* Keep inherited references within this callback's frame. */
+	if (cur_func(env)->in_callback_fn) {
+		verbose(env, "subprogram calls inside map callbacks are not supported\n");
+		return -EINVAL;
+	}
 
 	if (state->curframe + 1 >= MAX_CALL_FRAMES) {
 		verbose(env, "the call stack of %d frames is too deep\n",
@@ -5542,16 +5608,37 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		verbose(env, "cannot return stack pointer to the caller\n");
 		return -EINVAL;
 	}
+	if (callee->in_callback_fn) {
+		struct tnum range = tnum_range(0, 1);
+
+		if (r0->type != SCALAR_VALUE) {
+			verbose(env, "map callback must return a scalar\n");
+			return -EINVAL;
+		}
+		err = mark_reg_read(env, r0, r0->parent, REG_LIVE_READ64);
+		if (err)
+			return err;
+		err = mark_chain_precision(env, BPF_REG_0);
+		if (err)
+			return err;
+		if (!tnum_in(range, r0->var_off)) {
+			verbose(env, "map callback must return 0 or 1\n");
+			return -EINVAL;
+		}
+	}
 
 	state->curframe--;
 	caller = state->frame[state->curframe];
 	/* return to the caller whatever r0 had in the callee */
-	caller->regs[BPF_REG_0] = *r0;
+	if (!callee->in_callback_fn)
+		caller->regs[BPF_REG_0] = *r0;
 
 	/* Transfer references to the caller */
-	err = transfer_reference_state(caller, callee);
-	if (err)
-		return err;
+	if (!callee->in_callback_fn) {
+		err = transfer_reference_state(caller, callee);
+		if (err)
+			return err;
+	}
 
 	*insn_idx = callee->callsite + 1;
 	if (env->log.level & BPF_LOG_LEVEL) {
@@ -5599,7 +5686,8 @@ record_func_map(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 	    func_id != BPF_FUNC_map_delete_elem &&
 	    func_id != BPF_FUNC_map_push_elem &&
 	    func_id != BPF_FUNC_map_pop_elem &&
-	    func_id != BPF_FUNC_map_peek_elem)
+	    func_id != BPF_FUNC_map_peek_elem &&
+	    func_id != BPF_FUNC_for_each_map_elem)
 		return 0;
 
 	if (map == NULL) {
@@ -5669,17 +5757,105 @@ record_func_key(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 static int check_reference_leak(struct bpf_verifier_env *env)
 {
 	struct bpf_func_state *state = cur_func(env);
+	bool leaked = false;
 	int i;
 
 	for (i = 0; i < state->acquired_refs; i++) {
+		if (state->in_callback_fn &&
+		    state->refs[i].callback_ref != state->frameno)
+			continue;
 		verbose(env, "Unreleased reference id=%d alloc_insn=%d\n",
 			state->refs[i].id, state->refs[i].insn_idx);
+		leaked = true;
 	}
-	return state->acquired_refs ? -EINVAL : 0;
+	return leaked ? -EINVAL : 0;
 }
 
-static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn_idx)
+static int check_bpf_snprintf_call(struct bpf_verifier_env *env,
+				   struct bpf_reg_state *regs)
 {
+	struct bpf_reg_state *fmt_reg = &regs[BPF_REG_3];
+	struct bpf_reg_state *data_len_reg = &regs[BPF_REG_5];
+	struct bpf_map *fmt_map = fmt_reg->map_ptr;
+	struct bpf_bprintf_data data = {};
+	u64 fmt_addr, data_len;
+	int err, fmt_map_off;
+	char *fmt;
+
+	if (!tnum_is_const(data_len_reg->var_off)) {
+		verbose(env, "bpf_snprintf data length must be constant\n");
+		return -EINVAL;
+	}
+	data_len = data_len_reg->var_off.value;
+	if (data_len % sizeof(u64) ||
+	    data_len > MAX_BPRINTF_VARARGS * sizeof(u64))
+		return -EINVAL;
+
+	fmt_map_off = fmt_reg->off + fmt_reg->var_off.value;
+	err = fmt_map->ops->map_direct_value_addr(fmt_map, &fmt_addr,
+						  fmt_map_off);
+	if (err)
+		return err;
+	fmt = (char *)(long)fmt_addr + fmt_map_off;
+	err = bpf_bprintf_prepare(fmt, UINT_MAX, NULL,
+				  data_len / sizeof(u64), &data);
+	if (err < 0)
+		verbose(env, "Invalid bpf_snprintf format string\n");
+	return err;
+}
+
+static int check_map_elem_callback(struct bpf_verifier_env *env,
+				   int *insn_idx, u32 subprogno)
+{
+	struct bpf_verifier_state *state = env->cur_state;
+	struct bpf_func_state *caller = cur_func(env), *callee;
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[*insn_idx];
+	struct bpf_map *map;
+	int err;
+
+	if (caller->in_callback_fn) {
+		verbose(env, "nested map callbacks are not supported\n");
+		return -EINVAL;
+	}
+	if (state->curframe + 1 >= MAX_CALL_FRAMES ||
+	    state->frame[state->curframe + 1] ||
+	    subprogno >= env->subprog_cnt)
+		return -EINVAL;
+	if (bpf_map_ptr_poisoned(aux)) {
+		verbose(env, "map callback uses different maps across paths\n");
+		return -EINVAL;
+	}
+	map = BPF_MAP_PTR(aux->map_ptr_state);
+	if (!map || !map->ops->map_set_for_each_callback_args ||
+	    !map->ops->map_for_each_callback) {
+		verbose(env, "map does not support callbacks\n");
+		return -EOPNOTSUPP;
+	}
+	callee = kzalloc(sizeof(*callee), GFP_KERNEL);
+	if (!callee)
+		return -ENOMEM;
+	state->frame[state->curframe + 1] = callee;
+	init_func_state(env, callee, *insn_idx, state->curframe + 1,
+			subprogno);
+	err = transfer_reference_state(callee, caller);
+	if (!err)
+		err = map->ops->map_set_for_each_callback_args(env, caller,
+							callee);
+	if (err) {
+		free_func_state(callee);
+		state->frame[state->curframe + 1] = NULL;
+		return err;
+	}
+	callee->in_callback_fn = true;
+	state->curframe++;
+	*insn_idx = env->subprog_info[subprogno].start - 1;
+	return 0;
+}
+
+static int check_helper_call(struct bpf_verifier_env *env, int func_id,
+			     int *insn_idxp)
+{
+	int insn_idx = *insn_idxp;
 	const struct bpf_func_proto *fn = NULL;
 	struct bpf_reg_state *regs;
 	struct bpf_call_arg_meta meta;
@@ -5698,6 +5874,10 @@ static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn
 	if (!fn) {
 		verbose(env, "unknown func %s#%d\n", func_id_name(func_id),
 			func_id);
+		return -EINVAL;
+	}
+	if (cur_func(env)->in_callback_fn && func_id == BPF_FUNC_tail_call) {
+		verbose(env, "tail calls inside map callbacks are not supported\n");
 		return -EINVAL;
 	}
 
@@ -5734,6 +5914,11 @@ static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn
 	/* check args */
 	for (i = 0; i < 5; i++) {
 		err = check_func_arg(env, i, &meta, fn);
+		if (err)
+			return err;
+	}
+	if (func_id == BPF_FUNC_snprintf) {
+		err = check_bpf_snprintf_call(env, cur_regs(env));
 		if (err)
 			return err;
 	}
@@ -5780,6 +5965,12 @@ static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn
 	    !register_is_null(&regs[BPF_REG_2])) {
 		verbose(env, "get_local_storage() doesn't support non-zero flags\n");
 		return -EINVAL;
+	}
+	/* Keep the caller register file: the callback check switches curframe. */
+	if (func_id == BPF_FUNC_for_each_map_elem) {
+		err = check_map_elem_callback(env, insn_idxp, meta.subprogno);
+		if (err)
+			return err;
 	}
 
 	/* reset caller saved regs */
@@ -8544,6 +8735,26 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 		return 0;
 	}
 
+	if (insn->src_reg == BPF_PSEUDO_FUNC) {
+		int subprogno = find_subprog(env, env->insn_idx + insn->imm + 1);
+
+		if (subprogno < 0 ||
+		    subprogno >= env->prog->aux->func_info_cnt ||
+		    !env->prog->aux->func_info_aux) {
+			verbose(env, "invalid callback function metadata\n");
+			return -EINVAL;
+		}
+		if (env->prog->aux->func_info_aux[subprogno].linkage !=
+		    BTF_FUNC_STATIC) {
+			verbose(env, "callback function not static\n");
+			return -EINVAL;
+		}
+		mark_reg_known_zero(env, regs, insn->dst_reg);
+		dst_reg->type = PTR_TO_FUNC;
+		dst_reg->subprogno = subprogno;
+		return 0;
+	}
+
 	map = env->used_maps[aux->map_index];
 	mark_reg_known_zero(env, regs, insn->dst_reg);
 	dst_reg->map_ptr = map;
@@ -9003,6 +9214,18 @@ peek_stack:
 			goto peek_stack;
 		else if (ret < 0)
 			goto err_free;
+		if (bpf_pseudo_func(&insns[t])) {
+			/* The callback target must be reachable for CFG and dead
+			 * code analysis. Reject recursive callback references here.
+			 */
+			init_explored_state(env, t);
+			ret = push_insn(t, t + insns[t].imm + 1, BRANCH,
+						env, false);
+			if (ret == 1)
+				goto peek_stack;
+			else if (ret < 0)
+				goto err_free;
+		}
 	}
 
 mark_explored:
@@ -10386,7 +10609,8 @@ static int do_check(struct bpf_verifier_env *env)
 				if (insn->src_reg == BPF_PSEUDO_CALL)
 					err = check_func_call(env, insn, &env->insn_idx);
 				else
-					err = check_helper_call(env, insn->imm, env->insn_idx);
+					err = check_helper_call(env, insn->imm,
+							&env->insn_idx);
 				if (err)
 					return err;
 
@@ -10419,6 +10643,11 @@ static int do_check(struct bpf_verifier_env *env)
 				}
 
 				if (state->curframe) {
+					if (cur_func(env)->in_callback_fn) {
+						err = check_reference_leak(env);
+						if (err)
+							return err;
+					}
 					/* exit from nested function */
 					err = prepare_func_exit(env, &env->insn_idx);
 					if (err)
@@ -10733,6 +10962,14 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 					return err;
 				goto next_insn;
 			}
+			if (insn[0].src_reg == BPF_PSEUDO_FUNC) {
+				if (insn[1].imm != 0) {
+					verbose(env, "invalid callback function load\n");
+					return -EINVAL;
+				}
+				env->insn_aux_data[i].ptr_type = PTR_TO_FUNC;
+				goto next_insn;
+			}
 
 			/* In final convert_pseudo_ld_imm64() step, this is
 			 * converted into regular 64-bit imm load insn.
@@ -10860,7 +11097,8 @@ static void convert_pseudo_ld_imm64(struct bpf_verifier_env *env)
 	int i;
 
 	for (i = 0; i < insn_cnt; i++, insn++)
-		if (insn->code == (BPF_LD | BPF_IMM | BPF_DW))
+		if (insn->code == (BPF_LD | BPF_IMM | BPF_DW) &&
+		    insn->src_reg != BPF_PSEUDO_FUNC)
 			insn->src_reg = 0;
 }
 
@@ -11499,8 +11737,9 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		return 0;
 
 	for (i = 0, insn = prog->insnsi; i < prog->len; i++, insn++) {
-		if (insn->code != (BPF_JMP | BPF_CALL) ||
-		    insn->src_reg != BPF_PSEUDO_CALL)
+		if (!bpf_pseudo_func(insn) &&
+		    (insn->code != (BPF_JMP | BPF_CALL) ||
+		     insn->src_reg != BPF_PSEUDO_CALL))
 			continue;
 		/* Upon error here we cannot fall back to interpreter but
 		 * need a hard reject of the program. Thus -EFAULT is
@@ -11522,6 +11761,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		env->insn_aux_data[i].call_imm = insn->imm;
 		/* point imm to __bpf_call_base+1 from JITs point of view */
 		insn->imm = 1;
+		if (bpf_pseudo_func(insn))
+			insn[1].imm = 1;
 	}
 
 	err = bpf_prog_alloc_jited_linfo(prog);
@@ -11601,6 +11842,12 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	for (i = 0; i < env->subprog_cnt; i++) {
 		insn = func[i]->insnsi;
 		for (j = 0; j < func[i]->len; j++, insn++) {
+			if (bpf_pseudo_func(insn)) {
+				subprog = insn->off;
+				insn[0].imm = (u32)(long)func[subprog]->bpf_func;
+				insn[1].imm = ((u64)(long)func[subprog]->bpf_func) >> 32;
+				continue;
+			}
 			if (insn->code != (BPF_JMP | BPF_CALL) ||
 			    insn->src_reg != BPF_PSEUDO_CALL)
 				continue;
@@ -11647,6 +11894,12 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	 * later look the same as if they were interpreted only.
 	 */
 	for (i = 0, insn = prog->insnsi; i < prog->len; i++, insn++) {
+		if (bpf_pseudo_func(insn)) {
+			insn[0].imm = env->insn_aux_data[i].call_imm;
+			insn[1].imm = insn->off;
+			insn->off = 0;
+			continue;
+		}
 		if (insn->code != (BPF_JMP | BPF_CALL) ||
 		    insn->src_reg != BPF_PSEUDO_CALL)
 			continue;
@@ -11685,6 +11938,12 @@ out_undo_insn:
 	/* cleanup main prog to be interpreted */
 	prog->jit_requested = 0;
 	for (i = 0, insn = prog->insnsi; i < prog->len; i++, insn++) {
+		if (bpf_pseudo_func(insn)) {
+			insn->off = 0;
+			insn->imm = env->insn_aux_data[i].call_imm;
+			insn[1].imm = 0;
+			continue;
+		}
 		if (insn->code != (BPF_JMP | BPF_CALL) ||
 		    insn->src_reg != BPF_PSEUDO_CALL)
 			continue;
@@ -11711,6 +11970,16 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 			return 0;
 		if (err == -EFAULT)
 			return err;
+	}
+	{
+		int idx;
+
+		for (idx = 0; idx < env->prog->len; idx++) {
+			if (bpf_pseudo_func(&env->prog->insnsi[idx])) {
+				verbose(env, "callbacks require JIT compilation\n");
+				return -EINVAL;
+			}
+		}
 	}
 #ifndef CONFIG_BPF_JIT_ALWAYS_ON
 	if (env->subprog_cnt > 1 && env->prog->aux->tail_call_reachable) {
