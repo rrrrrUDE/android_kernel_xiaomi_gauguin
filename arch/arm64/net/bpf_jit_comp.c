@@ -134,6 +134,72 @@ static inline void emit_a64_mov_i64(const int reg, const u64 val,
 	}
 }
 
+/* A small trampoline for struct_ops callbacks.  Function tracing also needs
+ * arch text patching and an original-call path, which this JIT lacks.
+ */
+int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
+				void *image_end, const struct btf_func_model *m,
+				u32 flags, struct bpf_tramp_progs *tprogs,
+				void *orig_call)
+{
+	struct bpf_prog *prog;
+	struct jit_ctx ctx = { .image = image };
+	int i;
+
+	if (im || orig_call ||
+	    (flags != 0 && flags != BPF_TRAMP_F_RET_FENTRY_RET) ||
+	    m->nr_args > 8 || m->ret_size > sizeof(u64) ||
+	    tprogs[BPF_TRAMP_FENTRY].nr_progs != 1 ||
+	    tprogs[BPF_TRAMP_FEXIT].nr_progs ||
+	    tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs)
+		return -ENOTSUPP;
+	for (i = 0; i < m->nr_args; i++)
+		if (m->arg_size[i] != 1 && m->arg_size[i] != 2 &&
+		    m->arg_size[i] != 4 && m->arg_size[i] != 8)
+			return -ENOTSUPP;
+	prog = tprogs[BPF_TRAMP_FENTRY].progs[0];
+	if (!prog || !prog->jited ||
+	    (u8 *)image_end - (u8 *)image < 320)
+		return -ENOTSUPP;
+
+	/* Keep x19 (program), x20 (start time), and x21 (result) across calls.
+	 * Context is eight 64-bit argument slots.  ARM64 passes these in x0-x7.
+	 */
+	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), &ctx);
+	emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), &ctx);
+	emit(A64_PUSH(A64_R(21), A64_R(22), A64_SP), &ctx);
+	emit(A64_SUB_I(1, A64_SP, A64_SP, 64), &ctx);
+	for (i = 0; i < m->nr_args; i++) {
+		if (m->arg_size[i] < sizeof(u64))
+			emit(A64_UBFM(1, i, i, 0,
+					   m->arg_size[i] * 8 - 1), &ctx);
+		emit(A64_MOVZ(1, A64_R(9), i * 8, 0), &ctx);
+		emit(A64_STR64(i, A64_SP, A64_R(9)), &ctx);
+	}
+
+	emit_a64_mov_i64(A64_R(19), (unsigned long)prog, &ctx);
+	emit_a64_mov_i64(A64_R(10), (unsigned long)__bpf_prog_enter, &ctx);
+	emit(A64_BLR(A64_R(10)), &ctx);
+	emit(A64_MOV(1, A64_R(20), A64_R(0)), &ctx);
+	emit(A64_MOV(1, A64_R(0), A64_SP), &ctx);
+	emit_a64_mov_i64(A64_R(10), (unsigned long)prog->bpf_func, &ctx);
+	emit(A64_BLR(A64_R(10)), &ctx);
+	emit(A64_MOV(1, A64_R(21), A64_R(0)), &ctx);
+	emit(A64_MOV(1, A64_R(0), A64_R(19)), &ctx);
+	emit(A64_MOV(1, A64_R(1), A64_R(20)), &ctx);
+	emit_a64_mov_i64(A64_R(10), (unsigned long)__bpf_prog_exit, &ctx);
+	emit(A64_BLR(A64_R(10)), &ctx);
+	emit(A64_MOV(1, A64_R(0), A64_R(21)), &ctx);
+	emit(A64_ADD_I(1, A64_SP, A64_SP, 64), &ctx);
+	emit(A64_POP(A64_R(21), A64_R(22), A64_SP), &ctx);
+	emit(A64_POP(A64_R(19), A64_R(20), A64_SP), &ctx);
+	emit(A64_POP(A64_FP, A64_LR, A64_SP), &ctx);
+	emit(A64_RET(A64_LR), &ctx);
+	flush_icache_range((unsigned long)image,
+			   (unsigned long)image + ctx.idx * sizeof(u32));
+	return ctx.idx * sizeof(u32);
+}
+
 /*
  * This is an unoptimized 64 immediate emission used for BPF to BPF call
  * addresses. It will always do a full 64 bit decomposition as otherwise

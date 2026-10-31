@@ -8,6 +8,7 @@
 #define _LINUX_BPF_VERIFIER_H 1
 
 #include <linux/bpf.h> /* for enum bpf_reg_type */
+#include <linux/btf.h>
 #include <linux/filter.h> /* for MAX_BPF_STACK */
 #include <linux/tnum.h>
 
@@ -53,7 +54,11 @@ struct bpf_reg_state {
 		/* valid when type == CONST_PTR_TO_MAP | PTR_TO_MAP_VALUE |
 		 *   PTR_TO_MAP_VALUE_OR_NULL
 		 */
-		struct bpf_map *map_ptr;
+		struct {
+			struct bpf_map *map_ptr;
+			/* Unique identity for a map obtained from an outer map. */
+			u32 map_uid;
+		};
 
 		u32 btf_id; /* for PTR_TO_BTF_ID */
 
@@ -61,7 +66,10 @@ struct bpf_reg_state {
 		u32 subprogno; /* for PTR_TO_FUNC */
 
 		/* Max size from any of the above. */
-		unsigned long raw;
+		struct {
+			unsigned long raw1;
+			unsigned long raw2;
+		};
 	};
 	/* Fixed part of pointer offset, pointer types only */
 	s32 off;
@@ -199,6 +207,8 @@ struct bpf_func_state {
 	u32 subprogno;
 	/* This frame is entered by a BPF helper callback, not a BPF-to-BPF call. */
 	bool in_callback_fn;
+	u32 async_entry_cnt;
+	bool in_async_callback_fn;
 
 	/* The following fields should be last. See copy_func_state() */
 	int acquired_refs;
@@ -433,6 +443,7 @@ struct bpf_verifier_env {
 	struct bpf_verifier_state_list **explored_states; /* search pruning optimization */
 	struct bpf_verifier_state_list *free_list;
 	struct bpf_map *used_maps[MAX_USED_MAPS]; /* array of map's used by eBPF program */
+	bpfptr_t fd_array;
 	u32 used_map_cnt;		/* number of used maps */
 	u32 id_gen;			/* used to generate unique reg IDs */
 	bool explore_alu_limits;
@@ -505,12 +516,23 @@ bpf_prog_offload_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt);
 
 int check_ctx_reg(struct bpf_verifier_env *env,
 		  const struct bpf_reg_state *reg, int regno);
+int check_kfunc_mem_access(struct bpf_verifier_env *env, int regno,
+			   u32 size, u32 align);
 
 /* this lives here instead of in bpf.h because it needs to dereference tgt_prog */
 static inline u64 bpf_trampoline_compute_key(const struct bpf_prog *tgt_prog,
-					     u32 btf_id)
+					     struct btf *btf,
+					     u32 type_id)
 {
-        return tgt_prog ? (((u64)tgt_prog->aux->id) << 32 | btf_id) : btf_id;
+	if (tgt_prog)
+		return ((u64)tgt_prog->aux->id << 32) | type_id;
+	return ((u64)btf_id(btf) << 32) | 0x80000000 | type_id;
+}
+
+static inline void bpf_trampoline_unpack_key(u64 key, u32 *obj_id, u32 *btf_id)
+{
+	*obj_id = key >> 32;
+	*btf_id = key & 0x7fffffff;
 }
 
 int bpf_check_attach_target(struct bpf_verifier_log *log,

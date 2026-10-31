@@ -7,6 +7,7 @@
 #include <linux/rbtree_latch.h>
 #include <linux/perf_event.h>
 #include <linux/btf.h>
+#include <linux/module.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/rcupdate_wait.h>
 #include <trace/hooks/memory.h>
@@ -98,6 +99,10 @@ static int unregister_fentry(struct bpf_trampoline *tr, void *old_addr)
 		ret = unregister_ftrace_direct((long)ip, (long)old_addr);
 	else
 		ret = bpf_arch_text_poke(ip, BPF_MOD_CALL, old_addr, NULL);
+	if (!ret) {
+		module_put(tr->mod);
+		tr->mod = NULL;
+	}
 	return ret;
 }
 
@@ -117,17 +122,29 @@ static int modify_fentry(struct bpf_trampoline *tr, void *old_addr, void *new_ad
 static int register_fentry(struct bpf_trampoline *tr, void *new_addr)
 {
 	void *ip = tr->func.addr;
+	struct module *mod;
 	unsigned long faddr;
 	int ret;
 
 	faddr = ftrace_location((unsigned long)ip);
 	if (faddr)
 		tr->func.ftrace_managed = true;
+	preempt_disable();
+	mod = __module_text_address((unsigned long)ip);
+	if (mod && !try_module_get(mod)) {
+		preempt_enable();
+		return -ENOENT;
+	}
+	preempt_enable();
 
 	if (tr->func.ftrace_managed)
 		ret = register_ftrace_direct((long)ip, (long)new_addr);
 	else
 		ret = bpf_arch_text_poke(ip, BPF_MOD_CALL, NULL, new_addr);
+	if (ret)
+		module_put(mod);
+	else
+		tr->mod = mod;
 	return ret;
 }
 
@@ -291,6 +308,21 @@ out:
 	return ERR_PTR(err);
 }
 
+/* The image was never published as an entry point. Only the ksym's RCU
+ * readers need to finish before its storage can be released.
+ */
+static void bpf_tramp_image_free_unused(struct bpf_tramp_image *im)
+{
+	bpf_image_ksym_del(&im->ksym);
+	/* bpf_ksym_del() removes an RCU list entry. */
+	synchronize_rcu();
+	trace_android_vh_set_memory_nx((unsigned long)im->image, 1);
+	bpf_jit_free_exec(im->image);
+	bpf_jit_uncharge_modmem(1);
+	percpu_ref_exit(&im->pcref);
+	kfree(im);
+}
+
 static int bpf_trampoline_update(struct bpf_trampoline *tr)
 {
 	struct bpf_tramp_image *im;
@@ -305,6 +337,8 @@ static int bpf_trampoline_update(struct bpf_trampoline *tr)
 
 	if (total == 0) {
 		err = unregister_fentry(tr, tr->cur_image->image);
+		if (err)
+			goto out;
 		bpf_tramp_image_put(tr->cur_image);
 		tr->cur_image = NULL;
 		tr->selector = 0;
@@ -327,7 +361,7 @@ static int bpf_trampoline_update(struct bpf_trampoline *tr)
 					  &tr->func.model, flags, tprogs,
 					  tr->func.addr);
 	if (err < 0)
-		goto out;
+		goto out_free_im;
 
 	WARN_ON(tr->cur_image && tr->selector == 0);
 	WARN_ON(!tr->cur_image && tr->selector);
@@ -338,11 +372,14 @@ static int bpf_trampoline_update(struct bpf_trampoline *tr)
 		/* first time registering */
 		err = register_fentry(tr, im->image);
 	if (err)
-		goto out;
+		goto out_free_im;
 	if (tr->cur_image)
 		bpf_tramp_image_put(tr->cur_image);
 	tr->cur_image = im;
 	tr->selector++;
+	goto out;
+out_free_im:
+	bpf_tramp_image_free_unused(im);
 out:
 	kfree(tprogs);
 	return err;

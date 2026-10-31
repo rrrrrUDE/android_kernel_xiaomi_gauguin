@@ -202,6 +202,29 @@ static struct htab_elem *get_htab_elem(struct bpf_htab *htab, int i)
 	return (struct htab_elem *)(htab->elems + i * (u64)htab->elem_size);
 }
 
+static void check_and_free_timer(struct bpf_htab *htab, struct htab_elem *elem)
+{
+	if (unlikely(map_value_has_timer(&htab->map)))
+		bpf_timer_cancel_and_free(elem->key +
+					  round_up(htab->map.key_size, 8) +
+					  htab->map.timer_off);
+}
+
+static void htab_free_prealloced_timers(struct bpf_htab *htab)
+{
+	u32 num_entries = htab->map.max_entries;
+	int i;
+
+	if (!map_value_has_timer(&htab->map))
+		return;
+	if (!htab_is_percpu(htab) && !htab_is_lru(htab))
+		num_entries += num_possible_cpus();
+	for (i = 0; i < num_entries; i++) {
+		check_and_free_timer(htab, get_htab_elem(htab, i));
+		cond_resched();
+	}
+}
+
 static void htab_free_elems(struct bpf_htab *htab)
 {
 	int i;
@@ -704,6 +727,7 @@ static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node)
 	hlist_nulls_for_each_entry_rcu(l, n, head, hash_node)
 		if (l == tgt_l) {
 			hlist_nulls_del_rcu(&l->hash_node);
+			check_and_free_timer(htab, l);
 			break;
 		}
 
@@ -775,6 +799,7 @@ static void htab_elem_free(struct bpf_htab *htab, struct htab_elem *l)
 {
 	if (htab->map.map_type == BPF_MAP_TYPE_PERCPU_HASH)
 		free_percpu(htab_elem_get_ptr(l, htab->map.key_size));
+	check_and_free_timer(htab, l);
 	kfree(l);
 }
 
@@ -802,6 +827,7 @@ static void free_htab_elem(struct bpf_htab *htab, struct htab_elem *l)
 	htab_put_fd_value(htab, l);
 
 	if (htab_is_prealloc(htab)) {
+		check_and_free_timer(htab, l);
 		__pcpu_freelist_push(&htab->freelist, &l->fnode);
 	} else {
 		atomic_dec(&htab->count);
@@ -1043,6 +1069,8 @@ static int htab_map_update_elem(struct bpf_map *map, void *key, void *value,
 		hlist_nulls_del_rcu(&l_old->hash_node);
 		if (!htab_is_prealloc(htab))
 			free_htab_elem(htab, l_old);
+		else
+			check_and_free_timer(htab, l_old);
 	}
 	ret = 0;
 err:
@@ -1082,7 +1110,7 @@ static int htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value,
 	l_new = prealloc_lru_pop(htab, key, hash);
 	if (!l_new)
 		return -ENOMEM;
-	memcpy(l_new->key + round_up(map->key_size, 8), value, map->value_size);
+	copy_map_value(map, l_new->key + round_up(map->key_size, 8), value);
 
 	flags = htab_lock_bucket(htab, b);
 
@@ -1105,10 +1133,13 @@ static int htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value,
 err:
 	htab_unlock_bucket(htab, b, flags);
 
-	if (ret)
+	if (ret) {
+		check_and_free_timer(htab, l_new);
 		bpf_lru_push_free(&htab->lru, &l_new->lru_node);
-	else if (l_old)
+	} else if (l_old) {
+		check_and_free_timer(htab, l_old);
 		bpf_lru_push_free(&htab->lru, &l_old->lru_node);
+	}
 
 	return ret;
 }
@@ -1303,8 +1334,10 @@ static int htab_lru_map_delete_elem(struct bpf_map *map, void *key)
 	}
 
 	htab_unlock_bucket(htab, b, flags);
-	if (l)
+	if (l) {
+		check_and_free_timer(htab, l);
 		bpf_lru_push_free(&htab->lru, &l->lru_node);
+	}
 	return ret;
 }
 
@@ -1322,6 +1355,33 @@ static void delete_all_elements(struct bpf_htab *htab)
 			htab_elem_free(htab, l);
 		}
 	}
+}
+
+static void htab_map_free_timers(struct bpf_map *map)
+{
+	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+	int i;
+
+	if (likely(!map_value_has_timer(map)))
+		return;
+	if (htab_is_prealloc(htab)) {
+		htab_free_prealloced_timers(htab);
+		return;
+	}
+
+	rcu_read_lock();
+	for (i = 0; i < htab->n_buckets; i++) {
+		struct hlist_nulls_head *head = select_bucket(htab, i);
+		struct hlist_nulls_node *n;
+		struct htab_elem *l;
+
+		hlist_nulls_for_each_entry(l, n, head, hash_node)
+			check_and_free_timer(htab, l);
+		rcu_read_unlock();
+		cond_resched();
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
 }
 
 /* Called when map->refcnt goes to zero, either from workqueue or from syscall */
@@ -1890,6 +1950,7 @@ const struct bpf_map_ops htab_map_ops = {
 	.map_alloc_check = htab_map_alloc_check,
 	.map_alloc = htab_map_alloc,
 	.map_free = htab_map_free,
+	.map_release_uref = htab_map_free_timers,
 	.map_get_next_key = htab_map_get_next_key,
 	.map_lookup_elem = htab_map_lookup_elem,
 	.map_update_elem = htab_map_update_elem,
@@ -1910,6 +1971,7 @@ const struct bpf_map_ops htab_lru_map_ops = {
 	.map_alloc_check = htab_map_alloc_check,
 	.map_alloc = htab_map_alloc,
 	.map_free = htab_map_free,
+	.map_release_uref = htab_map_free_timers,
 	.map_get_next_key = htab_map_get_next_key,
 	.map_lookup_elem = htab_lru_map_lookup_elem,
 	.map_lookup_elem_sys_only = htab_lru_map_lookup_elem_sys,

@@ -32,12 +32,21 @@ extern void return_to_handler(void);
 
 static inline unsigned long ftrace_call_adjust(unsigned long addr)
 {
+	if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE_WITH_REGS))
+		return addr + AARCH64_INSN_SIZE;
 	/*
 	 * addr is the address of the mcount call instruction.
 	 * recordmcount does the necessary offset calculation.
 	 */
 	return addr;
 }
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
+struct dyn_ftrace;
+struct module;
+int ftrace_init_nop(struct module *mod, struct dyn_ftrace *rec);
+#define ftrace_init_nop ftrace_init_nop
+#endif
 
 #define ftrace_return_address(n) return_address(n)
 

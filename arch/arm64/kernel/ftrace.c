@@ -65,6 +65,42 @@ int ftrace_update_ftrace_func(ftrace_func_t func)
 	return ftrace_modify_code(pc, 0, new, false);
 }
 
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
+/* The first compiler-generated NOP saves LR in x9.  The second NOP,
+ * at rec->ip, is the branch site enabled by ftrace_make_call().
+ */
+int ftrace_init_nop(struct module *mod, struct dyn_ftrace *rec)
+{
+	unsigned long pc = rec->ip - AARCH64_INSN_SIZE;
+	u32 old = aarch64_insn_gen_nop();
+	u32 new;
+
+	new = aarch64_insn_gen_add_sub_imm(AARCH64_INSN_REG_9,
+					  AARCH64_INSN_REG_LR, 0,
+					  AARCH64_INSN_VARIANT_64BIT,
+					  AARCH64_INSN_ADSB_ADD);
+	return ftrace_modify_code(pc, old, new, true);
+}
+
+int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
+			      unsigned long addr)
+{
+	unsigned long pc = rec->ip;
+	long old_offset = (long)old_addr - (long)pc;
+	long new_offset = (long)addr - (long)pc;
+	u32 old, new;
+
+	if (old_offset < -SZ_128M || old_offset >= SZ_128M ||
+	    new_offset < -SZ_128M || new_offset >= SZ_128M)
+		return -EINVAL;
+	old = aarch64_insn_gen_branch_imm(pc, old_addr,
+					  AARCH64_INSN_BRANCH_LINK);
+	new = aarch64_insn_gen_branch_imm(pc, addr,
+					  AARCH64_INSN_BRANCH_LINK);
+	return ftrace_modify_code(pc, old, new, true);
+}
+#endif
+
 /*
  * Turn on the call to ftrace_caller() in instrumented function
  */

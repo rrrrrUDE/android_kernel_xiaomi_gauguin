@@ -36,6 +36,7 @@ struct bpf_map;
 struct sock;
 struct seq_file;
 struct btf;
+struct module;
 struct btf_type;
 struct exception_table_entry;
 struct seq_operations;
@@ -173,6 +174,7 @@ struct bpf_map {
 	u32 max_entries;
 	u32 map_flags;
 	int spin_lock_off; /* >=0 valid offset, <0 error */
+	int timer_off; /* >=0 valid offset, <0 error */
 	u32 id;
 	int numa_node;
 	u32 btf_key_type_id;
@@ -200,24 +202,44 @@ static inline bool map_value_has_spin_lock(const struct bpf_map *map)
 	return map->spin_lock_off >= 0;
 }
 
-static inline void check_and_init_map_lock(struct bpf_map *map, void *dst)
+static inline bool map_value_has_timer(const struct bpf_map *map)
 {
-	if (likely(!map_value_has_spin_lock(map)))
-		return;
-	*(struct bpf_spin_lock *)(dst + map->spin_lock_off) =
-		(struct bpf_spin_lock){};
+	return map->timer_off >= 0;
 }
 
-/* copy everything but bpf_spin_lock */
+void bpf_timer_cancel_and_free(void *timer);
+
+static inline void check_and_init_map_lock(struct bpf_map *map, void *dst)
+{
+	if (unlikely(map_value_has_spin_lock(map)))
+		memset(dst + map->spin_lock_off, 0, sizeof(struct bpf_spin_lock));
+	if (unlikely(map_value_has_timer(map)))
+		memset(dst + map->timer_off, 0, sizeof(struct bpf_timer));
+}
+
+/* Copy everything except kernel-owned spin lock and timer state. */
 static inline void copy_map_value(struct bpf_map *map, void *dst, void *src)
 {
-	if (unlikely(map_value_has_spin_lock(map))) {
-		u32 off = map->spin_lock_off;
+	u32 s_off = 0, s_sz = 0, t_off = 0, t_sz = 0;
 
-		memcpy(dst, src, off);
-		memcpy(dst + off + sizeof(struct bpf_spin_lock),
-		       src + off + sizeof(struct bpf_spin_lock),
-		       map->value_size - off - sizeof(struct bpf_spin_lock));
+	if (unlikely(map_value_has_spin_lock(map))) {
+		s_off = map->spin_lock_off;
+		s_sz = sizeof(struct bpf_spin_lock);
+	}
+	if (unlikely(map_value_has_timer(map))) {
+		t_off = map->timer_off;
+		t_sz = sizeof(struct bpf_timer);
+	}
+	if (unlikely(s_sz || t_sz)) {
+		if (s_off < t_off || !s_sz) {
+			swap(s_off, t_off);
+			swap(s_sz, t_sz);
+		}
+		memcpy(dst, src, t_off);
+		memcpy(dst + t_off + t_sz, src + t_off + t_sz,
+		       s_off - t_off - t_sz);
+		memcpy(dst + s_off + s_sz, src + s_off + s_sz,
+		       map->value_size - s_off - s_sz);
 	} else {
 		memcpy(dst, src, map->value_size);
 	}
@@ -319,6 +341,7 @@ enum bpf_arg_type {
 	ARG_PTR_TO_PERCPU_BTF_ID,	/* pointer to in-kernel percpu type */
 	ARG_PTR_TO_CONST_STR,	/* pointer to a null terminated read-only string */
 	ARG_PTR_TO_FUNC,	/* pointer to a BPF subprogram */
+	ARG_PTR_TO_TIMER,	/* pointer to bpf_timer in a map value */
 	ARG_PTR_TO_STACK_OR_NULL,	/* stack pointer or NULL */
 	__BPF_ARG_TYPE_MAX,
 };
@@ -540,6 +563,7 @@ enum bpf_cgroup_storage_type {
 struct bpf_prog_stats {
 	u64 cnt;
 	u64 nsecs;
+	u64 misses;
 	struct u64_stats_sync syncp;
 } __aligned(2 * sizeof(u64));
 
@@ -656,6 +680,7 @@ struct bpf_trampoline {
 	 * of the function it replaced.
 	 */
 	struct bpf_prog *extension_prog;
+	struct module *mod;
 	/* list of BPF programs using this trampoline */
 	struct hlist_head progs_hlist[BPF_TRAMP_MAX];
 	/* Number of attached programs. A counter per kind. */
@@ -830,6 +855,7 @@ struct bpf_prog_aux {
 	const struct bpf_ctx_arg_aux *ctx_arg_info;
 	struct mutex dst_mutex; /* protects dst_* pointers below, *after* prog becomes visible */
 	struct bpf_prog *dst_prog;
+	struct btf *attach_btf;
 	struct bpf_trampoline *dst_trampoline;
 	enum bpf_prog_type saved_dst_prog_type;
 	enum bpf_attach_type saved_dst_attach_type;
@@ -1493,8 +1519,13 @@ int dev_xdp_enqueue(struct net_device *dev, struct xdp_buff *xdp,
 		    struct net_device *dev_rx);
 int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_buff *xdp,
 		    struct net_device *dev_rx);
+int dev_map_enqueue_multi(struct bpf_map *map, struct xdp_buff *xdp,
+			  struct net_device *dev_rx, bool exclude_ingress);
 int dev_map_generic_redirect(struct bpf_dtab_netdev *dst, struct sk_buff *skb,
 			     struct bpf_prog *xdp_prog);
+int dev_map_redirect_multi(struct net_device *dev, struct sk_buff *skb,
+			   struct bpf_prog *xdp_prog, struct bpf_map *map,
+			   bool exclude_ingress);
 bool dev_map_can_have_prog(struct bpf_map *map);
 
 struct bpf_cpu_map_entry *__cpu_map_lookup_elem(struct bpf_map *map, u32 key);
@@ -1695,6 +1726,14 @@ int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_buff *xdp,
 	return 0;
 }
 
+static inline int dev_map_enqueue_multi(struct bpf_map *map,
+					struct xdp_buff *xdp,
+					struct net_device *dev_rx,
+					bool exclude_ingress)
+{
+	return -EOPNOTSUPP;
+}
+
 struct sk_buff;
 
 static inline int dev_map_generic_redirect(struct bpf_dtab_netdev *dst,
@@ -1702,6 +1741,15 @@ static inline int dev_map_generic_redirect(struct bpf_dtab_netdev *dst,
 					   struct bpf_prog *xdp_prog)
 {
 	return 0;
+}
+
+static inline int dev_map_redirect_multi(struct net_device *dev,
+					 struct sk_buff *skb,
+					 struct bpf_prog *xdp_prog,
+					 struct bpf_map *map,
+					 bool exclude_ingress)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline

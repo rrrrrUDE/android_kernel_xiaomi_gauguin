@@ -4054,12 +4054,22 @@ int xdp_do_redirect(struct net_device *dev, struct xdp_buff *xdp,
 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
 	struct bpf_map *map = READ_ONCE(ri->map);
 	u32 index = ri->tgt_index;
+	u64 flags = ri->flags;
 	void *fwd = ri->tgt_value;
 	int err;
 
 	ri->tgt_index = 0;
 	ri->tgt_value = NULL;
 	WRITE_ONCE(ri->map, NULL);
+	if (flags & BPF_F_BROADCAST) {
+		if (!map)
+			return -ENOENT;
+		if (map->map_type != BPF_MAP_TYPE_DEVMAP &&
+		    map->map_type != BPF_MAP_TYPE_DEVMAP_HASH)
+			return -EINVAL;
+		return dev_map_enqueue_multi(map, xdp, dev,
+					     flags & BPF_F_EXCLUDE_INGRESS);
+	}
 
 	if (unlikely(!map)) {
 		fwd = dev_get_by_index_rcu(dev_net(dev), index);
@@ -4098,6 +4108,14 @@ static int xdp_do_generic_redirect_map(struct net_device *dev,
 	ri->tgt_index = 0;
 	ri->tgt_value = NULL;
 	WRITE_ONCE(ri->map, NULL);
+	if (ri->flags & BPF_F_BROADCAST) {
+		err = dev_map_redirect_multi(dev, skb, xdp_prog, map,
+					     ri->flags & BPF_F_EXCLUDE_INGRESS);
+		/* The single-target tracepoint dereferences fwd, which is NULL
+		 * for a broadcast.  The caller owns skb on error.
+		 */
+		return err;
+	}
 
 	if (map->map_type == BPF_MAP_TYPE_DEVMAP ||
 	    map->map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
@@ -4132,12 +4150,17 @@ int xdp_do_generic_redirect(struct net_device *dev, struct sk_buff *skb,
 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
 	struct bpf_map *map = READ_ONCE(ri->map);
 	u32 index = ri->tgt_index;
+	u64 flags = ri->flags;
 	struct net_device *fwd;
 	int err = 0;
 
 	if (map)
 		return xdp_do_generic_redirect_map(dev, skb, xdp, xdp_prog,
 						   map);
+	if (flags & BPF_F_BROADCAST) {
+		ri->tgt_index = 0;
+		return -ENOENT;
+	}
 	ri->tgt_index = 0;
 	fwd = dev_get_by_index_rcu(dev_net(dev), index);
 	if (unlikely(!fwd)) {
@@ -4186,9 +4209,22 @@ BPF_CALL_3(bpf_xdp_redirect_map, struct bpf_map *, map, u32, ifindex,
 {
 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
 
-	/* Lower bits of the flags are used as return code on lookup failure */
-	if (unlikely(flags > XDP_TX))
+	/* Lower bits of flags are the return code on lookup failure. */
+	if (unlikely((flags & ~(BPF_F_BROADCAST |
+				 BPF_F_EXCLUDE_INGRESS | XDP_TX)) ||
+		     ((flags & BPF_F_EXCLUDE_INGRESS) &&
+		      !(flags & BPF_F_BROADCAST))))
 		return XDP_ABORTED;
+	if (flags & BPF_F_BROADCAST) {
+		if (map->map_type != BPF_MAP_TYPE_DEVMAP &&
+		    map->map_type != BPF_MAP_TYPE_DEVMAP_HASH)
+			return XDP_ABORTED;
+		ri->flags = flags;
+		ri->tgt_index = ifindex;
+		ri->tgt_value = NULL;
+		WRITE_ONCE(ri->map, map);
+		return XDP_REDIRECT;
+	}
 
 	ri->tgt_value = __xdp_map_lookup_elem(map, ifindex);
 	if (unlikely(!ri->tgt_value)) {
@@ -4198,7 +4234,7 @@ BPF_CALL_3(bpf_xdp_redirect_map, struct bpf_map *, map, u32, ifindex,
 		 * precedence.
 		 */
 		WRITE_ONCE(ri->map, NULL);
-		return flags;
+		return flags & XDP_TX;
 	}
 
 	ri->flags = flags;
@@ -10610,7 +10646,8 @@ static bool sk_lookup_is_valid_access(int off, int size,
 	case bpf_ctx_range(struct bpf_sk_lookup, local_ip4):
 	case bpf_ctx_range_till(struct bpf_sk_lookup, remote_ip6[0], remote_ip6[3]):
 	case bpf_ctx_range_till(struct bpf_sk_lookup, local_ip6[0], local_ip6[3]):
-	case bpf_ctx_range(struct bpf_sk_lookup, remote_port):
+	case offsetof(struct bpf_sk_lookup, remote_port) ...
+	     offsetof(struct bpf_sk_lookup, local_ip4) - 1:
 	case bpf_ctx_range(struct bpf_sk_lookup, local_port):
 		bpf_ctx_record_field_size(info, sizeof(__u32));
 		return bpf_ctx_narrow_access_ok(off, size, sizeof(__u32));

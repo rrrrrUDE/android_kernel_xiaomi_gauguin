@@ -45,6 +45,7 @@
  * types of devmap; only the lookup and insertion is different.
  */
 #include <linux/bpf.h>
+#include <linux/skbuff.h>
 #include <net/xdp.h>
 #include <linux/filter.h>
 #include <trace/events/xdp.h>
@@ -514,6 +515,168 @@ int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_buff *xdp,
 	return __xdp_enqueue(dev, xdp, dev_rx);
 }
 
+static struct xdp_frame *dev_map_clone_frame(struct xdp_frame *xdpf)
+{
+	unsigned int headroom;
+	unsigned int size;
+	struct xdp_frame *clone;
+	struct page *page;
+	void *addr;
+
+	if (xdpf->headroom > SKB_WITH_OVERHEAD(PAGE_SIZE) - sizeof(*xdpf))
+		return NULL;
+	headroom = xdpf->headroom + sizeof(*xdpf);
+	if (headroom > SKB_WITH_OVERHEAD(PAGE_SIZE) ||
+	    xdpf->len > SKB_WITH_OVERHEAD(PAGE_SIZE) - headroom)
+		return NULL;
+	size = headroom + xdpf->len;
+	page = dev_alloc_page();
+	if (!page)
+		return NULL;
+	addr = page_to_virt(page);
+	memcpy(addr, xdpf, size);
+	clone = addr;
+	clone->data = addr + headroom;
+	clone->frame_sz = PAGE_SIZE;
+	clone->mem.type = MEM_TYPE_PAGE_ORDER0;
+	clone->mem.id = 0;
+	return clone;
+}
+
+static int dev_map_enqueue_clone(struct bpf_dtab_netdev *dst,
+				 struct xdp_frame *source,
+				 const struct xdp_rxq_info *source_rxq,
+				 struct net_device *dev_rx)
+{
+	struct xdp_frame *clone = dev_map_clone_frame(source);
+	struct xdp_rxq_info rxq;
+	struct xdp_buff xdp;
+
+	if (!clone)
+		return -ENOMEM;
+	if (dst->xdp_prog) {
+		rxq = *source_rxq;
+		rxq.mem = clone->mem;
+		xdp_convert_frame_to_buff(clone, &xdp);
+		xdp.rxq = &rxq;
+		if (!dev_map_run_prog(dst->dev, &xdp, dst->xdp_prog))
+			return 0;
+		if (xdp_update_frame_from_buff(&xdp, clone)) {
+			xdp_return_frame(clone);
+			return -EOVERFLOW;
+		}
+	}
+	bq_enqueue(dst->dev, clone, dev_rx);
+	return 0;
+}
+
+static bool dev_map_excluded(struct net_device *dev,
+			     struct net_device *dev_rx)
+{
+	struct net_device *upper;
+	struct list_head *iter;
+
+	if (dev == dev_rx)
+		return true;
+	netdev_for_each_upper_dev_rcu(dev_rx, upper, iter)
+		if (dev == upper)
+			return true;
+	return false;
+}
+
+static bool dev_map_valid_broadcast_dst(struct bpf_dtab_netdev *dst,
+					struct xdp_frame *xdpf,
+					struct net_device *dev_rx,
+					bool exclude_ingress)
+{
+	return dst && dst->dev->netdev_ops->ndo_xdp_xmit &&
+		!xdp_ok_fwd_dev(dst->dev, xdpf->len) &&
+		(!exclude_ingress || !dev_map_excluded(dst->dev, dev_rx));
+}
+
+int dev_map_enqueue_multi(struct bpf_map *map, struct xdp_buff *xdp,
+			  struct net_device *dev_rx, bool exclude_ingress)
+{
+	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
+	struct bpf_dtab_netdev *dst, *last = NULL;
+	struct xdp_frame *xdpf;
+	struct hlist_head *head;
+	unsigned int i;
+	int err;
+
+	xdpf = xdp_convert_buff_to_frame(xdp);
+	if (!xdpf)
+		return -EOVERFLOW;
+
+	if (map->map_type == BPF_MAP_TYPE_DEVMAP) {
+		for (i = 0; i < map->max_entries; i++) {
+			dst = READ_ONCE(dtab->netdev_map[i]);
+			if (!dev_map_valid_broadcast_dst(dst, xdpf, dev_rx,
+						    exclude_ingress))
+				continue;
+			if (last) {
+				err = dev_map_enqueue_clone(last, xdpf, xdp->rxq,
+						    dev_rx);
+				if (err)
+					return err;
+			}
+			last = dst;
+		}
+	} else {
+		for (i = 0; i < dtab->n_buckets; i++) {
+			head = dev_map_index_hash(dtab, i);
+			hlist_for_each_entry_rcu(dst, head, index_hlist,
+						 rcu_read_lock_bh_held()) {
+				if (!dev_map_valid_broadcast_dst(dst, xdpf, dev_rx,
+							    exclude_ingress))
+					continue;
+				if (last) {
+					err = dev_map_enqueue_clone(last, xdpf,
+							    xdp->rxq, dev_rx);
+					if (err)
+						return err;
+				}
+				last = dst;
+			}
+		}
+	}
+
+	if (last)
+		return dev_map_enqueue(last, xdp, dev_rx);
+	xdp_return_buff(xdp);
+	return 0;
+}
+
+static u32 dev_map_bpf_prog_run_skb(struct sk_buff *skb,
+				    struct bpf_dtab_netdev *dst)
+{
+	struct xdp_txq_info txq = { .dev = dst->dev };
+	struct xdp_buff xdp;
+	u32 act;
+
+	if (!dst->xdp_prog)
+		return XDP_PASS;
+
+	__skb_pull(skb, skb->mac_len);
+	xdp.txq = &txq;
+	act = bpf_prog_run_generic_xdp(skb, &xdp, dst->xdp_prog);
+	switch (act) {
+	case XDP_PASS:
+		__skb_push(skb, skb->mac_len);
+		break;
+	default:
+		bpf_warn_invalid_xdp_action(act);
+		fallthrough;
+	case XDP_ABORTED:
+		trace_xdp_exception(dst->dev, dst->xdp_prog, act);
+		fallthrough;
+	case XDP_DROP:
+		kfree_skb(skb);
+		break;
+	}
+	return act;
+}
+
 int dev_map_generic_redirect(struct bpf_dtab_netdev *dst, struct sk_buff *skb,
 			     struct bpf_prog *xdp_prog)
 {
@@ -522,9 +685,92 @@ int dev_map_generic_redirect(struct bpf_dtab_netdev *dst, struct sk_buff *skb,
 	err = xdp_ok_fwd_dev(dst->dev, skb->len);
 	if (unlikely(err))
 		return err;
+	if (dst->xdp_prog && skb_cloned(skb)) {
+		struct sk_buff *nskb = skb_copy(skb, GFP_ATOMIC);
+
+		if (!nskb)
+			return -ENOMEM;
+		nskb->mac_len = skb->mac_len;
+		consume_skb(skb);
+		skb = nskb;
+	}
+	if (dev_map_bpf_prog_run_skb(skb, dst) != XDP_PASS)
+		return 0;
 	skb->dev = dst->dev;
 	generic_xdp_tx(skb, xdp_prog);
 
+	return 0;
+}
+
+static bool dev_map_valid_generic_dst(struct bpf_dtab_netdev *dst,
+				      struct sk_buff *skb,
+				      struct net_device *dev_rx,
+				      bool exclude_ingress)
+{
+	return dst && !xdp_ok_fwd_dev(dst->dev, skb->len) &&
+		(!exclude_ingress || !dev_map_excluded(dst->dev, dev_rx));
+}
+
+static int dev_map_generic_redirect_clone(struct bpf_dtab_netdev *dst,
+					  struct sk_buff *skb,
+					  struct bpf_prog *xdp_prog)
+{
+	struct sk_buff *clone = skb_clone(skb, GFP_ATOMIC);
+	int err;
+
+	if (!clone)
+		return -ENOMEM;
+	err = dev_map_generic_redirect(dst, clone, xdp_prog);
+	if (err)
+		consume_skb(clone);
+	return err;
+}
+
+int dev_map_redirect_multi(struct net_device *dev, struct sk_buff *skb,
+			   struct bpf_prog *xdp_prog, struct bpf_map *map,
+			   bool exclude_ingress)
+{
+	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
+	struct bpf_dtab_netdev *dst, *last = NULL;
+	struct hlist_head *head;
+	unsigned int i;
+	int err;
+
+	if (map->map_type == BPF_MAP_TYPE_DEVMAP) {
+		for (i = 0; i < map->max_entries; i++) {
+			dst = READ_ONCE(dtab->netdev_map[i]);
+			if (!dev_map_valid_generic_dst(dst, skb, dev,
+						       exclude_ingress))
+				continue;
+			if (last) {
+				err = dev_map_generic_redirect_clone(last, skb,
+							     xdp_prog);
+				if (err)
+					return err;
+			}
+			last = dst;
+		}
+	} else {
+		for (i = 0; i < dtab->n_buckets; i++) {
+			head = dev_map_index_hash(dtab, i);
+			hlist_for_each_entry_rcu(dst, head, index_hlist,
+						 rcu_read_lock_bh_held()) {
+				if (!dev_map_valid_generic_dst(dst, skb, dev,
+							       exclude_ingress))
+					continue;
+				if (last) {
+					err = dev_map_generic_redirect_clone(last,
+								     skb, xdp_prog);
+					if (err)
+						return err;
+				}
+				last = dst;
+			}
+		}
+	}
+	if (last)
+		return dev_map_generic_redirect(last, skb, xdp_prog);
+	consume_skb(skb);
 	return 0;
 }
 

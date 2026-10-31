@@ -382,6 +382,10 @@ enum bpf_link_type {
  * verifier type:    CONST_PTR_TO_MAP
  */
 #define BPF_PSEUDO_MAP_FD	1
+/* Like BPF_PSEUDO_MAP_FD, but insn[0].imm is an index into
+ * union bpf_attr.fd_array supplied with BPF_PROG_LOAD.
+ */
+#define BPF_PSEUDO_MAP_IDX	5
 /* insn[0].src_reg:  BPF_PSEUDO_MAP_VALUE
  * insn[0].imm:      map fd
  * insn[1].imm:      offset into value
@@ -391,6 +395,8 @@ enum bpf_link_type {
  * verifier type:    PTR_TO_MAP_VALUE
  */
 #define BPF_PSEUDO_MAP_VALUE	2
+/* Like BPF_PSEUDO_MAP_VALUE, with a map FD from fd_array. */
+#define BPF_PSEUDO_MAP_IDX_VALUE	6
 /* insn[0].src_reg:  BPF_PSEUDO_BTF_ID
  * insn[0].imm:      kernel btd id of VAR
  * insn[1].imm:      0
@@ -582,7 +588,12 @@ union bpf_attr {
 		__aligned_u64	line_info;	/* line info */
 		__u32		line_info_cnt;	/* number of bpf_line_info records */
 		__u32		attach_btf_id;	/* in-kernel BTF type id to attach to */
-		__u32		attach_prog_fd; /* 0 to attach to vmlinux */
+		union {
+			__u32	attach_prog_fd; /* 0 to attach to vmlinux */
+			__u32	attach_btf_obj_fd; /* module BTF object FD */
+		};
+		__u32		:32;
+		__aligned_u64	fd_array; /* FDs referenced by map index pseudo instructions */
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */
@@ -1797,8 +1808,12 @@ union bpf_attr {
  * 		The lower two bits of *flags* are used as the return code if
  * 		the map lookup fails. This is so that the return value can be
  * 		one of the XDP program return codes up to **XDP_TX**, as chosen
- * 		by the caller. Any higher bits in the *flags* argument must be
- * 		unset.
+ * 		by the caller. With a **BPF_MAP_TYPE_DEVMAP** or
+ * 		**BPF_MAP_TYPE_DEVMAP_HASH**, **BPF_F_BROADCAST** sends a copy to
+ * 		each eligible device. **BPF_F_EXCLUDE_INGRESS** also skips the
+ * 		ingress device and its upper devices. Devmap secondary programs
+ * 		are also run for generic XDP redirects. Other higher bits must
+ * 		be unset.
  *
  * 		See also **bpf_redirect**\ (), which only supports redirecting
  * 		to an ifindex, but doesn't require a map to do so.
@@ -3994,6 +4009,9 @@ enum {
 /* BPF_FUNC_clone_redirect and BPF_FUNC_redirect flags. */
 enum {
 	BPF_F_INGRESS			= (1ULL << 0),
+	BPF_F_BROADCAST			= (1ULL << 3),
+	BPF_F_EXCLUDE_INGRESS		= (1ULL << 4),
+#define BPF_F_REDIRECT_FLAGS (BPF_F_INGRESS | BPF_F_BROADCAST | BPF_F_EXCLUDE_INGRESS)
 };
 
 /* BPF_FUNC_skb_set_tunnel_key and BPF_FUNC_skb_get_tunnel_key flags. */
@@ -4457,6 +4475,7 @@ struct bpf_prog_info {
 	__aligned_u64 prog_tags;
 	__u64 run_time_ns;
 	__u64 run_cnt;
+	__u64 recursion_misses;
 } __attribute__((aligned(8)));
 
 struct bpf_map_info {
@@ -4480,6 +4499,9 @@ struct bpf_btf_info {
 	__aligned_u64 btf;
 	__u32 btf_size;
 	__u32 id;
+	__aligned_u64 name;
+	__u32 name_len;
+	__u32 kernel_btf;
 } __attribute__((aligned(8)));
 
 struct bpf_link_info {
@@ -4493,6 +4515,8 @@ struct bpf_link_info {
 		} raw_tracepoint;
 		struct {
 			__u32 attach_type;
+			__u32 target_obj_id;
+			__u32 target_btf_id;
 		} tracing;
 		struct {
 			__u64 cgroup_id;
@@ -5056,6 +5080,11 @@ struct bpf_spin_lock {
 	__u32	val;
 };
 
+struct bpf_timer {
+	__u64 :64;
+	__u64 :64;
+} __attribute__((aligned(8)));
+
 struct bpf_sysctl {
 	__u32	write;		/* Sysctl is being read (= 0) or written (= 1).
 				 * Allows 1,2,4-byte read, but no write.
@@ -5092,7 +5121,8 @@ struct bpf_sk_lookup {
 	__u32 protocol;		/* IP protocol (IPPROTO_TCP, IPPROTO_UDP) */
 	__u32 remote_ip4;	/* Network byte order */
 	__u32 remote_ip6[4];	/* Network byte order */
-	__u32 remote_port;	/* Network byte order */
+	__be16 remote_port;	/* Network byte order */
+	__u16 :16;		/* Zero padding */
 	__u32 local_ip4;	/* Network byte order */
 	__u32 local_ip6[4];	/* Network byte order */
 	__u32 local_port;	/* Host byte order */
