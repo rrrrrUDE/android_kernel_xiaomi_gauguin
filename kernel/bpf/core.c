@@ -266,6 +266,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->dst_mutex);
 		free_percpu(fp->aux->stats);
 		kfree(fp->aux->poke_tab);
+		kfree(fp->aux->kfunc_tab);
 		kfree(fp->aux);
 	}
 	vfree(fp);
@@ -1900,6 +1901,8 @@ static void bpf_prog_select_func(struct bpf_prog *fp)
  */
 struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
 {
+	bool has_kfunc_call = bpf_prog_has_kfunc_call(fp);
+
 	/* In case of BPF to BPF calls, verifier did all the prep
 	 * work with regards to JITing, etc.
 	 */
@@ -1922,6 +1925,10 @@ struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
 		fp = bpf_int_jit_compile(fp);
 		if (!fp->jited) {
 			bpf_prog_free_jited_linfo(fp);
+			if (has_kfunc_call) {
+				*err = -ENOTSUPP;
+				return fp;
+			}
 #ifdef CONFIG_BPF_JIT_ALWAYS_ON
 			*err = -ENOTSUPP;
 			return fp;
@@ -2257,6 +2264,7 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 		 * released along with it.
 		 */
 		aux->func[i]->aux->poke_tab = NULL;
+		aux->func[i]->aux->kfunc_tab = NULL;
 		bpf_jit_free(aux->func[i]);
 	}
 	if (aux->func_cnt) {

@@ -5304,6 +5304,48 @@ out:
 	return -EINVAL;
 }
 
+int btf_check_kfunc_arg_match(struct bpf_verifier_env *env,
+			      const struct btf *btf, u32 func_id,
+			      struct bpf_reg_state *regs)
+{
+	const struct btf_type *func, *proto, *type, *ref_type;
+	const struct btf_param *args;
+	u32 i, nargs, ref_id;
+
+	func = btf_type_by_id(btf, func_id);
+	if (!func || !btf_type_is_func(func))
+		return -EINVAL;
+	proto = btf_type_by_id(btf, func->type);
+	if (!proto || !btf_type_is_func_proto(proto))
+		return -EINVAL;
+	nargs = btf_type_vlen(proto);
+	if (nargs > 5)
+		return -EINVAL;
+	args = (const struct btf_param *)(proto + 1);
+	for (i = 0; i < nargs; i++) {
+		type = btf_type_skip_modifiers(btf, args[i].type, NULL);
+		if (!type)
+			return -EINVAL;
+		if (btf_type_is_int(type) || btf_type_is_enum(type)) {
+			if (type->size > sizeof(u64) ||
+			    regs[i + 1].type != SCALAR_VALUE)
+				return -EINVAL;
+			continue;
+		}
+		if (!btf_type_is_ptr(type) ||
+		    regs[i + 1].type != PTR_TO_BTF_ID || regs[i + 1].off ||
+		    !tnum_is_const(regs[i + 1].var_off) ||
+		    regs[i + 1].var_off.value)
+			return -EINVAL;
+		ref_type = btf_type_skip_modifiers(btf, type->type, &ref_id);
+		if (!ref_type || !btf_type_is_struct(ref_type) ||
+		    !btf_struct_ids_match(&env->log, 0, regs[i + 1].btf_id,
+					  ref_id))
+			return -EINVAL;
+	}
+	return 0;
+}
+
 /* Convert BTF of a function into bpf_reg_state if possible
  * Returns:
  * EFAULT - there is a verifier bug. Abort verification.

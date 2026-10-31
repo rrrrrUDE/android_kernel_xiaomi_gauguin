@@ -31,6 +31,7 @@ struct bpf_verifier_log;
 struct perf_event;
 struct bpf_prog;
 struct bpf_prog_aux;
+struct bpf_kfunc_desc_tab;
 struct bpf_map;
 struct sock;
 struct seq_file;
@@ -469,6 +470,8 @@ struct bpf_prog_ops {
 };
 
 struct bpf_verifier_ops {
+	/* Permit a BTF-identified kernel function for this program type. */
+	bool (*check_kfunc_call)(u32 kfunc_id);
 	/* return eBPF function prototype for verification */
 	const struct bpf_func_proto *
 	(*get_func_proto)(enum bpf_func_id func_id,
@@ -844,6 +847,7 @@ struct bpf_prog_aux {
 	struct bpf_prog **func;
 	void *jit_data; /* JIT specific data. arch dependent */
 	struct bpf_jit_poke_descriptor *poke_tab;
+	struct bpf_kfunc_desc_tab *kfunc_tab;
 	u32 size_poke_tab;
 	struct bpf_ksym ksym;
 	const struct bpf_prog_ops *ops;
@@ -1552,6 +1556,11 @@ static inline bool unprivileged_ebpf_enabled(void)
 struct bpf_reg_state;
 int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
 			     struct bpf_reg_state *regs);
+int btf_check_kfunc_arg_match(struct bpf_verifier_env *env,
+			      const struct btf *btf, u32 func_id,
+			      struct bpf_reg_state *regs);
+bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
+bool bpf_prog_test_check_kfunc_call(u32 kfunc_id);
 int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
 			  struct bpf_reg_state *reg);
 int btf_check_type_match(struct bpf_verifier_log *log, const struct bpf_prog *prog,
@@ -1562,6 +1571,16 @@ struct bpf_link *bpf_link_by_id(u32 id);
 
 const struct bpf_func_proto *bpf_base_func_proto(enum bpf_func_id func_id);
 #else /* !CONFIG_BPF_SYSCALL */
+static inline bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
+{
+	return false;
+}
+
+static inline bool bpf_prog_test_check_kfunc_call(u32 kfunc_id)
+{
+	return false;
+}
+
 static inline struct bpf_prog *bpf_prog_get(u32 ufd)
 {
 	return ERR_PTR(-EOPNOTSUPP);

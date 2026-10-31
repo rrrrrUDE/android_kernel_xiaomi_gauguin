@@ -975,6 +975,12 @@ out:
 	return prog;
 }
 
+/* Kfunc calls use the same register ABI and BLR sequence as helper calls. */
+bool bpf_jit_supports_kfunc_call(void)
+{
+	return true;
+}
+
 void *bpf_jit_alloc_exec(unsigned long size)
 {
 	return __vmalloc_node_range(size, PAGE_SIZE, BPF_JIT_REGION_START,

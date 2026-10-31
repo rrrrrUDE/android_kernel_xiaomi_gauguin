@@ -5,6 +5,7 @@
  * License as published by the Free Software Foundation.
  */
 #include <linux/bpf.h>
+#include <linux/btf_ids.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/etherdevice.h>
@@ -220,6 +221,21 @@ int noinline bpf_modify_return_test(int a, int *b)
 __diag_pop();
 
 ALLOW_ERROR_INJECTION(bpf_modify_return_test, ERRNO);
+
+/* Exercise the kfunc call path with scalar arguments and return value. */
+u64 noinline __used bpf_kfunc_call_test1(u32 a, u64 b, u32 c, u64 d)
+{
+	return a + b + c + d;
+}
+
+BTF_SET_START(test_kfunc_ids)
+BTF_ID(func, bpf_kfunc_call_test1)
+BTF_SET_END(test_kfunc_ids)
+
+bool bpf_prog_test_check_kfunc_call(u32 kfunc_id)
+{
+	return btf_id_set_contains(&test_kfunc_ids, kfunc_id);
+}
 
 static void *bpf_test_init(const union bpf_attr *kattr, u32 size,
 			   u32 headroom, u32 tailroom)

@@ -1502,6 +1502,118 @@ static int add_subprog(struct bpf_verifier_env *env, int off)
 	return 0;
 }
 
+struct bpf_kfunc_desc {
+	struct btf_func_model func_model;
+	u32 func_id;
+	s32 imm;
+};
+
+#define MAX_KFUNC_DESCS 256
+struct bpf_kfunc_desc_tab {
+	struct bpf_kfunc_desc descs[MAX_KFUNC_DESCS];
+	u32 nr_descs;
+};
+
+static int kfunc_desc_cmp_by_id(const void *a, const void *b)
+{
+	const struct bpf_kfunc_desc *d0 = a, *d1 = b;
+
+	return d0->func_id < d1->func_id ? -1 : d0->func_id > d1->func_id;
+}
+
+static const struct bpf_kfunc_desc *
+find_kfunc_desc(const struct bpf_prog *prog, u32 func_id)
+{
+	struct bpf_kfunc_desc key = { .func_id = func_id };
+	struct bpf_kfunc_desc_tab *tab = prog->aux->kfunc_tab;
+
+	if (!tab)
+		return NULL;
+	return bsearch(&key, tab->descs, tab->nr_descs,
+		       sizeof(tab->descs[0]), kfunc_desc_cmp_by_id);
+}
+
+static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id)
+{
+	const struct btf_type *func, *proto;
+	struct bpf_kfunc_desc_tab *tab = env->prog->aux->kfunc_tab;
+	struct bpf_kfunc_desc *desc;
+	const char *name;
+	unsigned long addr;
+	long call_offset;
+	int err;
+
+	if (!env->bpf_capable) {
+		verbose(env, "kernel function calls require CAP_BPF or CAP_SYS_ADMIN\n");
+		return -EPERM;
+	}
+	if (!btf_vmlinux || IS_ERR(btf_vmlinux)) {
+		verbose(env, "kernel function calls require kernel BTF\n");
+		return -ENOTSUPP;
+	}
+	if (!env->prog->jit_requested || !bpf_jit_supports_kfunc_call()) {
+		verbose(env, "JIT does not support calling kernel function\n");
+		return -ENOTSUPP;
+	}
+	if (!env->prog->gpl_compatible) {
+		verbose(env, "kernel function calls require a GPL-compatible program\n");
+		return -EINVAL;
+	}
+	if (find_kfunc_desc(env->prog, func_id))
+		return 0;
+	if (!tab) {
+		tab = kzalloc(sizeof(*tab), GFP_KERNEL);
+		if (!tab)
+			return -ENOMEM;
+		env->prog->aux->kfunc_tab = tab;
+	}
+	if (tab->nr_descs == MAX_KFUNC_DESCS)
+		return -E2BIG;
+	func = btf_type_by_id(btf_vmlinux, func_id);
+	if (!func || !btf_type_is_func(func)) {
+		verbose(env, "kernel btf_id %u is not a function\n", func_id);
+		return -EINVAL;
+	}
+	proto = btf_type_by_id(btf_vmlinux, func->type);
+	if (!proto || !btf_type_is_func_proto(proto))
+		return -EINVAL;
+	name = btf_name_by_offset(btf_vmlinux, func->name_off);
+	addr = kallsyms_lookup_name(name);
+	if (!addr)
+		return -ENOENT;
+	call_offset = (long)BPF_CAST_CALL(addr) - (long)__bpf_call_base;
+	if ((long)(s32)call_offset != call_offset)
+		return -ERANGE;
+	desc = &tab->descs[tab->nr_descs];
+	err = btf_distill_func_proto(&env->log, btf_vmlinux, proto,
+				     name, &desc->func_model);
+	if (err)
+		return err;
+	desc->func_id = func_id;
+	desc->imm = call_offset;
+	tab->nr_descs++;
+	sort(tab->descs, tab->nr_descs, sizeof(tab->descs[0]),
+	     kfunc_desc_cmp_by_id, NULL);
+	return 0;
+}
+
+bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
+{
+	return !!prog->aux->kfunc_tab;
+}
+
+static int fixup_kfunc_call(struct bpf_verifier_env *env,
+			   struct bpf_insn *insn)
+{
+	const struct bpf_kfunc_desc *desc;
+
+	desc = find_kfunc_desc(env->prog, insn->imm);
+	if (!desc)
+		return -EFAULT;
+	insn->imm = desc->imm;
+	return 0;
+}
+
 static int check_subprogs(struct bpf_verifier_env *env)
 {
 	int i, ret, subprog_start, subprog_end, off, cur_subprog = 0;
@@ -1516,6 +1628,13 @@ static int check_subprogs(struct bpf_verifier_env *env)
 
 	/* determine subprog starts. The end is one before the next starts */
 	for (i = 0; i < insn_cnt; i++) {
+		if (insn[i].code == (BPF_JMP | BPF_CALL) &&
+		    insn[i].src_reg == BPF_PSEUDO_KFUNC_CALL) {
+			ret = add_kfunc_call(env, insn[i].imm);
+			if (ret)
+				return ret;
+			continue;
+		}
 		if (!((insn[i].code == (BPF_JMP | BPF_CALL) &&
 		       insn[i].src_reg == BPF_PSEUDO_CALL) ||
 		      bpf_pseudo_func(&insn[i])))
@@ -1547,7 +1666,7 @@ static int check_subprogs(struct bpf_verifier_env *env)
 
 		if (code == (BPF_JMP | BPF_CALL) &&
 		    insn[i].imm == BPF_FUNC_tail_call &&
-		    insn[i].src_reg != BPF_PSEUDO_CALL)
+		    insn[i].src_reg == BPF_REG_0)
 			subprog[cur_subprog].has_tail_call = true;
 		if (BPF_CLASS(code) == BPF_LD &&
 		    (BPF_MODE(code) == BPF_ABS || BPF_MODE(code) == BPF_IND))
@@ -5873,6 +5992,50 @@ static int check_get_func_ip(struct bpf_verifier_env *env)
 		return 0;
 	verbose(env, "get_func_ip unsupported for program type %d\n", type);
 	return -ENOTSUPP;
+}
+
+static int check_kfunc_call(struct bpf_verifier_env *env,
+			    struct bpf_insn *insn)
+{
+	const struct btf_type *func, *proto, *ret_type;
+	struct bpf_reg_state *regs = cur_regs(env);
+	int i, err;
+
+	if (!env->ops->check_kfunc_call ||
+	    !env->ops->check_kfunc_call(insn->imm))
+		return -EACCES;
+	func = btf_type_by_id(btf_vmlinux, insn->imm);
+	if (!func || !btf_type_is_func(func))
+		return -EINVAL;
+	proto = btf_type_by_id(btf_vmlinux, func->type);
+	if (!proto || !btf_type_is_func_proto(proto))
+		return -EINVAL;
+	if (btf_type_vlen(proto) > 5)
+		return -EINVAL;
+	ret_type = btf_type_skip_modifiers(btf_vmlinux, proto->type, NULL);
+	if (!ret_type || (!btf_type_is_void(ret_type) &&
+			  !btf_type_is_int(ret_type) &&
+			  !btf_type_is_enum(ret_type)))
+		return -EINVAL;
+	if (!btf_type_is_void(ret_type) && ret_type->size > sizeof(u64))
+		return -EINVAL;
+	for (i = 0; i < btf_type_vlen(proto); i++) {
+		err = check_reg_arg(env, i + 1, SRC_OP);
+		if (err)
+			return err;
+	}
+	err = btf_check_kfunc_arg_match(env, btf_vmlinux, insn->imm, regs);
+	if (err)
+		return err;
+	for (i = 0; i < CALLER_SAVED_REGS; i++) {
+		mark_reg_not_init(env, regs, caller_saved[i]);
+		check_reg_arg(env, caller_saved[i], DST_OP_NO_MARK);
+	}
+	if (!btf_type_is_void(ret_type)) {
+		mark_reg_unknown(env, regs, BPF_REG_0);
+		regs[BPF_REG_0].subreg_def = DEF_NOT_SUBREG;
+	}
+	return 0;
 }
 
 static int check_helper_call(struct bpf_verifier_env *env, int func_id,
@@ -10631,18 +10794,15 @@ static int do_check(struct bpf_verifier_env *env)
 				}
 
 				if (env->cur_state->active_spin_lock &&
-				    (insn->src_reg == BPF_PSEUDO_CALL ||
+				    (insn->src_reg != BPF_REG_0 ||
 				     insn->imm != BPF_FUNC_spin_unlock)) {
 					verbose(env, "function calls are not allowed while holding a lock\n");
 					return -EINVAL;
 				}
 				if (insn->src_reg == BPF_PSEUDO_CALL)
 					err = check_func_call(env, insn, &env->insn_idx);
-				else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
-					/* Kfunc address fixup and JIT support are not available yet. */
-					verbose(env, "JIT does not support calling kernel function\n");
-					return -ENOTSUPP;
-				}
+				else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
+					err = check_kfunc_call(env, insn);
 				else
 					err = check_helper_call(env, insn->imm,
 							&env->insn_idx);
@@ -11849,6 +12009,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->name[0] = 'F';
 		func[i]->aux->stack_depth = env->subprog_info[i].stack_depth;
 		func[i]->jit_requested = 1;
+		func[i]->aux->kfunc_tab = prog->aux->kfunc_tab;
 		func[i]->aux->linfo = prog->aux->linfo;
 		func[i]->aux->nr_linfo = prog->aux->nr_linfo;
 		func[i]->aux->jited_linfo = prog->aux->jited_linfo;
@@ -11966,6 +12127,7 @@ out_free:
 		if (!func[i])
 			continue;
 		func[i]->aux->poke_tab = NULL;
+		func[i]->aux->kfunc_tab = NULL;
 		bpf_jit_free(func[i]);
 	}
 	kfree(func);
@@ -12017,6 +12179,10 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 		}
 	}
 #ifndef CONFIG_BPF_JIT_ALWAYS_ON
+	if (bpf_prog_has_kfunc_call(env->prog)) {
+		verbose(env, "kernel function calls require JIT compilation\n");
+		return -ENOTSUPP;
+	}
 	if (env->subprog_cnt > 1 && env->prog->aux->tail_call_reachable) {
 		/* When JIT fails the progs with bpf2bpf calls and tail_calls
 		 * have to be rejected, since interpreter doesn't support them yet.
@@ -12175,6 +12341,12 @@ static int fixup_bpf_calls(struct bpf_verifier_env *env)
 			continue;
 		if (insn->src_reg == BPF_PSEUDO_CALL)
 			continue;
+		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+			ret = fixup_kfunc_call(env, insn);
+			if (ret)
+				return ret;
+			continue;
+		}
 
 		if (insn->imm == BPF_FUNC_get_route_realm)
 			prog->dst_needed = 1;
