@@ -4,6 +4,7 @@
 #define _LINUX_BPFPTR_H
 
 #include <linux/sockptr.h>
+#include <linux/uaccess.h>
 
 typedef sockptr_t bpfptr_t;
 
@@ -50,13 +51,7 @@ static inline int copy_from_bpfptr_offset(void *dst, bpfptr_t src,
 {
 	if (!bpfptr_is_kernel(src))
 		return copy_from_user(dst, src.user + offset, size);
-	/*
-	 * 4.19 has no copy_from_kernel_nofault().  Kernel bpfptr values are
-	 * constructed only from kernel-owned syscall/test-run buffers, while
-	 * untrusted addresses always retain the userspace tag above.
-	 */
-	memcpy(dst, src.kernel + offset, size);
-	return 0;
+	return probe_kernel_read(dst, src.kernel + offset, size);
 }
 
 static inline int copy_from_bpfptr(void *dst, bpfptr_t src, size_t size)
@@ -67,7 +62,9 @@ static inline int copy_from_bpfptr(void *dst, bpfptr_t src, size_t size)
 static inline int copy_to_bpfptr_offset(bpfptr_t dst, size_t offset,
 					const void *src, size_t size)
 {
-	return copy_to_sockptr_offset((sockptr_t) dst, offset, src, size);
+	if (!bpfptr_is_kernel(dst))
+		return copy_to_user(dst.user + offset, src, size);
+	return probe_kernel_write(dst.kernel + offset, src, size);
 }
 
 static inline void *kvmemdup_bpfptr(bpfptr_t src, size_t len)
@@ -86,10 +83,15 @@ static inline void *kvmemdup_bpfptr(bpfptr_t src, size_t len)
 static inline long strncpy_from_bpfptr(char *dst, bpfptr_t src, size_t count)
 {
 	if (bpfptr_is_kernel(src)) {
-		long len = strnlen(src.kernel, count);
+		long len;
 
-		memcpy(dst, src.kernel, len == count ? count : len + 1);
-		return len;
+		for (len = 0; len < count; len++) {
+			if (probe_kernel_read(&dst[len], src.kernel + len, 1))
+				return -EFAULT;
+			if (!dst[len])
+				return len;
+		}
+		return count;
 	}
 	return strncpy_from_user(dst, src.user, count);
 }

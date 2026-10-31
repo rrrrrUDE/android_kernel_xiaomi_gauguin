@@ -141,7 +141,15 @@ static int inet_csk_bind_conflict(const struct sock *sk,
 	struct sock *sk2;
 	bool reuse = sk->sk_reuse;
 	bool reuseport = !!sk->sk_reuseport && reuseport_ok;
+	struct sock_reuseport *reuseport_cb;
+	bool reuseport_cb_ok;
 	kuid_t uid = sock_i_uid((struct sock *)sk);
+
+	rcu_read_lock();
+	reuseport_cb = rcu_dereference(sk->sk_reuseport_cb);
+	reuseport_cb_ok = !reuseport_cb ||
+		READ_ONCE(reuseport_cb->num_closed_socks);
+	rcu_read_unlock();
 
 	/*
 	 * Unlike other sk lookup places we do not check
@@ -158,7 +166,7 @@ static int inet_csk_bind_conflict(const struct sock *sk,
 			if ((!reuse || !sk2->sk_reuse ||
 			    sk2->sk_state == TCP_LISTEN) &&
 			    (!reuseport || !sk2->sk_reuseport ||
-			     rcu_access_pointer(sk->sk_reuseport_cb) ||
+			     !reuseport_cb_ok ||
 			     (sk2->sk_state != TCP_TIME_WAIT &&
 			     !uid_eq(uid, sock_i_uid(sk2))))) {
 				if (inet_rcv_saddr_equal(sk, sk2, true))
@@ -700,6 +708,60 @@ int inet_rtx_syn_ack(const struct sock *parent, struct request_sock *req)
 }
 EXPORT_SYMBOL(inet_rtx_syn_ack);
 
+static struct request_sock *inet_reqsk_clone(struct request_sock *req,
+					     struct sock *sk)
+{
+	struct sock *req_sk = req_to_sk(req), *nreq_sk;
+	struct request_sock *nreq;
+
+	nreq = kmem_cache_alloc(req->rsk_ops->slab, GFP_ATOMIC | __GFP_NOWARN);
+	if (!nreq) {
+		__NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPMIGRATEREQFAILURE);
+		sock_put(sk);
+		return NULL;
+	}
+	nreq_sk = req_to_sk(nreq);
+	memcpy(nreq_sk, req_sk, offsetof(struct sock, sk_dontcopy_begin));
+	memcpy(&nreq_sk->sk_dontcopy_end, &req_sk->sk_dontcopy_end,
+	       req->rsk_ops->obj_size - offsetof(struct sock, sk_dontcopy_end));
+	sk_node_init(&nreq_sk->sk_node);
+	nreq_sk->sk_tx_queue_mapping = req_sk->sk_tx_queue_mapping;
+#ifdef CONFIG_SOCK_RX_QUEUE_MAPPING
+	nreq_sk->sk_rx_queue_mapping = req_sk->sk_rx_queue_mapping;
+#endif
+	nreq_sk->sk_incoming_cpu = req_sk->sk_incoming_cpu;
+	nreq->rsk_listener = sk;
+	if (sk->sk_protocol == IPPROTO_TCP && tcp_rsk(nreq)->tfo_listener) {
+		struct fastopen_queue *fastopenq =
+			&inet_csk(sk)->icsk_accept_queue.fastopenq;
+
+		spin_lock_bh(&fastopenq->lock);
+		fastopenq->qlen++;
+		spin_unlock_bh(&fastopenq->lock);
+		rcu_assign_pointer(tcp_sk(nreq->sk)->fastopen_rsk, nreq);
+	}
+	return nreq;
+}
+
+static void reqsk_queue_migrated(struct request_sock_queue *queue,
+				 const struct request_sock *req)
+{
+	if (!req->num_timeout)
+		atomic_inc(&queue->young);
+	atomic_inc(&queue->qlen);
+}
+
+static void reqsk_migrate_reset(struct request_sock *req)
+{
+	req->saved_syn = NULL;
+#if IS_ENABLED(CONFIG_IPV6)
+	inet_rsk(req)->ipv6_opt = NULL;
+	inet_rsk(req)->pktopts = NULL;
+#else
+	inet_rsk(req)->ireq_opt = NULL;
+#endif
+}
+
 /* return true if req was found in the ehash table */
 static bool reqsk_queue_unlink(struct request_sock_queue *queue,
 			       struct request_sock *req)
@@ -751,16 +813,33 @@ EXPORT_SYMBOL(inet_csk_reqsk_queue_drop_and_put);
 static void reqsk_timer_handler(struct timer_list *t)
 {
 	struct request_sock *req = from_timer(req, t, rsk_timer);
+	struct request_sock *nreq = NULL, *oreq = req;
 	struct sock *sk_listener = req->rsk_listener;
-	struct net *net = sock_net(sk_listener);
-	struct inet_connection_sock *icsk = inet_csk(sk_listener);
-	struct request_sock_queue *queue = &icsk->icsk_accept_queue;
+	struct net *net;
+	struct inet_connection_sock *icsk;
+	struct request_sock_queue *queue;
 	int qlen, expire = 0, resend = 0;
 	int max_retries, thresh;
 	u8 defer_accept;
 
-	if (inet_sk_state_load(sk_listener) != TCP_LISTEN)
-		goto drop;
+	if (inet_sk_state_load(sk_listener) != TCP_LISTEN) {
+		struct sock *nsk = reuseport_migrate_sock(sk_listener,
+							req_to_sk(req), NULL);
+
+		if (!nsk)
+			goto drop;
+		nreq = inet_reqsk_clone(req, nsk);
+		if (!nreq)
+			goto drop;
+		refcount_set(&nreq->rsk_refcnt, 3);
+		timer_setup(&nreq->rsk_timer, reqsk_timer_handler, TIMER_PINNED);
+		reqsk_queue_migrated(&inet_csk(nsk)->icsk_accept_queue, req);
+		req = nreq;
+		sk_listener = nsk;
+	}
+	icsk = inet_csk(sk_listener);
+	net = sock_net(sk_listener);
+	queue = &icsk->icsk_accept_queue;
 
 	max_retries = icsk->icsk_syn_retries ? : net->ipv4.sysctl_tcp_synack_retries;
 	thresh = max_retries;
@@ -808,11 +887,32 @@ static void reqsk_timer_handler(struct timer_list *t)
 			atomic_dec(&queue->young);
 		timeo = min(TCP_TIMEOUT_INIT << req->num_timeout, TCP_RTO_MAX);
 		mod_timer(&req->rsk_timer, jiffies + timeo);
+		if (!nreq)
+			return;
+		if (!inet_ehash_insert(req_to_sk(nreq), req_to_sk(oreq),
+					   NULL)) {
+			del_timer(&nreq->rsk_timer);
+			goto migration_failed;
+		}
+		reqsk_migrate_reset(oreq);
+		__NET_INC_STATS(net, LINUX_MIB_TCPMIGRATEREQSUCCESS);
+		reqsk_queue_removed(&inet_csk(oreq->rsk_listener)->icsk_accept_queue,
+				    oreq);
+		reqsk_put(oreq);
+		reqsk_put(nreq);
 		return;
 	}
+	if (!nreq)
+		goto drop;
+migration_failed:
+	__NET_INC_STATS(net, LINUX_MIB_TCPMIGRATEREQFAILURE);
+	reqsk_migrate_reset(nreq);
+	reqsk_queue_removed(queue, nreq);
+	refcount_set(&nreq->rsk_refcnt, 0);
+	reqsk_free(nreq);
 drop:
-	__inet_csk_reqsk_queue_drop(sk_listener, req, true);
-	reqsk_put(req);
+	__inet_csk_reqsk_queue_drop(oreq->rsk_listener, oreq, true);
+	reqsk_put(oreq);
 }
 
 static void reqsk_queue_hash_req(struct request_sock *req,
@@ -1036,12 +1136,37 @@ struct sock *inet_csk_complete_hashdance(struct sock *sk, struct sock *child,
 					 struct request_sock *req, bool own_req)
 {
 	if (own_req) {
-		inet_csk_reqsk_queue_drop(sk, req);
-		reqsk_queue_removed(&inet_csk(sk)->icsk_accept_queue, req);
-		if (inet_csk_reqsk_queue_add(sk, req, child))
+		inet_csk_reqsk_queue_drop(req->rsk_listener, req);
+		reqsk_queue_removed(&inet_csk(req->rsk_listener)->icsk_accept_queue,
+				    req);
+		if (sk != req->rsk_listener) {
+			struct request_sock *nreq;
+
+			sock_hold(sk);
+			nreq = inet_reqsk_clone(req, sk);
+			if (!nreq) {
+				inet_child_forget(sk, req, child);
+				goto child_put;
+			}
+			refcount_set(&nreq->rsk_refcnt, 1);
+			if (inet_csk_reqsk_queue_add(sk, nreq, child)) {
+				__NET_INC_STATS(sock_net(sk),
+						LINUX_MIB_TCPMIGRATEREQSUCCESS);
+				reqsk_migrate_reset(req);
+				reqsk_put(req);
+				return child;
+			}
+			reqsk_migrate_reset(nreq);
+			__NET_INC_STATS(sock_net(sk),
+					LINUX_MIB_TCPMIGRATEREQFAILURE);
+			refcount_set(&nreq->rsk_refcnt, 0);
+			reqsk_free(nreq);
+		} else if (inet_csk_reqsk_queue_add(sk, req, child)) {
 			return child;
+		}
 	}
 	/* Too bad, another child took ownership of the request, undo. */
+child_put:
 	bh_unlock_sock(child);
 	sock_put(child);
 	return NULL;
@@ -1067,14 +1192,38 @@ void inet_csk_listen_stop(struct sock *sk)
 	 * of the variants now.			--ANK
 	 */
 	while ((req = reqsk_queue_remove(queue, sk)) != NULL) {
-		struct sock *child = req->sk;
+		struct sock *child = req->sk, *nsk;
+		struct request_sock *nreq;
 
 		local_bh_disable();
 		bh_lock_sock(child);
 		WARN_ON(sock_owned_by_user(child));
 		sock_hold(child);
 
+		nsk = reuseport_migrate_sock(sk, child, NULL);
+		if (nsk) {
+			nreq = inet_reqsk_clone(req, nsk);
+			if (nreq) {
+				refcount_set(&nreq->rsk_refcnt, 1);
+				rcu_read_lock();
+				if (inet_csk_reqsk_queue_add(nsk, nreq, child)) {
+					__NET_INC_STATS(sock_net(nsk),
+							LINUX_MIB_TCPMIGRATEREQSUCCESS);
+					reqsk_migrate_reset(req);
+					READ_ONCE(nsk->sk_data_ready)(nsk);
+				} else {
+					__NET_INC_STATS(sock_net(nsk),
+							LINUX_MIB_TCPMIGRATEREQFAILURE);
+					reqsk_migrate_reset(nreq);
+					refcount_set(&nreq->rsk_refcnt, 0);
+					reqsk_free(nreq);
+				}
+				rcu_read_unlock();
+				goto skip_child_forget;
+			}
+		}
 		inet_child_forget(sk, req, child);
+skip_child_forget:
 		reqsk_put(req);
 		bh_unlock_sock(child);
 		local_bh_enable();

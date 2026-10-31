@@ -285,7 +285,10 @@ void bpf_verifier_vlog(struct bpf_verifier_log *log, const char *fmt,
 		pr_err("BPF:%s\n", log->kbuf);
 		return;
 	}
-	if (!copy_to_user(log->ubuf + log->len_used, log->kbuf, n + 1))
+	if (!(log->ubuf_is_kernel ?
+	      probe_kernel_write((void *)log->ubuf + log->len_used,
+				 log->kbuf, n + 1) :
+	      copy_to_user(log->ubuf + log->len_used, log->kbuf, n + 1)))
 		log->len_used += n;
 	else
 		log->ubuf = NULL;
@@ -299,7 +302,9 @@ static void bpf_vlog_reset(struct bpf_verifier_log *log, u32 new_pos)
 		return;
 
 	log->len_used = new_pos;
-	if (put_user(zero, log->ubuf + new_pos))
+	if (log->ubuf_is_kernel ?
+	    probe_kernel_write((void *)log->ubuf + new_pos, &zero, 1) :
+	    put_user(zero, log->ubuf + new_pos))
 		log->ubuf = NULL;
 }
 
@@ -5852,6 +5857,24 @@ static int check_map_elem_callback(struct bpf_verifier_env *env,
 	return 0;
 }
 
+static int check_get_func_ip(struct bpf_verifier_env *env)
+{
+	enum bpf_attach_type eatype = env->prog->expected_attach_type;
+	enum bpf_prog_type type = resolve_prog_type(env->prog);
+
+	if (type == BPF_PROG_TYPE_TRACING) {
+		if (eatype == BPF_TRACE_FENTRY || eatype == BPF_TRACE_FEXIT ||
+		    eatype == BPF_MODIFY_RETURN)
+			return 0;
+		verbose(env, "get_func_ip requires fentry/fexit/fmod_ret\n");
+		return -ENOTSUPP;
+	}
+	if (type == BPF_PROG_TYPE_KPROBE)
+		return 0;
+	verbose(env, "get_func_ip unsupported for program type %d\n", type);
+	return -ENOTSUPP;
+}
+
 static int check_helper_call(struct bpf_verifier_env *env, int func_id,
 			     int *insn_idxp)
 {
@@ -6116,6 +6139,12 @@ static int check_helper_call(struct bpf_verifier_env *env, int func_id,
 
 	if (func_id == BPF_FUNC_get_stackid || func_id == BPF_FUNC_get_stack)
 		env->prog->call_get_stack = true;
+	if (func_id == BPF_FUNC_get_func_ip) {
+		err = check_get_func_ip(env);
+		if (err)
+			return err;
+		env->prog->call_get_func_ip = true;
+	}
 
 	if (changes_data)
 		clear_all_pkt_pointers(env);
@@ -12011,6 +12040,7 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 static int fixup_bpf_calls(struct bpf_verifier_env *env)
 {
 	struct bpf_prog *prog = env->prog;
+	enum bpf_prog_type prog_type = resolve_prog_type(prog);
 	bool expect_blinding = bpf_jit_blinding_enabled(prog);
 	struct bpf_insn *insn = prog->insnsi;
 	const struct bpf_func_proto *fn;
@@ -12325,6 +12355,19 @@ patch_map_ops_generic:
 			delta    += cnt - 1;
 			env->prog = prog = new_prog;
 			insn      = new_prog->insnsi + i + delta;
+			continue;
+		}
+
+		if (prog_type == BPF_PROG_TYPE_TRACING &&
+		    insn->imm == BPF_FUNC_get_func_ip) {
+			/* The trampoline stores the traced function IP at ctx[-1]. */
+			insn_buf[0] = BPF_LDX_MEM(BPF_DW, BPF_REG_0,
+						 BPF_REG_1, -8);
+			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, 1);
+			if (!new_prog)
+				return -ENOMEM;
+			env->prog = prog = new_prog;
+			insn = new_prog->insnsi + i + delta;
 			continue;
 		}
 
@@ -12875,6 +12918,13 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 	int ret;
 	u64 key;
 
+	if (prog->type == BPF_PROG_TYPE_SYSCALL) {
+		if (prog->aux->sleepable)
+			return 0;
+		verbose(env, "Syscall programs can only be sleepable\n");
+		return -EINVAL;
+	}
+
 	if (prog->aux->sleepable && prog->type != BPF_PROG_TYPE_TRACING &&
 	    prog->type != BPF_PROG_TYPE_LSM) {
 		verbose(env, "Only fentry/fexit/fmod_ret and lsm programs can be sleepable\n");
@@ -12991,6 +13041,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
 		 */
 		log->level = attr->log_level;
 		log->ubuf = (char __user *) (unsigned long) attr->log_buf;
+		log->ubuf_is_kernel = bpfptr_is_kernel(uattr);
 		log->len_total = attr->log_size;
 
 		/* log attributes have to be sane */

@@ -29,6 +29,7 @@
 #include <linux/pgtable.h>
 #include <linux/bpf_lsm.h>
 #include <linux/poll.h>
+#include <linux/perf_event.h>
 #include <linux/bpf-netns.h>
 #include <linux/rcupdate_trace.h>
 
@@ -87,12 +88,23 @@ int bpf_check_uarg_tail_zero(bpfptr_t uaddr,
 	if (actual_size <= expected_size)
 		return 0;
 
-	if (bpfptr_is_kernel(uaddr))
-		res = memchr_inv(uaddr.kernel + expected_size, 0,
-				 actual_size - expected_size) == NULL;
-	else
+	if (bpfptr_is_kernel(uaddr)) {
+		size_t i;
+		u8 byte;
+
+		res = 1;
+		for (i = expected_size; i < actual_size; i++) {
+			if (probe_kernel_read(&byte, uaddr.kernel + i, 1))
+				return -EFAULT;
+			if (byte) {
+				res = 0;
+				break;
+			}
+		}
+	} else {
 		res = check_zeroed_user(uaddr.user + expected_size,
 					actual_size - expected_size);
+	}
 	if (res < 0)
 		return res;
 	return res ? 0 : -E2BIG;
@@ -2000,6 +2012,10 @@ static void bpf_prog_load_fixup_attach_type(union bpf_attr *attr)
 			attr->expected_attach_type =
 				BPF_CGROUP_INET_SOCK_CREATE;
 		break;
+	case BPF_PROG_TYPE_SK_REUSEPORT:
+		if (!attr->expected_attach_type)
+			attr->expected_attach_type = BPF_SK_REUSEPORT_SELECT;
+		break;
 	}
 }
 
@@ -2076,6 +2092,18 @@ bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
 		if (expected_attach_type == BPF_SK_LOOKUP)
 			return 0;
 		return -EINVAL;
+	case BPF_PROG_TYPE_SK_SKB:
+		if (expected_attach_type == BPF_SK_SKB_STREAM_PARSER ||
+		    expected_attach_type == BPF_SK_SKB_STREAM_VERDICT ||
+		    expected_attach_type == BPF_SK_SKB_VERDICT)
+			return 0;
+		return -EINVAL;
+	case BPF_PROG_TYPE_SK_REUSEPORT:
+		if (expected_attach_type == BPF_SK_REUSEPORT_SELECT ||
+		    expected_attach_type == BPF_SK_REUSEPORT_SELECT_OR_MIGRATE)
+			return 0;
+		return -EINVAL;
+	case BPF_PROG_TYPE_SYSCALL:
 	case BPF_PROG_TYPE_EXT:
 		if (expected_attach_type)
 			return -EINVAL;
@@ -2842,6 +2870,77 @@ static const struct bpf_link_ops bpf_raw_tp_link_lops = {
 	.fill_link_info = bpf_raw_tp_link_fill_link_info,
 };
 
+#ifdef CONFIG_PERF_EVENTS
+struct bpf_perf_link {
+	struct bpf_link link;
+	struct file *perf_file;
+};
+
+static void bpf_perf_link_release(struct bpf_link *link)
+{
+	struct bpf_perf_link *perf_link = container_of(link, struct bpf_perf_link, link);
+	struct perf_event *event = perf_link->perf_file->private_data;
+
+	perf_event_free_bpf_prog(event);
+	fput(perf_link->perf_file);
+}
+
+static void bpf_perf_link_dealloc(struct bpf_link *link)
+{
+	struct bpf_perf_link *perf_link = container_of(link, struct bpf_perf_link, link);
+
+	kfree(perf_link);
+}
+
+static const struct bpf_link_ops bpf_perf_link_lops = {
+	.release = bpf_perf_link_release,
+	.dealloc = bpf_perf_link_dealloc,
+};
+
+static int bpf_perf_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+{
+	struct bpf_link_primer link_primer;
+	struct bpf_perf_link *link;
+	struct perf_event *event;
+	struct file *perf_file;
+	int err;
+
+	if (attr->link_create.flags)
+		return -EINVAL;
+
+	perf_file = perf_event_get(attr->link_create.target_fd);
+	if (IS_ERR(perf_file))
+		return PTR_ERR(perf_file);
+
+	link = kzalloc(sizeof(*link), GFP_USER);
+	if (!link) {
+		err = -ENOMEM;
+		goto out_put_file;
+	}
+	bpf_link_init(&link->link, BPF_LINK_TYPE_PERF_EVENT, &bpf_perf_link_lops, prog);
+	link->perf_file = perf_file;
+
+	err = bpf_link_prime(&link->link, &link_primer);
+	if (err) {
+		kfree(link);
+		goto out_put_file;
+	}
+
+	event = perf_file->private_data;
+	err = perf_event_set_bpf_prog(event, prog, attr->link_create.perf_event.bpf_cookie);
+	if (err) {
+		bpf_link_cleanup(&link_primer);
+		goto out_put_file;
+	}
+	bpf_prog_inc(prog);
+	return bpf_link_settle(&link_primer);
+
+out_put_file:
+	fput(perf_file);
+	return err;
+}
+#endif
+
 #define BPF_RAW_TRACEPOINT_OPEN_LAST_FIELD raw_tracepoint.prog_fd
 
 static int bpf_raw_tracepoint_open(const union bpf_attr *attr)
@@ -2989,6 +3088,7 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
 		return BPF_PROG_TYPE_SK_MSG;
 	case BPF_SK_SKB_STREAM_PARSER:
 	case BPF_SK_SKB_STREAM_VERDICT:
+	case BPF_SK_SKB_VERDICT:
 		return BPF_PROG_TYPE_SK_SKB;
 	case BPF_LIRC_MODE2:
 		return BPF_PROG_TYPE_LIRC_MODE2;
@@ -3849,7 +3949,7 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 
 #define BPF_BTF_LOAD_LAST_FIELD btf_log_level
 
-static int bpf_btf_load(const union bpf_attr *attr)
+static int bpf_btf_load(const union bpf_attr *attr, bpfptr_t uattr)
 {
 	if (CHECK_ATTR(BPF_BTF_LOAD))
 		return -EINVAL;
@@ -3857,7 +3957,7 @@ static int bpf_btf_load(const union bpf_attr *attr)
 	if (!bpf_capable())
 		return -EPERM;
 
-	return btf_new_fd(attr);
+	return btf_new_fd(attr, uattr);
 }
 
 #define BPF_BTF_GET_FD_BY_ID_LAST_FIELD btf_id
@@ -4099,6 +4199,20 @@ static int link_create(union bpf_attr *attr)
 
 	if (prog->type == BPF_PROG_TYPE_EXT) {
 		ret = tracing_bpf_link_attach(attr, prog);
+		goto out;
+	}
+	if (prog->type == BPF_PROG_TYPE_PERF_EVENT ||
+	    prog->type == BPF_PROG_TYPE_KPROBE ||
+	    prog->type == BPF_PROG_TYPE_TRACEPOINT) {
+		if (attr->link_create.attach_type != BPF_PERF_EVENT) {
+			ret = -EINVAL;
+			goto out;
+		}
+#ifdef CONFIG_PERF_EVENTS
+		ret = bpf_perf_link_attach(attr, prog);
+#else
+		ret = -EOPNOTSUPP;
+#endif
 		goto out;
 	}
 
@@ -4440,7 +4554,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 	 * user-copying commands unreachable from BPF programs until ported. */
 	if (bpfptr_is_kernel(uattr) && cmd != BPF_MAP_CREATE &&
 	    cmd != BPF_MAP_UPDATE_ELEM && cmd != BPF_MAP_FREEZE &&
-	    cmd != BPF_PROG_LOAD)
+	    cmd != BPF_PROG_LOAD && cmd != BPF_BTF_LOAD)
 		return -EOPNOTSUPP;
 
 	switch (cmd) {
@@ -4508,7 +4622,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 		err = bpf_raw_tracepoint_open(&attr);
 		break;
 	case BPF_BTF_LOAD:
-		err = bpf_btf_load(&attr);
+		err = bpf_btf_load(&attr, uattr);
 		break;
 	case BPF_BTF_GET_FD_BY_ID:
 		err = bpf_btf_get_fd_by_id(&attr);
@@ -4562,6 +4676,134 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	}
 
+	return err;
+}
+
+/* This 4.19 tree has no sleepable migrate_disable().  Syscall programs
+ * therefore expose only helpers that do not require a stable CPU while the
+ * program sleeps.  The test-run path invokes the program without pinning it.
+ */
+static bool syscall_prog_is_valid_access(int off, int size,
+					 enum bpf_access_type type,
+					 const struct bpf_prog *prog,
+					 struct bpf_insn_access_aux *info)
+{
+	return off >= 0 && off < U16_MAX && off % size == 0;
+}
+
+BPF_CALL_3(bpf_sys_bpf, int, cmd, void *, attr, u32, attr_size)
+{
+	switch (cmd) {
+	case BPF_MAP_CREATE:
+	case BPF_MAP_UPDATE_ELEM:
+	case BPF_MAP_FREEZE:
+	case BPF_PROG_LOAD:
+	case BPF_BTF_LOAD:
+		break;
+	default:
+		return -EINVAL;
+	}
+	return __sys_bpf(cmd, KERNEL_BPFPTR(attr), attr_size);
+}
+
+static const struct bpf_func_proto bpf_sys_bpf_proto = {
+	.func		= bpf_sys_bpf,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_ANYTHING,
+	.arg2_type	= ARG_PTR_TO_MEM,
+	.arg3_type	= ARG_CONST_SIZE,
+};
+
+BPF_CALL_1(bpf_sys_close, u32, fd)
+{
+	return ksys_close(fd);
+}
+
+static const struct bpf_func_proto bpf_sys_close_proto = {
+	.func		= bpf_sys_close,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_ANYTHING,
+};
+
+static const struct bpf_func_proto *
+syscall_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	case BPF_FUNC_map_lookup_elem:
+		return &bpf_map_lookup_elem_proto;
+	case BPF_FUNC_map_update_elem:
+		return &bpf_map_update_elem_proto;
+	case BPF_FUNC_map_delete_elem:
+		return &bpf_map_delete_elem_proto;
+	case BPF_FUNC_ktime_get_ns:
+		return &bpf_ktime_get_ns_proto;
+	case BPF_FUNC_ktime_get_boot_ns:
+		return &bpf_ktime_get_boot_ns_proto;
+	case BPF_FUNC_sys_bpf:
+		return perfmon_capable() ? &bpf_sys_bpf_proto : NULL;
+	case BPF_FUNC_sys_close:
+		return &bpf_sys_close_proto;
+	case BPF_FUNC_btf_find_by_name_kind:
+		return &bpf_btf_find_by_name_kind_proto;
+	default:
+		return NULL;
+	}
+}
+
+const struct bpf_verifier_ops bpf_syscall_verifier_ops = {
+	.get_func_proto	= syscall_prog_func_proto,
+	.is_valid_access = syscall_prog_is_valid_access,
+};
+
+const struct bpf_prog_ops bpf_syscall_prog_ops = {
+	.test_run = bpf_prog_test_run_syscall,
+};
+
+int bpf_prog_test_run_syscall(struct bpf_prog *prog,
+			      const union bpf_attr *kattr,
+			      union bpf_attr __user *uattr)
+{
+	void __user *ctx_in = u64_to_user_ptr(kattr->test.ctx_in);
+	u32 ctx_size_in = kattr->test.ctx_size_in;
+	void *ctx = NULL;
+	u32 retval;
+	int err = 0;
+
+	if (kattr->test.data_in || kattr->test.data_out ||
+	    kattr->test.ctx_out || kattr->test.ctx_size_out ||
+	    kattr->test.duration || kattr->test.repeat ||
+	    kattr->test.flags || kattr->test.cpu)
+		return -EINVAL;
+	if (ctx_size_in < prog->aux->max_ctx_offset || ctx_size_in > U16_MAX)
+		return -EINVAL;
+
+	if (ctx_size_in) {
+		ctx = kzalloc(ctx_size_in, GFP_USER);
+		if (!ctx)
+			return -ENOMEM;
+		if (copy_from_user(ctx, ctx_in, ctx_size_in)) {
+			err = -EFAULT;
+			goto out;
+		}
+	}
+
+	/* The helper set above has no per-CPU helpers.  Do not use this tree's
+	 * bpf_prog_run_pin_on_cpu(): migrate_disable() disables preemption here.
+	 */
+	rcu_read_lock_trace();
+	retval = bpf_dispatcher_nop_func(ctx, prog->insnsi, prog->bpf_func);
+	rcu_read_unlock_trace();
+
+	if (copy_to_user(&uattr->test.retval, &retval, sizeof(retval))) {
+		err = -EFAULT;
+		goto out;
+	}
+	if (ctx_size_in && copy_to_user(ctx_in, ctx, ctx_size_in))
+		err = -EFAULT;
+out:
+	kfree(ctx);
 	return err;
 }
 
