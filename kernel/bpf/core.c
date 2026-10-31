@@ -2404,6 +2404,11 @@ bool __weak bpf_jit_needs_zext(void)
 	return false;
 }
 
+bool __weak bpf_jit_supports_kfunc_call(void)
+{
+	return false;
+}
+
 /* To execute LD_ABS/LD_IND instructions __bpf_prog_run() may call
  * skb_copy_bits(), so provide a weak definition of it for NET-less config.
  */

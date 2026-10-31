@@ -106,6 +106,7 @@ enum bpf_cmd {
 	BPF_PROG_ATTACH,
 	BPF_PROG_DETACH,
 	BPF_PROG_TEST_RUN,
+	BPF_PROG_RUN = BPF_PROG_TEST_RUN,
 	BPF_PROG_GET_NEXT_ID,
 	BPF_MAP_GET_NEXT_ID,
 	BPF_PROG_GET_FD_BY_ID,
@@ -414,6 +415,8 @@ enum bpf_link_type {
  * offset to another bpf function
  */
 #define BPF_PSEUDO_CALL		1
+/* bpf_call->imm is the BTF ID of a kernel BTF_KIND_FUNC. */
+#define BPF_PSEUDO_KFUNC_CALL	2
 
 /* flags for BPF_MAP_UPDATE_ELEM command */
 enum {

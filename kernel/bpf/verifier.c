@@ -10622,7 +10622,8 @@ static int do_check(struct bpf_verifier_env *env)
 				if (BPF_SRC(insn->code) != BPF_K ||
 				    insn->off != 0 ||
 				    (insn->src_reg != BPF_REG_0 &&
-				     insn->src_reg != BPF_PSEUDO_CALL) ||
+				     insn->src_reg != BPF_PSEUDO_CALL &&
+				     insn->src_reg != BPF_PSEUDO_KFUNC_CALL) ||
 				    insn->dst_reg != BPF_REG_0 ||
 				    class == BPF_JMP32) {
 					verbose(env, "BPF_CALL uses reserved fields\n");
@@ -10637,6 +10638,11 @@ static int do_check(struct bpf_verifier_env *env)
 				}
 				if (insn->src_reg == BPF_PSEUDO_CALL)
 					err = check_func_call(env, insn, &env->insn_idx);
+				else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+					/* Kfunc address fixup and JIT support are not available yet. */
+					verbose(env, "JIT does not support calling kernel function\n");
+					return -ENOTSUPP;
+				}
 				else
 					err = check_helper_call(env, insn->imm,
 							&env->insn_idx);
