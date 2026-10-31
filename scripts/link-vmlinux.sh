@@ -205,6 +205,9 @@ gen_btf()
 	info "BTF" ${2}
 	vmlinux_link ${1}
 	LLVM_OBJCOPY=${OBJCOPY} ${PAHOLE} ${pahole_opts} -J ${1}
+	# Keep per-CPU VAR/DATASEC records, but correct stale offsets emitted by
+	# some pahole/LLVM combinations before the kernel validates vmlinux BTF.
+	python3 "${srctree}/scripts/fix-percpu-btf.py" "${1}" "${READELF}" || return 1
 
 	# Create ${2} which contains just .BTF section but no symbols. Add
 	# SHF_ALLOC because .BTF will be part of the vmlinux image. --strip-all
