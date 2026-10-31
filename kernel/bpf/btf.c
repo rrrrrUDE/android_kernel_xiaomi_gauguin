@@ -4466,6 +4466,14 @@ static int btf_vmlinux_map_ids_init(const struct btf *btf,
 		}
 		btf_id = btf_find_by_name_kind(btf, ops->map_btf_name,
 					       BTF_KIND_STRUCT);
+		if (btf_id == -ENOENT) {
+			/* The verifier already rejects map_ptr access when this ID
+			 * remains zero. Other BTF features can still be used.
+			 */
+			pr_warn("BPF: vmlinux BTF missing map struct %s (map type %d); map_ptr access disabled\n",
+				ops->map_btf_name, i);
+			continue;
+		}
 		if (btf_id < 0)
 			return btf_id;
 		*ops->map_btf_id = btf_id;
