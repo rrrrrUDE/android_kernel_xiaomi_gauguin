@@ -20,9 +20,6 @@
 
 #include <linux/debugfs.h>
 #include <linux/dma-buf.h>
-#include <linux/pstore_screen.h>
-#include <asm/cacheflush.h>
-#include <drm/drm_fourcc.h>
 #include <uapi/drm/sde_drm.h>
 #include <uapi/drm/msm_drm_pp.h>
 
@@ -36,11 +33,9 @@
 #include "sde_hw_catalog_format.h"
 #include "sde_trace.h"
 #include "sde_crtc.h"
-#include "sde_encoder.h"
 #include "sde_vbif.h"
 #include "sde_plane.h"
 #include "sde_color_processing.h"
-#include "msm_gem.h"
 
 #define SDE_DEBUG_PLANE(pl, fmt, ...) SDE_DEBUG("plane%d " fmt,\
 		(pl) ? (pl)->base.base.id : -1, ##__VA_ARGS__)
@@ -140,16 +135,6 @@ struct sde_plane {
 	struct drm_property_blob *blob_info;
 	struct drm_property_blob *blob_rot_caps;
 
-#if IS_ENABLED(CONFIG_PSTORE_SCREEN_DISPLAY)
-	struct pstore_screen_display_handle *panic_display;
-	struct drm_gem_object *panic_bo;
-	struct msm_gem_address_space *panic_aspace;
-	void *panic_vaddr;
-	struct sde_hw_pipe_cfg panic_pipe_cfg;
-	u32 panic_width, panic_height, panic_pitch;
-	bool panic_switched;
-#endif
-
 	/* debugfs related stuff */
 	struct dentry *debugfs_root;
 	bool debugfs_default_scale;
@@ -217,223 +202,6 @@ static struct sde_hw_ctl *_sde_plane_get_hw_ctl(const struct drm_plane *plane)
 
 	return ctl;
 }
-
-#if IS_ENABLED(CONFIG_PSTORE_SCREEN_DISPLAY)
-static int sde_pstore_check(void *ctx, u64 generation, u64 token)
-{
-	struct sde_plane *psde = ctx;
-	struct drm_plane_state *state = READ_ONCE(psde->base.state);
-	struct sde_plane_state *pstate;
-	struct sde_crtc *crtc;
-	struct drm_encoder *encoder;
-	bool video_mode = false;
-
-	/* The 4.19 techpack SDE path does not maintain DRM's visible flag. */
-	if (!state || !state->fb || !state->crtc ||
-	    !state->crtc->state || !state->crtc->state->active ||
-	    !pm_runtime_active(psde->base.dev->dev))
-		return -ENODEV;
-	pstate = to_sde_plane_state(state);
-	crtc = to_sde_crtc(state->crtc);
-	/* Android may move the full-screen plane above stage 0 later. */
-	if (!psde->panic_vaddr || !psde->pipe_hw ||
-	    !pstate->aspace || pstate->aspace != psde->panic_aspace ||
-	    !pstate->aspace->domain_attached || crtc->num_mixers != 1 ||
-	    pstate->stage < SDE_STAGE_0 || pstate->stage >= SDE_STAGE_MAX ||
-	    pstate->multirect_index != SDE_SSPP_RECT_SOLO ||
-	    pstate->multirect_mode != SDE_SSPP_MULTIRECT_NONE ||
-	    psde->is_virtual ||
-	    !crtc->mixers[0].hw_ctl ||
-	    state->src_x || state->src_y || state->crtc_x || state->crtc_y ||
-	    state->rotation != DRM_MODE_ROTATE_0 ||
-	    state->src_w != (psde->panic_width << 16) ||
-	    state->src_h != (psde->panic_height << 16) ||
-	    state->crtc_w != psde->panic_width ||
-	    state->crtc_h != psde->panic_height)
-		return -ENODEV;
-	list_for_each_entry(encoder,
-			&psde->base.dev->mode_config.encoder_list, head) {
-		if (encoder->crtc == state->crtc &&
-		    sde_encoder_get_intf_mode(encoder) == INTF_MODE_VIDEO) {
-			video_mode = true;
-			break;
-		}
-	}
-	return video_mode ? 0 : -ENODEV;
-}
-
-static int sde_pstore_enter(void *ctx, u64 generation, u64 token)
-{
-	return 0;
-}
-
-static int sde_pstore_flush(void *ctx)
-{
-	struct sde_plane *psde = ctx;
-	struct sde_hw_ctl *ctl;
-	struct sde_hw_pipe_cdp_cfg cdp = { 0 };
-	int ret;
-
-	dmac_flush_range(psde->panic_vaddr,
-			 (u8 *)psde->panic_vaddr +
-			 (size_t)psde->panic_pitch * psde->panic_height);
-	if (READ_ONCE(psde->panic_switched))
-		return 0;
-	ret = sde_pstore_check(psde, 0, 0);
-	if (ret)
-		return ret;
-	ctl = _sde_plane_get_hw_ctl(&psde->base);
-	if (!ctl || !ctl->ops.update_bitmask_sspp ||
-	    !ctl->ops.trigger_flush || !psde->pipe_hw->ops.setup_format ||
-	    !psde->pipe_hw->ops.setup_rects ||
-	    !psde->pipe_hw->ops.setup_sourceaddress)
-		return -ENODEV;
-
-	psde->pipe_hw->ops.setup_format(psde->pipe_hw,
-			psde->panic_pipe_cfg.layout.format, false, 0,
-			SDE_SSPP_RECT_SOLO);
-	psde->pipe_hw->ops.setup_rects(psde->pipe_hw,
-			&psde->panic_pipe_cfg, SDE_SSPP_RECT_SOLO);
-	psde->pipe_hw->ops.setup_sourceaddress(psde->pipe_hw,
-			&psde->panic_pipe_cfg, SDE_SSPP_RECT_SOLO);
-	if (psde->pipe_hw->ops.setup_cdp)
-		psde->pipe_hw->ops.setup_cdp(psde->pipe_hw, &cdp,
-					      SDE_SSPP_RECT_SOLO);
-	ret = ctl->ops.update_bitmask_sspp(ctl, psde->pipe, true);
-	if (ret)
-		return ret;
-	ret = ctl->ops.trigger_flush(ctl);
-	if (!ret)
-		WRITE_ONCE(psde->panic_switched, true);
-	return ret;
-}
-
-static void sde_pstore_destroy(struct sde_plane *psde)
-{
-	if (!psde->panic_bo)
-		return;
-	pstore_screen_display_unregister(psde->panic_display);
-	msm_gem_put_vaddr(psde->panic_bo);
-	msm_gem_put_iova(psde->panic_bo, psde->panic_aspace);
-	drm_gem_object_put_unlocked(psde->panic_bo);
-	psde->panic_display = NULL;
-	psde->panic_bo = NULL;
-	psde->panic_aspace = NULL;
-	psde->panic_vaddr = NULL;
-	psde->panic_width = 0;
-	psde->panic_height = 0;
-	psde->panic_pitch = 0;
-}
-
-static void sde_pstore_prepare(struct drm_plane *plane,
-			       struct drm_plane_state *state,
-			       struct msm_gem_address_space *aspace)
-{
-	struct sde_plane *psde = to_sde_plane(plane);
-	struct pstore_screen_display_desc desc = { 0 };
-	struct drm_gem_object *bo = NULL;
-	struct sde_kms *kms = _sde_plane_get_kms(plane);
-	const struct sde_format *fmt;
-	void *vaddr;
-	u64 iova;
-	u32 width, height, pitch, size;
-	int ret;
-
-	if (!kms || !aspace ||
-	    aspace != kms->aspace[MSM_SMMU_DOMAIN_UNSECURE] ||
-	    !aspace->domain_attached || psde->is_virtual ||
-	    !state->crtc || !state->fb || state->crtc_x || state->crtc_y ||
-	    state->src_x || state->src_y ||
-	    state->src_w != (state->crtc_w << 16) ||
-	    state->src_h != (state->crtc_h << 16) ||
-	    state->crtc_w < 1000 || state->crtc_h < 2000 ||
-	    state->rotation != DRM_MODE_ROTATE_0)
-		return;
-	width = state->crtc_w;
-	height = state->crtc_h;
-	if (psde->panic_display) {
-		if (psde->panic_aspace == aspace &&
-		    psde->panic_width == width &&
-		    psde->panic_height == height)
-			return;
-		sde_pstore_destroy(psde);
-	}
-	if (width > U32_MAX / 4)
-		return;
-	pitch = ALIGN(width * 4, 64);
-	if ((u64)pitch * height > U32_MAX)
-		return;
-	size = pitch * height;
-	fmt = sde_get_sde_format(DRM_FORMAT_ABGR8888);
-	if (!fmt || !psde->pipe_hw)
-		return;
-	vaddr = msm_gem_kernel_new(plane->dev, size,
-			MSM_BO_SCANOUT | MSM_BO_WC, aspace, &bo, &iova);
-	if (IS_ERR_OR_NULL(vaddr))
-		return;
-	if (iova > U32_MAX || (u64)size - 1 > U32_MAX - iova)
-		goto free_bo;
-
-	psde->panic_bo = bo;
-	psde->panic_aspace = aspace;
-	psde->panic_vaddr = vaddr;
-	psde->panic_width = width;
-	psde->panic_height = height;
-	psde->panic_pitch = pitch;
-	psde->panic_pipe_cfg.layout.format = fmt;
-	psde->panic_pipe_cfg.layout.num_planes = 1;
-	psde->panic_pipe_cfg.layout.width = width;
-	psde->panic_pipe_cfg.layout.height = height;
-	psde->panic_pipe_cfg.layout.total_size = size;
-	psde->panic_pipe_cfg.layout.plane_addr[0] = (u32)iova;
-	psde->panic_pipe_cfg.layout.plane_size[0] = size;
-	psde->panic_pipe_cfg.layout.plane_pitch[0] = pitch;
-	psde->panic_pipe_cfg.src_rect.w = width;
-	psde->panic_pipe_cfg.src_rect.h = height;
-	psde->panic_pipe_cfg.dst_rect.w = width;
-	psde->panic_pipe_cfg.dst_rect.h = height;
-
-	desc.size = sizeof(desc);
-	desc.version = PSTORE_SCREEN_DISPLAY_DESC_VERSION;
-	desc.name = "sde-panic-linear";
-	desc.stage = PSTORE_SCREEN_STAGE_CONTROLLER;
-	desc.priority = PSTORE_SCREEN_PRIORITY_CONTROLLER;
-	desc.capabilities = PSTORE_SCREEN_PROVIDER_CAP_CHECK_NO_SIDE_EFFECT |
-		PSTORE_SCREEN_PROVIDER_CAP_ENTER_PANIC_SAFE |
-		PSTORE_SCREEN_PROVIDER_CAP_FLUSH_PANIC_SAFE;
-	desc.ctx = psde;
-	desc.ops.check = sde_pstore_check;
-	desc.ops.enter = sde_pstore_enter;
-	desc.scanout.map_kind = PSTORE_SCREEN_MAP_SYSTEM;
-	desc.scanout.format = DRM_FORMAT_ABGR8888;
-	desc.scanout.width = width;
-	desc.scanout.height = height;
-	desc.scanout.pitch = pitch;
-	desc.scanout.length = size;
-	desc.scanout.address.system = vaddr;
-	desc.scanout.ctx = psde;
-	desc.scanout.flush = sde_pstore_flush;
-	ret = pstore_screen_display_register(&desc, &psde->panic_display);
-	if (!ret) {
-		pr_info_once("pstore-screen: SDE panic linear provider ready (%ux%u pipe=%u)\n",
-			     width, height, psde->pipe);
-		return;
-	}
-	psde->panic_bo = NULL;
-	psde->panic_aspace = NULL;
-	psde->panic_vaddr = NULL;
-free_bo:
-	msm_gem_put_vaddr(bo);
-	msm_gem_put_iova(bo, aspace);
-	drm_gem_object_put_unlocked(bo);
-}
-
-#else
-static void sde_pstore_prepare(struct drm_plane *plane,
-			       struct drm_plane_state *state,
-			       struct msm_gem_address_space *aspace) {}
-static void sde_pstore_destroy(struct sde_plane *psde) {}
-#endif
 
 static bool sde_plane_enabled(const struct drm_plane_state *state)
 {
@@ -983,9 +751,6 @@ static inline void _sde_plane_set_scanout(struct drm_plane *plane,
 			return;
 		}
 		pstate->defer_prepare_fb = false;
-		if (plane->type == DRM_PLANE_TYPE_PRIMARY)
-			msm_pstore_screen_prepare(fb);
-		sde_pstore_prepare(plane, plane->state, aspace);
 	}
 	mode = sde_plane_get_property(pstate, PLANE_PROP_FB_TRANSLATION_MODE);
 	if ((mode == SDE_DRM_FB_SEC) || (mode == SDE_DRM_FB_SEC_DIR_TRANS))
@@ -2151,10 +1916,6 @@ static int sde_plane_prepare_fb(struct drm_plane *plane,
 		SDE_ERROR_PLANE(psde, "failed to get format layout, %d\n", ret);
 		return ret;
 	}
-	if (pstate->aspace && plane->type == DRM_PLANE_TYPE_PRIMARY)
-		msm_pstore_screen_prepare(fb);
-	if (pstate->aspace)
-		sde_pstore_prepare(plane, new_state, pstate->aspace);
 
 	return 0;
 }
@@ -2237,8 +1998,6 @@ static void sde_plane_cleanup_fb(struct drm_plane *plane,
 		pm_runtime_put_sync(plane->dev->dev);
 	}
 
-	if (plane->type == DRM_PLANE_TYPE_PRIMARY)
-		msm_pstore_screen_cleanup(old_state->fb);
 	msm_framebuffer_cleanup(old_state->fb, old_pstate->aspace);
 
 }
@@ -3571,12 +3330,6 @@ static void sde_plane_atomic_update(struct drm_plane *plane,
 		ret = sde_plane_sspp_atomic_update(plane, old_state);
 		/* atomic_check should have ensured that this doesn't fail */
 		WARN_ON(ret < 0);
-#if IS_ENABLED(CONFIG_PSTORE_SCREEN_DISPLAY)
-		if (!ret && psde->panic_display &&
-		    !sde_pstore_check(psde, 0, 0))
-			pr_info_once("pstore-screen: SDE 4.19 scanout eligible (pipe=%u)\n",
-				     psde->pipe);
-#endif
 	}
 }
 
@@ -4326,7 +4079,6 @@ static void sde_plane_destroy(struct drm_plane *plane)
 	SDE_DEBUG_PLANE(psde, "\n");
 
 	if (psde) {
-		sde_pstore_destroy(psde);
 		_sde_plane_set_qos_ctrl(plane, false, SDE_PLANE_QOS_PANIC_CTRL);
 
 		if (psde->blob_info)

@@ -883,8 +883,6 @@ int msm_framebuffer_prepare(struct drm_framebuffer *fb,
 		struct msm_gem_address_space *aspace);
 void msm_framebuffer_cleanup(struct drm_framebuffer *fb,
 		struct msm_gem_address_space *aspace);
-void msm_pstore_screen_prepare(struct drm_framebuffer *fb);
-void msm_pstore_screen_cleanup(struct drm_framebuffer *fb);
 uint32_t msm_framebuffer_iova(struct drm_framebuffer *fb,
 		struct msm_gem_address_space *aspace, int plane);
 uint32_t msm_framebuffer_phys(struct drm_framebuffer *fb, int plane);

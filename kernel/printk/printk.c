@@ -36,7 +36,6 @@
 #include <linux/kdb.h>
 #include <linux/ratelimit.h>
 #include <linux/kmsg_dump.h>
-#include <linux/pstore_screen_log.h>
 #include <linux/syslog.h>
 #include <linux/cpu.h>
 #include <linux/rculist.h>
@@ -3110,45 +3109,6 @@ int kmsg_dump_unregister(struct kmsg_dumper *dumper)
 	return err;
 }
 EXPORT_SYMBOL_GPL(kmsg_dump_unregister);
-
-#if IS_ENABLED(CONFIG_PSTORE_SCREEN_LOG_CAPTURE)
-bool pstore_screen_printk_ring_ready(void)
-{
-	return READ_ONCE(log_buf_len) >= (1U << 19);
-}
-
-void pstore_screen_printk_snapshot_window(struct kmsg_dumper *dumper)
-{
-	WRITE_ONCE(dumper->active, true);
-	WRITE_ONCE(dumper->cur_seq, READ_ONCE(log_first_seq));
-	WRITE_ONCE(dumper->cur_idx, READ_ONCE(log_first_idx));
-	WRITE_ONCE(dumper->next_seq, READ_ONCE(log_next_seq));
-	WRITE_ONCE(dumper->next_idx, READ_ONCE(log_next_idx));
-}
-
-int pstore_screen_printk_get_line(struct kmsg_dumper *dumper, char *line,
-				   size_t capacity, size_t *len)
-{
-	struct printk_log *msg;
-	size_t needed;
-
-	if (!dumper->active || dumper->cur_seq >= dumper->next_seq)
-		return 0;
-	if (dumper->cur_seq < READ_ONCE(log_first_seq))
-		return -ESTALE;
-	msg = log_from_idx(dumper->cur_idx);
-	needed = msg_print_text(msg, true, NULL, 0);
-	if (needed >= capacity)
-		return -EMSGSIZE;
-	*len = msg_print_text(msg, true, line, capacity);
-	if (*len != needed)
-		return -ESTALE;
-	line[*len] = '\0';
-	dumper->cur_idx = log_next(dumper->cur_idx);
-	dumper->cur_seq++;
-	return 1;
-}
-#endif
 
 static bool always_kmsg_dump;
 module_param_named(always_kmsg_dump, always_kmsg_dump, bool, S_IRUGO | S_IWUSR);

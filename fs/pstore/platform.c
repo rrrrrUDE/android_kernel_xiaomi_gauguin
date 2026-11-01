@@ -28,7 +28,6 @@
 #include <linux/console.h>
 #include <linux/module.h>
 #include <linux/pstore.h>
-#include <linux/pstore_screen_log.h>
 #if IS_ENABLED(CONFIG_PSTORE_LZO_COMPRESS)
 #include <linux/lzo.h>
 #endif
@@ -629,7 +628,6 @@ void pstore_unregister(struct pstore_info *psi)
 	pstore_update_ms = -1;
 	del_timer_sync(&pstore_timer);
 	flush_work(&pstore_work);
-	pstore_screen_log_mirror_invalidate();
 
 	if (psi->flags & PSTORE_FLAGS_PMSG)
 		pstore_unregister_pmsg();
@@ -704,19 +702,14 @@ void pstore_get_backend_records(struct pstore_info *psi,
 				struct dentry *root, int quiet)
 {
 	int failed = 0;
-	u32 mirror_events = 0;
 	unsigned int stop_loop = 65536;
 
 	if (!psi || !root)
 		return;
 
 	mutex_lock(&psi->read_mutex);
-	pstore_screen_log_mirror_scan_begin();
-	if (psi->open && psi->open(psi)) {
-		mirror_events |= PSTORE_SCREEN_MIRROR_EVENT_BACKEND_READ_FAILURE |
-			PSTORE_SCREEN_MIRROR_EVENT_SCAN_INCOMPLETE;
+	if (psi->open && psi->open(psi))
 		goto out;
-	}
 
 	/*
 	 * Backend callback read() allocates record.buf. decompress_record()
@@ -725,13 +718,11 @@ void pstore_get_backend_records(struct pstore_info *psi,
 	 */
 	for (; stop_loop; stop_loop--) {
 		struct pstore_record *record;
-		bool was_compressed;
 		int rc;
 
 		record = kzalloc(sizeof(*record), GFP_KERNEL);
 		if (!record) {
 			pr_err("out of memory creating record\n");
-			mirror_events |= PSTORE_SCREEN_MIRROR_EVENT_SCAN_INCOMPLETE;
 			break;
 		}
 		pstore_record_init(record, psi);
@@ -740,17 +731,11 @@ void pstore_get_backend_records(struct pstore_info *psi,
 
 		/* No more records left in backend? */
 		if (record->size <= 0) {
-			if (record->size < 0)
-				mirror_events |= PSTORE_SCREEN_MIRROR_EVENT_BACKEND_READ_FAILURE |
-					PSTORE_SCREEN_MIRROR_EVENT_SCAN_INCOMPLETE;
 			kfree(record);
 			break;
 		}
 
-		was_compressed = record->compressed;
 		decompress_record(record);
-		pstore_screen_log_mirror_record(record, was_compressed,
-						zbackend ? zbackend->name : compress);
 		rc = pstore_mkfile(root, record);
 		if (rc) {
 			/* pstore_mkfile() did not take record, so free it. */
@@ -760,13 +745,9 @@ void pstore_get_backend_records(struct pstore_info *psi,
 				failed++;
 		}
 	}
-	if (psi->close && psi->close(psi))
-		mirror_events |= PSTORE_SCREEN_MIRROR_EVENT_BACKEND_READ_FAILURE |
-			PSTORE_SCREEN_MIRROR_EVENT_SCAN_INCOMPLETE;
+	if (psi->close)
+		psi->close(psi);
 out:
-	if (!stop_loop)
-		mirror_events |= PSTORE_SCREEN_MIRROR_EVENT_SCAN_INCOMPLETE;
-	pstore_screen_log_mirror_scan_end(mirror_events);
 	mutex_unlock(&psi->read_mutex);
 
 	if (failed)

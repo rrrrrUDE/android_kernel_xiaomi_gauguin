@@ -4,8 +4,6 @@
 
 menu "Misc devices"
 
-source "drivers/misc/pstore_screen/Kconfig"
-
 config SPI_XIAOMI_TP
         bool
         default y

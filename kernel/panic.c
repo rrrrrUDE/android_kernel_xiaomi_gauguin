@@ -12,8 +12,6 @@
 #include <linux/sched/debug.h>
 #include <linux/interrupt.h>
 #include <linux/kmsg_dump.h>
-#include <linux/pstore_screen_log.h>
-#include <linux/pstore_screen_panic.h>
 #include <linux/kallsyms.h>
 #include <linux/notifier.h>
 #include <linux/vt_kern.h>
@@ -197,10 +195,6 @@ void panic(const char *fmt, ...)
 	static char buf[1024];
 	va_list args;
 	long i, i_next = 0;
-	int format_ret;
-#if IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC)
-	int pstore_screen_ret;
-#endif
 	int state = 0;
 	int old_cpu, this_cpu;
 	bool _crash_kexec_post_notifiers = crash_kexec_post_notifiers;
@@ -248,10 +242,8 @@ void panic(const char *fmt, ...)
 	console_verbose();
 	bust_spinlocks(1);
 	va_start(args, fmt);
-	format_ret = vsnprintf(buf, sizeof(buf), fmt, args);
+	vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
-	pstore_screen_log_panic_capture(buf, strnlen(buf, sizeof(buf)),
-					format_ret < 0 || format_ret >= sizeof(buf));
 	dump_stack_minidump(0);
 	if (vendor_panic_cb)
 		vendor_panic_cb(0);
@@ -300,13 +292,6 @@ void panic(const char *fmt, ...)
 	/* Call flush even twice. It tries harder with a single online CPU */
 	printk_safe_flush_on_panic();
 	kmsg_dump(KMSG_DUMP_PANIC);
-#if IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC)
-	pstore_screen_ret = pstore_screen_panic_start();
-	pr_emerg("pstore-screen: panic display start returned %d\n",
-		 pstore_screen_ret);
-	if (!pstore_screen_ret)
-		pstore_screen_panic_wait();
-#endif
 
 	/*
 	 * If you doubt kdump always works fine in any situation,
