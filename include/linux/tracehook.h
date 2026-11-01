@@ -177,8 +177,10 @@ static inline void set_notify_resume(struct task_struct *task)
 static inline void set_notify_signal(struct task_struct *task)
 {
 #ifdef TIF_NOTIFY_RESUME
-	if (!test_and_set_tsk_thread_flag(task, TIF_NOTIFY_RESUME) &&
-	    !wake_up_state(task, TASK_INTERRUPTIBLE))
+	bool newly_set = !test_and_set_tsk_thread_flag(task, TIF_NOTIFY_RESUME);
+
+	/* New task work must wake a sleeper even if the flag was already set. */
+	if (!wake_up_state(task, TASK_INTERRUPTIBLE) && newly_set)
 		kick_process(task);
 #endif
 }
