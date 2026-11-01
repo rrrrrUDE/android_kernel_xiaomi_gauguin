@@ -228,7 +228,8 @@ static int sde_pstore_check(void *ctx, u64 generation, u64 token)
 	struct drm_encoder *encoder;
 	bool video_mode = false;
 
-	if (!state || !state->fb || !state->crtc || !state->visible ||
+	/* The 4.19 techpack SDE path does not maintain DRM's visible flag. */
+	if (!state || !state->fb || !state->crtc ||
 	    !state->crtc->state || !state->crtc->state->active ||
 	    !pm_runtime_active(psde->base.dev->dev))
 		return -ENODEV;
@@ -983,6 +984,7 @@ static inline void _sde_plane_set_scanout(struct drm_plane *plane,
 		pstate->defer_prepare_fb = false;
 		if (plane->type == DRM_PLANE_TYPE_PRIMARY)
 			msm_pstore_screen_prepare(fb);
+		sde_pstore_prepare(plane, plane->state, aspace);
 	}
 	mode = sde_plane_get_property(pstate, PLANE_PROP_FB_TRANSLATION_MODE);
 	if ((mode == SDE_DRM_FB_SEC) || (mode == SDE_DRM_FB_SEC_DIR_TRANS))

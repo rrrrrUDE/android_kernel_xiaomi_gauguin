@@ -217,10 +217,9 @@ static int panic_wdog_handler(struct notifier_block *this,
 {
 	struct msm_watchdog_data *wdog_dd = container_of(this,
 				struct msm_watchdog_data, panic_blk);
-	int timeout = IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC) ? 120 :
-		panic_timeout + 10;
+	int timeout = panic_timeout + 10;
 
-	if (panic_timeout == 0 && !IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC)) {
+	if (panic_timeout == 0 || IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC)) {
 		__raw_writel(0, wdog_dd->base + WDT0_EN);
 		/* Ensure the disable reaches hardware before returning. */
 		mb();
