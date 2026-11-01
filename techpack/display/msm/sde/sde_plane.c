@@ -235,10 +235,11 @@ static int sde_pstore_check(void *ctx, u64 generation, u64 token)
 		return -ENODEV;
 	pstate = to_sde_plane_state(state);
 	crtc = to_sde_crtc(state->crtc);
+	/* Android may move the full-screen plane above stage 0 later. */
 	if (!psde->panic_vaddr || !psde->pipe_hw ||
 	    !pstate->aspace || pstate->aspace != psde->panic_aspace ||
 	    !pstate->aspace->domain_attached || crtc->num_mixers != 1 ||
-	    pstate->stage != SDE_STAGE_0 ||
+	    pstate->stage < SDE_STAGE_0 || pstate->stage >= SDE_STAGE_MAX ||
 	    pstate->multirect_index != SDE_SSPP_RECT_SOLO ||
 	    pstate->multirect_mode != SDE_SSPP_MULTIRECT_NONE ||
 	    psde->is_virtual ||

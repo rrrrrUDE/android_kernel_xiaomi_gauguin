@@ -1137,29 +1137,36 @@ int pstore_screen_log_snapshot_internal(const u8 **data, u32 *data_len,
 static void ps_log_kmsg_dump(struct kmsg_dumper *dumper,
 			     enum kmsg_dump_reason reason)
 {
+	static const u8 fallback_log[] =
+		"pstore-screen: current kernel log snapshot unavailable\n";
+	static const u8 fallback_description[] = "Kernel panic";
 	struct ps_log_capture_result capture;
 	struct kmsg_dumper iter;
 	u64 start_seq;
 	u64 end_seq;
 	u32 description_len;
 	u32 output_len;
+	const u8 *description;
 	int ret;
 
 	if (reason != KMSG_DUMP_PANIC ||
 	    cmpxchg(&ps_log_dump_state, 0U, 1U) != 0U)
 		return;
 	WRITE_ONCE(ps_log_container_valid, false);
-	if (!pstore_screen_printk_ring_ready()) {
-		pr_emerg("pstore-screen: 4.19 printk ring too small\n");
-		goto out_invalid;
-	}
 	/* Pair with panic_capture before consuming its private description. */
 	if (smp_load_acquire(&ps_log_panic_description_state) != 2U ||
 	    READ_ONCE(ps_log_panic_description_invalid)) {
 		pr_emerg("pstore-screen: 4.19 panic description unavailable\n");
-		goto out_invalid;
+		description = fallback_description;
+		description_len = sizeof(fallback_description) - 1U;
+	} else {
+		description = ps_log_panic_description;
+		description_len = READ_ONCE(ps_log_panic_description_len);
 	}
-	description_len = READ_ONCE(ps_log_panic_description_len);
+	if (!pstore_screen_printk_ring_ready()) {
+		pr_emerg("pstore-screen: 4.19 printk ring too small\n");
+		goto fallback_capture;
+	}
 	pstore_screen_printk_snapshot_window(&iter);
 	start_seq = READ_ONCE(iter.cur_seq);
 	end_seq = READ_ONCE(iter.next_seq);
@@ -1168,14 +1175,25 @@ static void ps_log_kmsg_dump(struct kmsg_dumper *dumper,
 					   PS_LOG_SCRATCH_BYTES, &capture);
 	if (ret) {
 		pr_emerg("pstore-screen: 4.19 printk capture failed: %d\n", ret);
-		goto out_invalid;
+		goto fallback_capture;
 	}
+	goto capture_ready;
+
+fallback_capture:
+	memset(&capture, 0, sizeof(capture));
+	capture.payload = fallback_log;
+	capture.payload_len = sizeof(fallback_log) - 1U;
+	capture.current_total_len = capture.payload_len;
+	capture.valid = 1U;
+
+capture_ready:
 	ret = pstore_screen_log_freeze_mirror_internal(&ps_log_frozen_mirror);
 	if (ret) {
 		pr_emerg("pstore-screen: mirror freeze failed: %d\n", ret);
-		goto out_invalid;
+		ps_log_mirror_reset(&ps_log_frozen_mirror,
+				    PS_MIRROR_SOURCE_ABSENT);
 	}
-	ret = ps_log_build_pslc(ps_log_panic_description, description_len,
+	ret = ps_log_build_pslc(description, description_len,
 				&capture, &ps_log_frozen_mirror,
 				ps_log_segments, PS_LOG_MAX_SEGMENTS,
 				ps_log_container, PS_LOG_CONTAINER_BYTES,

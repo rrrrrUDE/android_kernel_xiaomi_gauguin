@@ -267,10 +267,7 @@ void pstore_screen_panic_wait(void)
 		if (!ret)
 			ps_input_event(&ps_panic.input, key, event, now_ms,
 				       &input_ops, &ps_panic, NULL);
-		else if (ret == -ENOSYS)
-			return;
-		else if (ret != -EAGAIN)
-			cpu_relax();
+		/* Keep the screen up even when panic-time key polling is absent. */
 		ps_input_tick(&ps_panic.input, now_ms, &input_ops, &ps_panic, NULL);
 		touch_nmi_watchdog();
 		cpu_relax();
