@@ -91,6 +91,10 @@ struct spmi_controller {
 	int	(*cmd)(struct spmi_controller *ctrl, u8 opcode, u8 sid);
 	int	(*read_cmd)(struct spmi_controller *ctrl, u8 opcode,
 			    u8 sid, u16 addr, u8 *buf, size_t len);
+	int	(*panic_read_cmd)(struct spmi_controller *ctrl, u8 opcode,
+			  u8 sid, u16 addr, u8 *buf, size_t len);
+	int	(*panic_write_cmd)(struct spmi_controller *ctrl, u8 opcode,
+			   u8 sid, u16 addr, const u8 *buf, size_t len);
 	int	(*write_cmd)(struct spmi_controller *ctrl, u8 opcode,
 			     u8 sid, u16 addr, const u8 *buf, size_t len);
 };

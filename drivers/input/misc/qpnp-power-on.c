@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/spmi.h>
 #include <linux/input/qpnp-power-on.h>
+#include <linux/pstore_screen_gauguin.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/machine.h>
 #include <linux/regulator/of_regulator.h>
@@ -240,6 +241,128 @@ module_param_named(
 
 static struct qpnp_pon *sys_reset_dev;
 static struct qpnp_pon *modem_reset_dev;
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_GAUGUIN_KEYS)
+/* Gauguin: PM6350 SID0 PON power/resin and GPIO2 volume-up.  The
+ * controller callback is bounded polling and uses no sleeping regmap lock. */
+static int qpnp_pon_panic_write(struct spmi_device *sdev, u16 addr, u8 value)
+{
+	return sdev->ctrl->panic_write_cmd(sdev->ctrl, SPMI_CMD_EXT_WRITEL,
+					  sdev->usid, addr, &value, 1);
+}
+
+int qpnp_pon_panic_poweroff_type(u8 type)
+{
+	struct qpnp_pon *pon = READ_ONCE(sys_reset_dev);
+	struct spmi_device *sdev;
+	u16 enable_addr;
+	u8 value;
+	int ret;
+
+	if (!pon)
+		return -ENODEV;
+	if (type == PON_POWER_OFF_HARD_RESET) {
+		if (pon->ps_hold_hard_reset_disable)
+			return -EOPNOTSUPP;
+		if (pon->hard_reset_poff_type != -EINVAL)
+			type = pon->hard_reset_poff_type;
+	} else if (type == PON_POWER_OFF_SHUTDOWN) {
+		if (pon->ps_hold_shutdown_disable)
+			return -EOPNOTSUPP;
+		if (pon->shutdown_poff_type != -EINVAL)
+			type = pon->shutdown_poff_type;
+	}
+	sdev = to_spmi_device(pon->dev->parent);
+	if (!sdev || !sdev->ctrl || !sdev->ctrl->panic_read_cmd ||
+	    !sdev->ctrl->panic_write_cmd)
+		return -ENODEV;
+	enable_addr = pon->pon_ver == QPNP_PON_GEN1_V1 ?
+		QPNP_PON_PS_HOLD_RST_CTL(pon) : QPNP_PON_PS_HOLD_RST_CTL2(pon);
+	ret = sdev->ctrl->panic_read_cmd(sdev->ctrl, SPMI_CMD_EXT_READL,
+					 sdev->usid, enable_addr, &value, 1);
+	if (ret)
+		return ret;
+	ret = qpnp_pon_panic_write(sdev, enable_addr,
+				  value & ~QPNP_PON_RESET_EN);
+	if (ret)
+		return ret;
+	udelay(500);
+	ret = sdev->ctrl->panic_read_cmd(sdev->ctrl, SPMI_CMD_EXT_READL,
+					 sdev->usid, QPNP_PON_PS_HOLD_RST_CTL(pon),
+					 &value, 1);
+	if (ret)
+		return ret;
+	ret = qpnp_pon_panic_write(sdev, QPNP_PON_PS_HOLD_RST_CTL(pon),
+				  (value & ~QPNP_PON_POWER_OFF_MASK) |
+				  (type & QPNP_PON_POWER_OFF_MASK));
+	if (ret)
+		return ret;
+	ret = sdev->ctrl->panic_read_cmd(sdev->ctrl, SPMI_CMD_EXT_READL,
+					 sdev->usid, enable_addr, &value, 1);
+	if (ret)
+		return ret;
+	return qpnp_pon_panic_write(sdev, enable_addr,
+					  value | QPNP_PON_RESET_EN);
+}
+
+int pstore_screen_panic_poll_key(u32 *key, u32 *event, u64 *now_ms)
+{
+	static u8 last;
+	static bool initialized;
+	struct qpnp_pon *pon = READ_ONCE(sys_reset_dev);
+	struct spmi_device *sdev;
+	u8 status, volume_up;
+	u8 pressed, changed;
+	int ret;
+
+	if (!pon || !key || !event || !now_ms)
+		return -ENOSYS;
+	sdev = to_spmi_device(pon->dev->parent);
+	if (!sdev || !sdev->ctrl || !sdev->ctrl->panic_read_cmd)
+		return -ENOSYS;
+	ret = sdev->ctrl->panic_read_cmd(sdev->ctrl, SPMI_CMD_EXT_READL,
+					 sdev->usid, QPNP_PON_RT_STS(pon),
+					 &status, 1);
+	if (ret)
+		return -EAGAIN;
+	ret = sdev->ctrl->panic_read_cmd(sdev->ctrl, SPMI_CMD_EXT_READL,
+					 sdev->usid, 0xc110, &volume_up, 1);
+	if (ret)
+		return -EAGAIN;
+	pressed = ((status & QPNP_PON_KPDPWR_N_SET) ? BIT(0) : 0) |
+		  ((status & QPNP_PON_RESIN_N_SET) ? BIT(1) : 0) |
+		  (!(volume_up & BIT(0)) ? BIT(2) : 0);
+	if (!initialized) {
+		last = pressed;
+		initialized = true;
+		return -EAGAIN;
+	}
+	/* Keep pending transitions until each has been reported. */
+	changed = pressed ^ last;
+	if (!changed)
+		return -EAGAIN;
+	if (changed & BIT(0)) {
+		*key = PSTORE_SCREEN_KEY_POWER;
+		*event = (pressed & BIT(0)) ? PSTORE_SCREEN_KEY_PRESS :
+			PSTORE_SCREEN_KEY_RELEASE;
+	} else if (changed & BIT(1)) {
+		*key = PSTORE_SCREEN_KEY_VOLUME_DOWN;
+		*event = (pressed & BIT(1)) ? PSTORE_SCREEN_KEY_PRESS :
+			PSTORE_SCREEN_KEY_RELEASE;
+	} else {
+		*key = PSTORE_SCREEN_KEY_VOLUME_UP;
+		*event = (pressed & BIT(2)) ? PSTORE_SCREEN_KEY_PRESS :
+			PSTORE_SCREEN_KEY_RELEASE;
+	}
+	if (*key == PSTORE_SCREEN_KEY_POWER)
+		last ^= BIT(0);
+	else if (*key == PSTORE_SCREEN_KEY_VOLUME_DOWN)
+		last ^= BIT(1);
+	else
+		last ^= BIT(2);
+	return 0;
+}
+#endif
+
 static DEFINE_SPINLOCK(spon_list_slock);
 static LIST_HEAD(spon_dev_list);
 
@@ -2642,6 +2765,8 @@ static int qpnp_pon_remove(struct platform_device *pdev)
 		list_del(&pon->list);
 		spin_unlock_irqrestore(&spon_list_slock, flags);
 	}
+	if (READ_ONCE(sys_reset_dev) == pon)
+		WRITE_ONCE(sys_reset_dev, NULL);
 
 	return 0;
 }

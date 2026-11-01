@@ -387,6 +387,68 @@ done:
 	return rc;
 }
 
+/* Other CPUs have been stopped before the panic screen polls the PMIC. */
+static int pmic_arb_panic_wait(void __iomem *base, u32 offset)
+{
+	u32 timeout = PMIC_ARB_TIMEOUT_US;
+	u32 status;
+
+	while (timeout--) {
+		status = readl_relaxed(base + offset + PMIC_ARB_STATUS);
+		if (status & PMIC_ARB_STATUS_DONE)
+			return status & PMIC_ARB_STATUS_DENIED ? -EPERM :
+			       status & (PMIC_ARB_STATUS_FAILURE |
+					 PMIC_ARB_STATUS_DROPPED) ? -EIO : 0;
+		udelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
+static int pmic_arb_panic_read_cmd(struct spmi_controller *ctrl, u8 opc,
+				   u8 sid, u16 addr, u8 *buf, size_t len)
+{
+	struct spmi_pmic_arb *pmic_arb = spmi_controller_get_drvdata(ctrl);
+	u32 offset, cmd;
+	int rc;
+
+	if (!buf || len != 1 || opc != SPMI_CMD_EXT_READL)
+		return -EINVAL;
+	rc = pmic_arb->ver_ops->offset(pmic_arb, sid, addr,
+				       PMIC_ARB_CHANNEL_OBS);
+	if (rc < 0)
+		return rc;
+	offset = rc;
+	cmd = pmic_arb->ver_ops->fmt_cmd(PMIC_ARB_OP_EXT_READL,
+					     sid, addr, 0);
+	pmic_arb_set_rd_cmd(pmic_arb, offset + PMIC_ARB_CMD, cmd);
+	rc = pmic_arb_panic_wait(pmic_arb->rd_base, offset);
+	if (!rc)
+		pmic_arb_read_data(pmic_arb, buf, offset + PMIC_ARB_RDATA0, 0);
+	return rc;
+}
+
+static int pmic_arb_panic_write_cmd(struct spmi_controller *ctrl, u8 opc,
+				    u8 sid, u16 addr, const u8 *buf, size_t len)
+{
+	struct spmi_pmic_arb *pmic_arb = spmi_controller_get_drvdata(ctrl);
+	u32 offset, cmd;
+	int rc;
+
+	if (!buf || len != 1 || opc != SPMI_CMD_EXT_WRITEL)
+		return -EINVAL;
+	rc = pmic_arb->ver_ops->offset(pmic_arb, sid, addr,
+				       PMIC_ARB_CHANNEL_RW);
+	if (rc < 0)
+		return rc;
+	offset = rc;
+	cmd = pmic_arb->ver_ops->fmt_cmd(PMIC_ARB_OP_EXT_WRITEL,
+					     sid, addr, 0);
+	pmic_arb_write_data(pmic_arb, buf, offset + PMIC_ARB_WDATA0, 0);
+	pmic_arb_base_write(pmic_arb, offset + PMIC_ARB_CMD, cmd);
+	rc = pmic_arb_panic_wait(pmic_arb->wr_base, offset);
+	return rc;
+}
+
 static int pmic_arb_write_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 			u16 addr, const u8 *buf, size_t len)
 {
@@ -1319,6 +1381,8 @@ static int spmi_pmic_arb_probe(struct platform_device *pdev)
 
 	ctrl->cmd = pmic_arb_cmd;
 	ctrl->read_cmd = pmic_arb_read_cmd;
+	ctrl->panic_read_cmd = pmic_arb_panic_read_cmd;
+	ctrl->panic_write_cmd = pmic_arb_panic_write_cmd;
 	ctrl->write_cmd = pmic_arb_write_cmd;
 
 	if (hw_ver >= PMIC_ARB_VERSION_V5_MIN) {

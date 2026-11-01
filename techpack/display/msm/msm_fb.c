@@ -18,9 +18,12 @@
 
 #include <linux/dma-mapping.h>
 #include <linux/dma-buf.h>
+#include <linux/pstore_screen.h>
+#include <asm/cacheflush.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_fourcc.h>
 
 #include "msm_drv.h"
 #include "msm_kms.h"
@@ -34,8 +37,139 @@ struct msm_framebuffer {
 	void *vaddr[MAX_PLANE];
 	atomic_t kmap_count;
 	u32 flags;
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_DISPLAY)
+	struct pstore_screen_display_handle *pstore_screen;
+	void *pstore_vaddr;
+	unsigned int pstore_users;
+	struct mutex pstore_lock;
+#endif
 };
 #define to_msm_framebuffer(x) container_of(x, struct msm_framebuffer, base)
+
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_DISPLAY)
+/* The scanout is prepared in normal context; panic callbacks only touch the
+ * retained mapping.  An active, unscaled primary plane is required. */
+static int msm_pstore_screen_check(void *ctx, u64 generation, u64 token)
+{
+	struct msm_framebuffer *msm_fb = ctx;
+	struct drm_framebuffer *fb = &msm_fb->base;
+	struct drm_plane *plane;
+	struct drm_plane_state *state;
+
+	drm_for_each_plane(plane, fb->dev) {
+		if (plane->type != DRM_PLANE_TYPE_PRIMARY)
+			continue;
+		state = READ_ONCE(plane->state);
+		if (state && READ_ONCE(state->fb) == fb &&
+		    READ_ONCE(state->crtc) && state->visible &&
+		    !state->src_x && !state->src_y &&
+		    state->src_w == (fb->width << 16) &&
+		    state->src_h == (fb->height << 16) &&
+		    !state->crtc_x && !state->crtc_y &&
+		    state->crtc_w == fb->width &&
+		    state->crtc_h == fb->height &&
+		    state->rotation == DRM_MODE_ROTATE_0)
+			return 0;
+	}
+	return -ENODEV;
+}
+
+static int msm_pstore_screen_flush(void *ctx)
+{
+	struct msm_framebuffer *msm_fb = ctx;
+	struct drm_framebuffer *fb = &msm_fb->base;
+	u64 length = (u64)fb->pitches[0] * fb->height;
+
+	dmac_flush_range((u8 *)msm_fb->pstore_vaddr + fb->offsets[0],
+			 (u8 *)msm_fb->pstore_vaddr + fb->offsets[0] + length);
+	return 0;
+}
+
+void msm_pstore_screen_prepare(struct drm_framebuffer *fb)
+{
+	struct msm_framebuffer *msm_fb = to_msm_framebuffer(fb);
+	struct pstore_screen_display_desc desc = {
+		.size = sizeof(desc),
+		.version = PSTORE_SCREEN_DISPLAY_DESC_VERSION,
+		.name = "msm-sde-primary",
+		.stage = PSTORE_SCREEN_STAGE_DRM,
+		.priority = PSTORE_SCREEN_PRIORITY_DRM,
+		.flags = PSTORE_SCREEN_PROVIDER_ACTIVE_SCANOUT,
+		.capabilities = PSTORE_SCREEN_PROVIDER_CAP_CHECK_NO_SIDE_EFFECT |
+			PSTORE_SCREEN_PROVIDER_CAP_FLUSH_PANIC_SAFE,
+		.ctx = msm_fb,
+		.ops.check = msm_pstore_screen_check,
+		.scanout = {
+			.map_kind = PSTORE_SCREEN_MAP_SYSTEM,
+			.format = fb->format->format,
+			.width = fb->width,
+			.height = fb->height,
+			.pitch = fb->pitches[0],
+			.ctx = msm_fb,
+			.flush = msm_pstore_screen_flush,
+		},
+	};
+	void *vaddr;
+
+	if (fb->format->num_planes != 1 || !fb->obj[0] || fb->modifier ||
+	    fb->offsets[0] >= fb->obj[0]->size ||
+	    (desc.scanout.format != DRM_FORMAT_XRGB8888 &&
+	     desc.scanout.format != DRM_FORMAT_ARGB8888 &&
+	     desc.scanout.format != DRM_FORMAT_XBGR8888 &&
+	     desc.scanout.format != DRM_FORMAT_ABGR8888 &&
+	     desc.scanout.format != DRM_FORMAT_RGBX8888 &&
+	     desc.scanout.format != DRM_FORMAT_BGRX8888 &&
+	     desc.scanout.format != DRM_FORMAT_RGBA8888 &&
+	     desc.scanout.format != DRM_FORMAT_BGRA8888 &&
+	     desc.scanout.format != DRM_FORMAT_RGB565 &&
+	     desc.scanout.format != DRM_FORMAT_BGR565))
+		return;
+	mutex_lock(&msm_fb->pstore_lock);
+	if (msm_fb->pstore_users) {
+		msm_fb->pstore_users++;
+		goto out;
+	}
+	msm_fb->pstore_users = 1;
+	vaddr = msm_gem_get_vaddr(fb->obj[0]);
+	if (IS_ERR_OR_NULL(vaddr)) {
+		msm_fb->pstore_users = 0;
+		goto out;
+	}
+	msm_fb->pstore_vaddr = vaddr;
+	desc.scanout.address.system = (u8 *)vaddr + fb->offsets[0];
+	desc.scanout.length = fb->obj[0]->size - fb->offsets[0];
+	if (pstore_screen_display_register(&desc, &msm_fb->pstore_screen)) {
+		msm_gem_put_vaddr(fb->obj[0]);
+		msm_fb->pstore_vaddr = NULL;
+		msm_fb->pstore_users = 0;
+	} else {
+		pr_info_once("pstore-screen: SDE scanout provider ready (%4.4s %ux%u)\n",
+			     (char *)&desc.scanout.format,
+			     desc.scanout.width, desc.scanout.height);
+	}
+out:
+	mutex_unlock(&msm_fb->pstore_lock);
+}
+
+void msm_pstore_screen_cleanup(struct drm_framebuffer *fb)
+{
+	struct msm_framebuffer *msm_fb = to_msm_framebuffer(fb);
+
+	mutex_lock(&msm_fb->pstore_lock);
+	if (msm_fb->pstore_users && !--msm_fb->pstore_users) {
+		pstore_screen_display_unregister(msm_fb->pstore_screen);
+		msm_fb->pstore_screen = NULL;
+		if (msm_fb->pstore_vaddr) {
+			msm_gem_put_vaddr(fb->obj[0]);
+			msm_fb->pstore_vaddr = NULL;
+		}
+	}
+	mutex_unlock(&msm_fb->pstore_lock);
+}
+#else
+void msm_pstore_screen_prepare(struct drm_framebuffer *fb) {}
+void msm_pstore_screen_cleanup(struct drm_framebuffer *fb) {}
+#endif
 
 int msm_framebuffer_dirty(struct drm_framebuffer *fb,
 		struct drm_file *file_priv, unsigned int flags,
@@ -413,6 +547,9 @@ struct drm_framebuffer *msm_framebuffer_init(struct drm_device *dev,
 
 	msm_fb->format = format;
 	atomic_set(&msm_fb->kmap_count, 0);
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_DISPLAY)
+	mutex_init(&msm_fb->pstore_lock);
+#endif
 
 	if (mode_cmd->flags & DRM_MODE_FB_MODIFIERS) {
 		for (i = 0; i < ARRAY_SIZE(mode_cmd->modifier); i++) {

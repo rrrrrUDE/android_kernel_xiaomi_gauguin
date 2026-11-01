@@ -217,16 +217,21 @@ static int panic_wdog_handler(struct notifier_block *this,
 {
 	struct msm_watchdog_data *wdog_dd = container_of(this,
 				struct msm_watchdog_data, panic_blk);
-	if (panic_timeout == 0) {
+	int timeout = IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC) ? 120 :
+		panic_timeout + 10;
+
+	if (panic_timeout == 0 && !IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC)) {
 		__raw_writel(0, wdog_dd->base + WDT0_EN);
-		/* Make sure watchdog is enabled before notifying the caller */
+		/* Ensure the disable reaches hardware before returning. */
 		mb();
 	} else {
-		__raw_writel(WDT_HZ * (panic_timeout + 10),
+		__raw_writel(WDT_HZ * timeout,
 				wdog_dd->base + WDT0_BARK_TIME);
-		__raw_writel(WDT_HZ * (panic_timeout + 10),
+		__raw_writel(WDT_HZ * timeout,
 				wdog_dd->base + WDT0_BITE_TIME);
+		__raw_writel(1, wdog_dd->base + WDT0_EN);
 		__raw_writel(1, wdog_dd->base + WDT0_RST);
+		mb();
 	}
 	return NOTIFY_DONE;
 }

@@ -16,6 +16,7 @@
 #include <linux/pm.h>
 #include <linux/delay.h>
 #include <linux/input/qpnp-power-on.h>
+#include <linux/pstore_screen_gauguin.h>
 #include <linux/of_address.h>
 
 #include <asm/cacheflush.h>
@@ -607,6 +608,36 @@ static void deassert_ps_hold(void)
 	/* Fall-through to the direct write in case the scm_call "returns" */
 	__raw_writel(0, msm_ps_hold);
 }
+
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_GAUGUIN_KEYS)
+int pstore_screen_panic_poweroff(void)
+{
+	int ret;
+
+	if (!msm_ps_hold || IS_ERR(msm_ps_hold))
+		return -ENODEV;
+	ret = qpnp_pon_panic_poweroff_type(PON_POWER_OFF_SHUTDOWN);
+	if (ret)
+		return ret;
+	__raw_writel(0, msm_ps_hold);
+	mb();
+	return 0;
+}
+
+int pstore_screen_panic_restart(void)
+{
+	int ret;
+
+	if (!msm_ps_hold || IS_ERR(msm_ps_hold))
+		return -ENODEV;
+	ret = qpnp_pon_panic_poweroff_type(PON_POWER_OFF_HARD_RESET);
+	if (ret)
+		return ret;
+	__raw_writel(0, msm_ps_hold);
+	mb();
+	return 0;
+}
+#endif
 
 static void do_msm_restart(enum reboot_mode reboot_mode, const char *cmd)
 {
