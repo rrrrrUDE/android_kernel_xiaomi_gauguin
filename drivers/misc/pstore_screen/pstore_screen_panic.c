@@ -56,6 +56,10 @@ int __weak pstore_screen_panic_restart(void)
 	return -EOPNOTSUPP;
 }
 
+void __weak pstore_screen_panic_stop_watchdog(void)
+{
+}
+
 static u16 ps_panic_le16(const u8 *data)
 {
 	return (u16)data[0] | ((u16)data[1] << 8);
@@ -233,6 +237,8 @@ int pstore_screen_panic_start(void)
 		goto abort_claim;
 	}
 	ps_panic.started = 1U;
+	/* Keep the panic watchdog armed until the first frame is on screen. */
+	pstore_screen_panic_stop_watchdog();
 	return 0;
 
 abort_claim:

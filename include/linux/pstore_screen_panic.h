@@ -9,6 +9,7 @@
 #if IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC)
 int pstore_screen_panic_start(void);
 void pstore_screen_panic_wait(void);
+void pstore_screen_panic_stop_watchdog(void);
 #else
 static inline int pstore_screen_panic_start(void)
 {

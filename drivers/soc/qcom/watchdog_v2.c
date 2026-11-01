@@ -32,6 +32,7 @@
 #include <linux/cpumask.h>
 #include <uapi/linux/sched/types.h>
 #include <linux/sched/debug.h>
+#include <linux/pstore_screen_panic.h>
 #ifdef CONFIG_QCOM_INITIAL_LOGBUF
 #include <linux/kallsyms.h>
 #include <linux/math64.h>
@@ -141,6 +142,18 @@ module_param(enable, int, 0000);
 static long WDT_HZ = 32765;
 module_param(WDT_HZ, long, 0000);
 
+#if IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC)
+void pstore_screen_panic_stop_watchdog(void)
+{
+	struct msm_watchdog_data *wdog_dd = READ_ONCE(wdog_data);
+
+	if (!wdog_dd || !wdog_dd->base)
+		return;
+	__raw_writel(0, wdog_dd->base + WDT0_EN);
+	mb();
+}
+#endif
+
 /*
  * Watchdog ipi optimization:
  * Does not ping cores in low power mode at pet time to save power.
@@ -217,9 +230,10 @@ static int panic_wdog_handler(struct notifier_block *this,
 {
 	struct msm_watchdog_data *wdog_dd = container_of(this,
 				struct msm_watchdog_data, panic_blk);
-	int timeout = panic_timeout + 10;
+	int timeout = IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC) ? 120 :
+		panic_timeout + 10;
 
-	if (panic_timeout == 0 || IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC)) {
+	if (panic_timeout == 0 && !IS_ENABLED(CONFIG_PSTORE_SCREEN_PANIC)) {
 		__raw_writel(0, wdog_dd->base + WDT0_EN);
 		/* Ensure the disable reaches hardware before returning. */
 		mb();
