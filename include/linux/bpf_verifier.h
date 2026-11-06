@@ -520,6 +520,8 @@ bpf_prog_offload_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt);
 
 int check_ctx_reg(struct bpf_verifier_env *env,
 		  const struct bpf_reg_state *reg, int regno);
+int check_mem_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
+		  u32 regno, u32 mem_size);
 int check_kfunc_mem_access(struct bpf_verifier_env *env, int regno,
 			   u32 size, u32 align);
 

@@ -4715,6 +4715,37 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, int regno,
 	}
 }
 
+/* Global subprogram pointer arguments may be NULL, otherwise the entire
+ * BTF-described object must be initialized and safe for the callee to write.
+ * Restore the caller state after checking the non-NULL branch.
+ */
+int check_mem_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
+		  u32 regno, u32 mem_size)
+{
+	struct bpf_reg_state saved = *reg;
+	int err;
+
+	if (register_is_null(reg))
+		return 0;
+	if (base_type(reg->type) == PTR_TO_MAP_VALUE &&
+	    (reg->map_ptr->inner_map_meta ||
+	     reg->map_ptr->map_type == BPF_MAP_TYPE_XSKMAP ||
+	     reg->map_ptr->map_type == BPF_MAP_TYPE_SOCKMAP ||
+	     reg->map_ptr->map_type == BPF_MAP_TYPE_SOCKHASH))
+		return -EACCES;
+	reg->type &= ~PTR_MAYBE_NULL;
+	/* Global callees receive writable memory, so require both permissions. */
+	if (reg->type == PTR_TO_MAP_KEY ||
+	    (reg->type == PTR_TO_MAP_VALUE &&
+	     check_map_access_type(env, regno, reg->off, mem_size, BPF_WRITE))) {
+		*reg = saved;
+		return -EACCES;
+	}
+	err = check_helper_mem_access(env, regno, mem_size, true, NULL);
+	*reg = saved;
+	return err;
+}
+
 int check_kfunc_mem_access(struct bpf_verifier_env *env, int regno,
 			   u32 size, u32 align)
 {
@@ -5800,7 +5831,7 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	func_info_aux = env->prog->aux->func_info_aux;
 	if (func_info_aux)
 		is_global = func_info_aux[subprog].linkage == BTF_FUNC_GLOBAL;
-	err = btf_check_func_arg_match(env, subprog, caller->regs);
+	err = btf_check_subprog_arg_match(env, subprog, caller->regs);
 	if (err == -EFAULT)
 		return err;
 	if (is_global) {
@@ -12948,12 +12979,19 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 				mark_reg_known_zero(env, regs, i);
 			else if (regs[i].type == SCALAR_VALUE)
 				mark_reg_unknown(env, regs, i);
+			else if (base_type(regs[i].type) == PTR_TO_MEM) {
+				u32 mem_size = regs[i].mem_size;
+
+				mark_reg_known_zero(env, regs, i);
+				regs[i].mem_size = mem_size;
+				regs[i].id = ++env->id_gen;
+			}
 		}
 	} else {
 		/* 1st arg to a function */
 		regs[BPF_REG_1].type = PTR_TO_CTX;
 		mark_reg_known_zero(env, regs, BPF_REG_1);
-		ret = btf_check_func_arg_match(env, subprog, regs);
+		ret = btf_check_subprog_arg_match(env, subprog, regs);
 		if (ret == -EFAULT)
 			/* unlikely verifier bug. abort.
 			 * ret == 0 and ret < 0 are sadly acceptable for
@@ -13381,6 +13419,19 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 	return 0;
 }
 
+BTF_SET_START(btf_id_deny)
+BTF_ID_UNUSED
+#ifdef CONFIG_SMP
+BTF_ID(func, migrate_disable)
+BTF_ID(func, migrate_enable)
+#endif
+#if defined(CONFIG_PREEMPT) && (defined(CONFIG_DEBUG_PREEMPT) || \
+			       defined(CONFIG_TRACE_PREEMPT_TOGGLE))
+BTF_ID(func, preempt_count_add)
+BTF_ID(func, preempt_count_sub)
+#endif
+BTF_SET_END(btf_id_deny)
+
 static int check_attach_btf_id(struct bpf_verifier_env *env)
 {
 	struct bpf_prog *prog = env->prog;
@@ -13447,6 +13498,11 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 		ret = bpf_lsm_verify_prog(&env->log, prog);
 		if (ret < 0)
 			return ret;
+	} else if (!tgt_prog && prog->type == BPF_PROG_TYPE_TRACING &&
+		   prog->aux->attach_btf == btf_vmlinux &&
+		   btf_id_set_contains(&btf_id_deny, btf_id)) {
+		verbose(env, "Tracing this kernel function is prohibited\n");
+		return -EINVAL;
 	}
 
 	key = bpf_trampoline_compute_key(tgt_prog, prog->aux->attach_btf,

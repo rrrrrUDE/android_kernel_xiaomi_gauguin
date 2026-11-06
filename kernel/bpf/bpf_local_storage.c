@@ -6,10 +6,9 @@
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/bpf.h>
+#include <linux/filter.h>
 #include <linux/btf_ids.h>
 #include <linux/bpf_local_storage.h>
-#include <net/sock.h>
-#include <uapi/linux/sock_diag.h>
 #include <uapi/linux/btf.h>
 
 #define BPF_LOCAL_STORAGE_CREATE_FLAG_MASK (BPF_F_NO_PREALLOC | BPF_F_CLONE)

@@ -26,7 +26,11 @@ c = r'''
 '''
 c += enum('bpf_type_flag') + enum('bpf_reg_type')
 c += r'''
-struct map { int key_size; };
+typedef unsigned int u32;
+#define BPF_MAP_TYPE_XSKMAP 1
+#define BPF_MAP_TYPE_SOCKMAP 2
+#define BPF_MAP_TYPE_SOCKHASH 3
+struct map { int key_size, map_type, deny_write; void *inner_map_meta; };
 struct bpf_reg_state { int type, off, mem_size; struct map *map_ptr; };
 struct aux { unsigned max_rdonly_access, max_rdwr_access; };
 struct prog { struct aux *aux; };
@@ -37,7 +41,7 @@ struct bpf_call_arg_meta { bool raw_mode, mem_rdonly; };
 #define BPF_READ 0
 #define ACCESS_HELPER 0
 #define check_packet_access(...) 0
-#define check_map_access_type(...) 0
+#define check_map_access_type(e,r,o,n,t) ((t)==BPF_WRITE && (e)->regs[r].map_ptr->deny_write ? -EACCES : 0)
 #define check_map_access(...) 0
 #define check_mem_region_access(e,r,o,n,z,zero) ((n) <= (z) ? 0 : -EACCES)
 #define check_stack_range_initialized(...) 0
@@ -68,7 +72,26 @@ int main(void) {
  e.regs[1].type=PTR_TO_BUF;
  assert(check_helper_mem_access(&e,1,12,false,&m)==0);
  assert(aux.max_rdwr_access==12);
- puts("PASS: helper memory modifier dispatch and access checks");
+ struct bpf_reg_state saved;
+ e.regs[1].type=PTR_TO_MEM|PTR_MAYBE_NULL;
+ e.regs[1].mem_size=16;
+ saved=e.regs[1];
+ assert(check_mem_reg(&e,&e.regs[1],1,16)==0);
+ assert(e.regs[1].type==saved.type && e.regs[1].mem_size==saved.mem_size);
+ assert(check_mem_reg(&e,&e.regs[1],1,17)==-EACCES);
+ assert(e.regs[1].type==saved.type);
+ e.regs[1].type=PTR_TO_MEM|MEM_RDONLY;
+ assert(check_mem_reg(&e,&e.regs[1],1,8)==-EACCES);
+ e.regs[1].type=PTR_TO_MAP_KEY;
+ assert(check_mem_reg(&e,&e.regs[1],1,8)==-EACCES);
+ struct map map={.map_type=BPF_MAP_TYPE_SOCKMAP};
+ e.regs[1].type=PTR_TO_MAP_VALUE|PTR_MAYBE_NULL;
+ e.regs[1].map_ptr=&map;
+ assert(check_mem_reg(&e,&e.regs[1],1,8)==-EACCES);
+ map.map_type=0; map.deny_write=1;
+ assert(check_mem_reg(&e,&e.regs[1],1,8)==-EACCES);
+ assert(e.regs[1].type==(PTR_TO_MAP_VALUE|PTR_MAYBE_NULL));
+ puts("PASS: helper and global subprogram memory bounds, readonly rejection and caller restoration");
 }
 '''
 # Variable-size input must retain readonly metadata when disabling raw mode.

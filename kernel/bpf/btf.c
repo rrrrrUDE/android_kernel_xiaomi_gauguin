@@ -5462,13 +5462,15 @@ int btf_check_type_match(struct bpf_verifier_log *log, const struct bpf_prog *pr
  * EFAULT - there is a verifier bug. Abort verification.
  * EINVAL - there is a type mismatch or BTF is not available.
  * 0 - BTF matches with what bpf_reg_state expects.
- * Only PTR_TO_CTX and SCALAR_VALUE states are recognized.
+ * Global functions additionally accept BTF-sized, initialized memory.
  */
-int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
+int btf_check_subprog_arg_match(struct bpf_verifier_env *env, int subprog,
 			     struct bpf_reg_state *reg)
 {
 	struct bpf_verifier_log *log = &env->log;
 	struct bpf_prog *prog = env->prog;
+	enum bpf_prog_type prog_type = prog->type == BPF_PROG_TYPE_EXT ?
+		prog->aux->dst_prog->type : prog->type;
 	struct btf *btf = prog->aux->btf;
 	const struct btf_param *args;
 	const struct btf_type *t;
@@ -5521,14 +5523,16 @@ int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
 			goto out;
 		}
 		if (btf_type_is_ptr(t)) {
-			if (reg[i + 1].type == SCALAR_VALUE) {
+			if (reg[i + 1].type == SCALAR_VALUE &&
+			    (reg[i + 1].var_off.value ||
+			     !tnum_is_const(reg[i + 1].var_off))) {
 				bpf_log(log, "R%d is not a pointer\n", i + 1);
 				goto out;
 			}
 			/* If function expects ctx type in BTF check that caller
 			 * is passing PTR_TO_CTX.
 			 */
-			if (btf_get_prog_ctx_type(log, btf, t, prog->type, i)) {
+			if (btf_get_prog_ctx_type(log, btf, t, prog_type, i)) {
 				if (reg[i + 1].type != PTR_TO_CTX) {
 					bpf_log(log,
 						"arg#%d expected pointer to ctx, but got %s\n",
@@ -5536,6 +5540,16 @@ int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
 					goto out;
 				}
 				if (check_ctx_reg(env, &reg[i + 1], i + 1))
+					goto out;
+				continue;
+			}
+			if (prog->aux->func_info_aux[subprog].linkage == BTF_FUNC_GLOBAL) {
+				const struct btf_type *ref;
+				u32 size;
+
+				ref = btf_type_skip_modifiers(btf, t->type, NULL);
+				if (!ref || IS_ERR(btf_resolve_size(btf, ref, &size)) ||
+				    check_mem_reg(env, &reg[i + 1], i + 1, size))
 					goto out;
 				continue;
 			}
@@ -5684,17 +5698,17 @@ int btf_check_kfunc_arg_match(struct bpf_verifier_env *env,
  * EFAULT - there is a verifier bug. Abort verification.
  * EINVAL - cannot convert BTF.
  * 0 - Successfully converted BTF into bpf_reg_state
- * (either PTR_TO_CTX or SCALAR_VALUE).
+ * (PTR_TO_CTX, SCALAR_VALUE, or nullable PTR_TO_MEM).
  */
 int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
-			  struct bpf_reg_state *reg)
+			  struct bpf_reg_state *regs)
 {
 	struct bpf_verifier_log *log = &env->log;
 	struct bpf_prog *prog = env->prog;
 	enum bpf_prog_type prog_type = prog->type;
 	struct btf *btf = prog->aux->btf;
 	const struct btf_param *args;
-	const struct btf_type *t;
+	const struct btf_type *t, *ref_t;
 	u32 i, nargs, btf_id;
 	const char *tname;
 
@@ -5740,8 +5754,8 @@ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
 	args = (const struct btf_param *)(t + 1);
 	nargs = btf_type_vlen(t);
 	if (nargs > 5) {
-		bpf_log(log, "Global function %s() with %d > 5 args. Buggy compiler.\n",
-			tname, nargs);
+		bpf_log(log, "Global function %s() with %d > %d args. Buggy compiler.\n",
+			tname, nargs, 5);
 		return -EINVAL;
 	}
 	/* check that function returns int */
@@ -5755,19 +5769,38 @@ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
 		return -EINVAL;
 	}
 	/* Convert BTF function arguments into verifier types.
-	 * Only PTR_TO_CTX and SCALAR are supported atm.
+	 * Context, scalar, and BTF-sized nullable memory arguments are supported.
 	 */
 	for (i = 0; i < nargs; i++) {
+		struct bpf_reg_state *reg = &regs[i + 1];
+
 		t = btf_type_by_id(btf, args[i].type);
 		while (btf_type_is_modifier(t))
 			t = btf_type_by_id(btf, t->type);
 		if (btf_type_is_int(t) || btf_type_is_enum(t)) {
-			reg[i + 1].type = SCALAR_VALUE;
+			reg->type = SCALAR_VALUE;
 			continue;
 		}
-		if (btf_type_is_ptr(t) &&
-		    btf_get_prog_ctx_type(log, btf, t, prog_type, i)) {
-			reg[i + 1].type = PTR_TO_CTX;
+		if (btf_type_is_ptr(t)) {
+			if (btf_get_prog_ctx_type(log, btf, t, prog_type, i)) {
+				reg->type = PTR_TO_CTX;
+				continue;
+			}
+
+			t = btf_type_skip_modifiers(btf, t->type, NULL);
+
+			ref_t = btf_resolve_size(btf, t, &reg->mem_size);
+			if (IS_ERR(ref_t)) {
+				bpf_log(log,
+				    "arg#%d reference type('%s %s') size cannot be determined: %ld\n",
+				    i, btf_type_str(t), btf_name_by_offset(btf, t->name_off),
+					PTR_ERR(ref_t));
+				return -EINVAL;
+			}
+
+			reg->type = PTR_TO_MEM | PTR_MAYBE_NULL;
+			reg->id = ++env->id_gen;
+
 			continue;
 		}
 		bpf_log(log, "Arg#%d type %s in %s() is not supported yet.\n",

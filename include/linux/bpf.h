@@ -1611,7 +1611,7 @@ static inline bool unprivileged_ebpf_enabled(void)
 }
 
 struct bpf_reg_state;
-int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
+int btf_check_subprog_arg_match(struct bpf_verifier_env *env, int subprog,
 			     struct bpf_reg_state *regs);
 int btf_check_kfunc_arg_match(struct bpf_verifier_env *env,
 			      const struct btf *btf, u32 func_id,

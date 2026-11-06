@@ -1143,6 +1143,11 @@ void bpf_prog_kallsyms_del(struct bpf_prog *fp);
 
 #else /* CONFIG_BPF_JIT */
 
+static inline bool bpf_jit_blinding_enabled(struct bpf_prog *prog)
+{
+	return false;
+}
+
 static inline bool ebpf_jit_enabled(void)
 {
 	return false;

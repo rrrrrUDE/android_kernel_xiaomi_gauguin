@@ -1784,6 +1784,9 @@ union bpf_attr {
  *		  **BPF_F_ADJ_ROOM_ENCAP_L4_UDP**:
  *		  Use with ENCAP_L3 flags to further specify the tunnel type.
  *
+ *		* **BPF_F_ADJ_ROOM_ENCAP_L2_ETH**: The inner L2 header is
+ *		  Ethernet; use with **BPF_F_ADJ_ROOM_ENCAP_L2**.
+ *
  *		* **BPF_F_ADJ_ROOM_ENCAP_L2**\ (*len*):
  *		  Use with ENCAP_L3/L4 flags to further specify the tunnel
  *		  type; *len* is the length of the inner MAC header.
@@ -4068,6 +4071,7 @@ enum {
 	BPF_F_ADJ_ROOM_ENCAP_L4_GRE	= (1ULL << 3),
 	BPF_F_ADJ_ROOM_ENCAP_L4_UDP	= (1ULL << 4),
 	BPF_F_ADJ_ROOM_NO_CSUM_RESET	= (1ULL << 5),
+	BPF_F_ADJ_ROOM_ENCAP_L2_ETH	= (1ULL << 6),
 };
 
 enum {
