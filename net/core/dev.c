@@ -4607,7 +4607,7 @@ static u32 netif_receive_generic_xdp(struct sk_buff *skb,
 {
 	u32 act = XDP_DROP;
 
-	if (skb_is_tc_redirected(skb))
+	if (skb->xdp_redirected || skb_is_tc_redirected(skb))
 		return XDP_PASS;
 
 	if (skb_cloned(skb) || skb_is_nonlinear(skb) ||
@@ -5059,6 +5059,7 @@ another_round:
 		}
 		skb_reset_mac_len(skb);
 	}
+	skb->xdp_redirected = 0;
 
 	if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
 	    skb->protocol == cpu_to_be16(ETH_P_8021AD)) {

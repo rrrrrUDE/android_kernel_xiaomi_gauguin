@@ -18,7 +18,9 @@
 
 #define pr_fmt(fmt) "bpf_jit: " fmt
 
+#include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/extable.h>
 #include <linux/filter.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
@@ -70,6 +72,7 @@ struct jit_ctx {
 	int *offset;
 	__le32 *image;
 	u32 stack_size;
+	int exentry_idx;
 };
 
 static inline void emit(const u32 insn, struct jit_ctx *ctx)
@@ -134,9 +137,93 @@ static inline void emit_a64_mov_i64(const int reg, const u64 val,
 	}
 }
 
-/* A small trampoline for struct_ops callbacks.  Function tracing also needs
- * arch text patching and an original-call path, which this JIT lacks.
+/* Direct ftrace enters with x9 holding the original LR and x30 the
+ * address following the patched BL.  Preserve both across BPF calls.
  */
+static int prepare_fentry_trampoline(void *image, void *image_end,
+				     const struct btf_func_model *m,
+				     u32 flags, struct bpf_tramp_progs *tprogs,
+				     void *orig_call)
+{
+	struct jit_ctx ctx = { .image = image };
+	bool ip_arg = flags & BPF_TRAMP_F_IP_ARG;
+	unsigned int nr = tprogs[BPF_TRAMP_FENTRY].nr_progs;
+	unsigned int ctx_off = ip_arg ? sizeof(u64) : 0;
+	unsigned int stack_size = 80;
+	int i;
+
+	if (!orig_call || m->nr_args > 8 ||
+	    flags & ~(BPF_TRAMP_F_RESTORE_REGS | BPF_TRAMP_F_IP_ARG) ||
+	    !(flags & BPF_TRAMP_F_RESTORE_REGS) ||
+	    tprogs[BPF_TRAMP_FEXIT].nr_progs ||
+	    tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs ||
+	    (u8 *)image_end - (u8 *)image < (100 + nr * 40) * sizeof(u32))
+		return -ENOTSUPP;
+	for (i = 0; i < m->nr_args; i++)
+		if (m->arg_size[i] != 1 && m->arg_size[i] != 2 &&
+		    m->arg_size[i] != 4 && m->arg_size[i] != 8)
+			return -ENOTSUPP;
+	for (i = 0; i < nr; i++)
+		if (!tprogs[BPF_TRAMP_FENTRY].progs[i]->jited)
+			return -ENOTSUPP;
+
+	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), &ctx);
+	emit(A64_MOV(1, A64_FP, A64_SP), &ctx);
+	emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), &ctx);
+	emit(A64_PUSH(A64_R(9), A64_ZR, A64_SP), &ctx);
+	emit(A64_SUB_I(1, A64_SP, A64_SP, stack_size), &ctx);
+	/* Preserve all argument registers, including the indirect result x8. */
+	for (i = 0; i < 9; i++) {
+		emit_a64_mov_i(1, A64_R(10), ctx_off + i * 8, &ctx);
+		if (i < m->nr_args && m->arg_size[i] < sizeof(u64)) {
+			emit(A64_UBFM(1, A64_R(11), i, 0,
+				      m->arg_size[i] * 8 - 1), &ctx);
+			emit(A64_STR64(A64_R(11), A64_SP, A64_R(10)), &ctx);
+		} else {
+			emit(A64_STR64(i, A64_SP, A64_R(10)), &ctx);
+		}
+	}
+	if (ip_arg) {
+		emit_a64_mov_i64(A64_R(10), (unsigned long)orig_call, &ctx);
+		emit(A64_STR64(A64_R(10), A64_SP, A64_ZR), &ctx);
+	}
+	for (i = 0; i < nr; i++) {
+		struct bpf_prog *prog = tprogs[BPF_TRAMP_FENTRY].progs[i];
+		bool sleepable = prog->aux->sleepable;
+
+		emit_a64_mov_i64(A64_R(19), (unsigned long)prog, &ctx);
+		emit_a64_mov_i64(A64_R(10), sleepable ?
+			(unsigned long)__bpf_prog_enter_sleepable :
+			(unsigned long)__bpf_prog_enter, &ctx);
+		emit(A64_BLR(A64_R(10)), &ctx);
+		emit(A64_MOV(1, A64_R(20), A64_R(0)), &ctx);
+		emit(A64_ADD_I(1, A64_R(0), A64_SP, ctx_off), &ctx);
+		emit_a64_mov_i64(A64_R(10), (unsigned long)prog->bpf_func, &ctx);
+		emit(A64_BLR(A64_R(10)), &ctx);
+		emit(A64_MOV(1, A64_R(0), A64_R(19)), &ctx);
+		emit(A64_MOV(1, A64_R(1), A64_R(20)), &ctx);
+		emit_a64_mov_i64(A64_R(10), sleepable ?
+			(unsigned long)__bpf_prog_exit_sleepable :
+			(unsigned long)__bpf_prog_exit, &ctx);
+		emit(A64_BLR(A64_R(10)), &ctx);
+	}
+	for (i = 0; i < 9; i++) {
+		emit_a64_mov_i(1, A64_R(10), ctx_off + i * 8, &ctx);
+		emit(A64_LDR64(i, A64_SP, A64_R(10)), &ctx);
+	}
+	emit(A64_ADD_I(1, A64_SP, A64_SP, stack_size), &ctx);
+	emit(A64_POP(A64_R(9), A64_ZR, A64_SP), &ctx);
+	emit(A64_POP(A64_R(19), A64_R(20), A64_SP), &ctx);
+	emit(A64_POP(A64_FP, A64_LR, A64_SP), &ctx);
+	emit(A64_MOV(1, A64_R(10), A64_LR), &ctx);
+	emit(A64_MOV(1, A64_LR, A64_R(9)), &ctx);
+	emit(A64_RET(A64_R(10)), &ctx);
+	flush_icache_range((unsigned long)image,
+			   (unsigned long)image + ctx.idx * sizeof(u32));
+	return ctx.idx * sizeof(u32);
+}
+
+/* Struct_ops callbacks use a normal AAPCS entry. */
 int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
 				void *image_end, const struct btf_func_model *m,
 				u32 flags, struct bpf_tramp_progs *tprogs,
@@ -145,6 +232,10 @@ int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
 	struct bpf_prog *prog;
 	struct jit_ctx ctx = { .image = image };
 	int i;
+
+	if (im && orig_call)
+		return prepare_fentry_trampoline(image, image_end, m, flags,
+					     tprogs, orig_call);
 
 	if (im || orig_call ||
 	    (flags != 0 && flags != BPF_TRAMP_F_RET_FENTRY_RET) ||
@@ -412,6 +503,67 @@ static void build_epilogue(struct jit_ctx *ctx)
 	emit(A64_RET(A64_LR), ctx);
 }
 
+#define BPF_FIXUP_OFFSET_MASK	GENMASK(26, 0)
+#define BPF_FIXUP_REG_MASK	GENMASK(31, 27)
+
+int arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
+			      struct pt_regs *regs)
+{
+	off_t offset = FIELD_GET(BPF_FIXUP_OFFSET_MASK, ex->fixup);
+	int dst_reg = FIELD_GET(BPF_FIXUP_REG_MASK, ex->fixup);
+
+	regs->regs[dst_reg] = 0;
+	regs->pc = (unsigned long)&ex->fixup - offset;
+	return 1;
+}
+
+/* For accesses to BTF pointers, add an entry to the exception table */
+static int add_exception_handler(const struct bpf_insn *insn,
+				 struct jit_ctx *ctx,
+				 int dst_reg)
+{
+	off_t offset;
+	unsigned long pc;
+	struct exception_table_entry *ex;
+
+	if (!ctx->image)
+		/* First pass */
+		return 0;
+
+	if (BPF_MODE(insn->code) != BPF_PROBE_MEM)
+		return 0;
+
+	if (!ctx->prog->aux->extable ||
+	    WARN_ON_ONCE(ctx->exentry_idx >= ctx->prog->aux->num_exentries))
+		return -EINVAL;
+
+	ex = &ctx->prog->aux->extable[ctx->exentry_idx];
+	pc = (unsigned long)&ctx->image[ctx->idx - 1];
+
+	offset = pc - (long)&ex->insn;
+	if (WARN_ON_ONCE(offset >= 0 || offset < INT_MIN))
+		return -ERANGE;
+	ex->insn = offset;
+
+	/*
+	 * Since the extable follows the program, the fixup offset is always
+	 * negative and limited to BPF_JIT_REGION_SIZE. Store a positive value
+	 * to keep things simple, and put the destination register in the upper
+	 * bits. We don't need to worry about buildtime or runtime sort
+	 * modifying the upper bits because the table is already sorted, and
+	 * isn't part of the main exception table.
+	 */
+	offset = (long)&ex->fixup - (pc + AARCH64_INSN_SIZE);
+	if (!FIELD_FIT(BPF_FIXUP_OFFSET_MASK, offset))
+		return -ERANGE;
+
+	ex->fixup = FIELD_PREP(BPF_FIXUP_OFFSET_MASK, offset) |
+		    FIELD_PREP(BPF_FIXUP_REG_MASK, dst_reg);
+
+	ctx->exentry_idx++;
+	return 0;
+}
+
 /* JITs an eBPF instruction.
  * Returns:
  * 0  - successfully JITed an 8-byte eBPF instruction.
@@ -433,6 +585,7 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx)
 	const bool isdw = BPF_SIZE(code) == BPF_DW;
 	u8 jmp_cond, reg;
 	s32 jmp_offset;
+	int ret;
 
 #define check_imm(bits, imm) do {				\
 	if ((((imm) > 0) && ((imm) >> (bits))) ||		\
@@ -738,6 +891,10 @@ emit_cond_jmp:
 	case BPF_LDX | BPF_MEM | BPF_H:
 	case BPF_LDX | BPF_MEM | BPF_B:
 	case BPF_LDX | BPF_MEM | BPF_DW:
+	case BPF_LDX | BPF_PROBE_MEM | BPF_W:
+	case BPF_LDX | BPF_PROBE_MEM | BPF_H:
+	case BPF_LDX | BPF_PROBE_MEM | BPF_B:
+	case BPF_LDX | BPF_PROBE_MEM | BPF_DW:
 		emit_a64_mov_i(1, tmp, off, ctx);
 		switch (BPF_SIZE(code)) {
 		case BPF_W:
@@ -753,6 +910,9 @@ emit_cond_jmp:
 			emit(A64_LDR64(dst, src, tmp), ctx);
 			break;
 		}
+		ret = add_exception_handler(insn, ctx, dst);
+		if (ret)
+			return ret;
 		break;
 
 	/* speculation barrier */
@@ -909,7 +1069,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	bool tmp_blinded = false;
 	bool extra_pass = false;
 	struct jit_ctx ctx;
-	int image_size;
+	int image_size, prog_size, extable_size, body_size, i;
 	u8 *image_ptr;
 
 	if (!prog->jit_requested)
@@ -940,7 +1100,10 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		image_ptr = jit_data->image;
 		header = jit_data->header;
 		extra_pass = true;
-		image_size = sizeof(u32) * ctx.idx;
+		prog_size = sizeof(u32) * ctx.idx;
+		extable_size = prog->aux->num_exentries *
+			sizeof(struct exception_table_entry);
+		image_size = prog_size + extable_size;
 		goto skip_init_ctx;
 	}
 	memset(&ctx, 0, sizeof(ctx));
@@ -959,17 +1122,24 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		prog = orig_prog;
 		goto out_off;
 	}
+	body_size = ctx.idx;
 
 	if (build_prologue(&ctx, was_classic)) {
 		prog = orig_prog;
 		goto out_off;
 	}
+	/* Offsets were measured before the prologue in this 4.19 JIT. */
+	for (i = 0; i < prog->len; i++)
+		ctx.offset[i] += ctx.idx - body_size;
 
 	ctx.epilogue_offset = ctx.idx;
 	build_epilogue(&ctx);
 
 	/* Now we know the actual image size. */
-	image_size = sizeof(u32) * ctx.idx;
+	prog_size = sizeof(u32) * ctx.idx;
+	extable_size = prog->aux->num_exentries *
+		sizeof(struct exception_table_entry);
+	image_size = prog_size + extable_size;
 	header = bpf_jit_binary_alloc(image_size, &image_ptr,
 				      sizeof(u32), jit_fill_hole);
 	if (header == NULL) {
@@ -980,8 +1150,11 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	/* 2. Now, the actual pass. */
 
 	ctx.image = (__le32 *)image_ptr;
+	if (extable_size)
+		prog->aux->extable = (void *)image_ptr + prog_size;
 skip_init_ctx:
 	ctx.idx = 0;
+	ctx.exentry_idx = 0;
 
 	build_prologue(&ctx, was_classic);
 
@@ -1002,7 +1175,7 @@ skip_init_ctx:
 
 	/* And we're done. */
 	if (bpf_jit_enable > 1)
-		bpf_jit_dump(prog->len, image_size, 2, ctx.image);
+		bpf_jit_dump(prog->len, prog_size, 2, ctx.image);
 
 	bpf_flush_icache(header, ctx.image + ctx.idx);
 
@@ -1026,9 +1199,14 @@ skip_init_ctx:
 	}
 	prog->bpf_func = (void *)ctx.image;
 	prog->jited = 1;
-	prog->jited_len = image_size;
+	prog->jited_len = prog_size;
 
 	if (!prog->is_func || extra_pass) {
+		int i;
+
+		for (i = 0; i < prog->len; i++)
+			ctx.offset[i] *= AARCH64_INSN_SIZE;
+		bpf_prog_fill_jited_linfo(prog, ctx.offset);
 out_off:
 		kfree(ctx.offset);
 		kfree(jit_data);

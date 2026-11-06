@@ -20,6 +20,7 @@
 
 #include <linux/bitops.h>
 #include <linux/elf.h>
+#include <linux/ftrace.h>
 #include <linux/gfp.h>
 #include <linux/kasan.h>
 #include <linux/kernel.h>
@@ -454,10 +455,16 @@ int module_finalize(const Elf_Ehdr *hdr,
 	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
 		if (strcmp(".altinstructions", secstrs + s->sh_name) == 0)
 			apply_alternatives_module((void *)s->sh_addr, s->sh_size);
-#ifdef CONFIG_ARM64_MODULE_PLTS
-		if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE) &&
-		    !strcmp(".text.ftrace_trampoline", secstrs + s->sh_name))
-			me->arch.ftrace_trampoline = (void *)s->sh_addr;
+#if defined(CONFIG_ARM64_MODULE_PLTS) && defined(CONFIG_DYNAMIC_FTRACE)
+		if (!strcmp(".text.ftrace_trampoline", secstrs + s->sh_name)) {
+			struct plt_entry *plts = (void *)s->sh_addr;
+
+			plts[FTRACE_PLT_IDX] = get_plt_entry(FTRACE_ADDR);
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
+			plts[FTRACE_REGS_PLT_IDX] = get_plt_entry(FTRACE_REGS_ADDR);
+#endif
+			me->arch.ftrace_trampoline = plts;
+		}
 #endif
 	}
 

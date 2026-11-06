@@ -783,6 +783,8 @@ struct sk_buff {
 #endif
 	__u8			ipvs_property:1;
 
+	/* Skip the ingress XDP program once after a CPUMAP redirect. */
+	__u8			xdp_redirected:1;
 	__u8			inner_protocol_type:1;
 	__u8			remcsum_offload:1;
 #ifdef CONFIG_NET_SWITCHDEV

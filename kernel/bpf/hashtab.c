@@ -1746,6 +1746,7 @@ again_nocopy:
 	while (node_to_free) {
 		l = node_to_free;
 		node_to_free = node_to_free->batch_flink;
+		check_and_free_timer(htab, l);
 		bpf_lru_push_free(&htab->lru, &l->lru_node);
 	}
 
