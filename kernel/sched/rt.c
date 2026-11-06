@@ -1743,8 +1743,8 @@ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
 
 static int pick_rt_task(struct rq *rq, struct task_struct *p, int cpu)
 {
-	if (!task_running(rq, p) &&
-	    cpumask_test_cpu(cpu, &p->cpus_allowed))
+	if (!task_running(rq, p) && !is_migration_disabled(p) &&
+	    cpumask_test_cpu(cpu, p->cpus_ptr))
 		return 1;
 
 	return 0;
@@ -1887,7 +1887,7 @@ static int find_lowest_rq(struct task_struct *task)
 	if (unlikely(!lowest_mask))
 		return -1;
 
-	if (task->nr_cpus_allowed == 1)
+	if (task->nr_cpus_allowed == 1 || is_migration_disabled(task))
 		return -1; /* No other targets possible */
 
 	if (!cpupri_find(&task_rq(task)->rd->cpupri, task, lowest_mask))
@@ -1991,7 +1991,8 @@ static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 			 * Also make sure that it wasn't scheduled on its rq.
 			 */
 			if (unlikely(task_rq(task) != rq ||
-				     !cpumask_test_cpu(lowest_rq->cpu, &task->cpus_allowed) ||
+				     is_migration_disabled(task) ||
+				     !cpumask_test_cpu(lowest_rq->cpu, task->cpus_ptr) ||
 				     task_running(rq, task) ||
 				     !rt_task(task) ||
 				     !task_on_rq_queued(task))) {
@@ -2049,7 +2050,7 @@ static int push_rt_task(struct rq *rq)
 		return 0;
 
 	next_task = pick_next_pushable_task(rq);
-	if (!next_task)
+	if (!next_task || is_migration_disabled(next_task))
 		return 0;
 
 retry:

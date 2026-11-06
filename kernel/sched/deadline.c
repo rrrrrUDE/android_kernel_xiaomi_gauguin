@@ -540,7 +540,7 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 		 * If we cannot preempt any rq, fall back to pick any
 		 * online CPU:
 		 */
-		cpu = cpumask_any_and(cpu_active_mask, &p->cpus_allowed);
+		cpu = cpumask_any_and(cpu_active_mask, p->cpus_ptr);
 		if (cpu >= nr_cpu_ids) {
 			/*
 			 * Failed to find any suitable CPU.
@@ -1884,8 +1884,8 @@ static void set_curr_task_dl(struct rq *rq)
 
 static int pick_dl_task(struct rq *rq, struct task_struct *p, int cpu)
 {
-	if (!task_running(rq, p) &&
-	    cpumask_test_cpu(cpu, &p->cpus_allowed))
+	if (!task_running(rq, p) && !is_migration_disabled(p) &&
+	    cpumask_test_cpu(cpu, p->cpus_ptr))
 		return 1;
 	return 0;
 }
@@ -1929,7 +1929,7 @@ static int find_later_rq(struct task_struct *task)
 	if (unlikely(!later_mask))
 		return -1;
 
-	if (task->nr_cpus_allowed == 1)
+	if (task->nr_cpus_allowed == 1 || is_migration_disabled(task))
 		return -1;
 
 	/*
@@ -2035,7 +2035,8 @@ static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq)
 		/* Retry if something changed. */
 		if (double_lock_balance(rq, later_rq)) {
 			if (unlikely(task_rq(task) != rq ||
-				     !cpumask_test_cpu(later_rq->cpu, &task->cpus_allowed) ||
+				     is_migration_disabled(task) ||
+				     !cpumask_test_cpu(later_rq->cpu, task->cpus_ptr) ||
 				     task_running(rq, task) ||
 				     !dl_task(task) ||
 				     !task_on_rq_queued(task))) {
@@ -2098,7 +2099,7 @@ static int push_dl_task(struct rq *rq)
 		return 0;
 
 	next_task = pick_next_pushable_dl_task(rq);
-	if (!next_task)
+	if (!next_task || is_migration_disabled(next_task))
 		return 0;
 
 retry:
@@ -2288,11 +2289,15 @@ static void task_woken_dl(struct rq *rq, struct task_struct *p)
 }
 
 static void set_cpus_allowed_dl(struct task_struct *p,
-				const struct cpumask *new_mask)
+				const struct cpumask *new_mask, u32 flags)
 {
 	struct root_domain *src_rd;
 	struct rq *rq;
 
+	if (flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
+		set_cpus_allowed_common(p, new_mask, flags);
+		return;
+	}
 	BUG_ON(!dl_task(p));
 
 	rq = task_rq(p);
@@ -2317,7 +2322,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 		raw_spin_unlock(&src_dl_b->lock);
 	}
 
-	set_cpus_allowed_common(p, new_mask);
+	set_cpus_allowed_common(p, new_mask, flags);
 }
 
 /* Assumes rq->lock is held */

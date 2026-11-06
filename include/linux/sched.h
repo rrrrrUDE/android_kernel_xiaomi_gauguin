@@ -932,6 +932,9 @@ struct task_struct {
 	unsigned int			policy;
 	int				nr_cpus_allowed;
 	cpumask_t			cpus_allowed;
+	const struct cpumask		*cpus_ptr;
+	unsigned int			migration_disabled;
+	struct set_affinity_pending	*migration_pending;
 	cpumask_t			cpus_requested;
 
 #ifdef CONFIG_PREEMPT_RCU

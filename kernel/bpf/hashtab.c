@@ -161,8 +161,8 @@ static inline int htab_lock_bucket(const struct bpf_htab *htab,
 		preempt_disable();
 	else
 		migrate_disable();
-	if (unlikely(__this_cpu_inc_return(*htab->map_locked[hash]) != 1)) {
-		__this_cpu_dec(*htab->map_locked[hash]);
+	if (unlikely(this_cpu_inc_return(*htab->map_locked[hash]) != 1)) {
+		this_cpu_dec(*htab->map_locked[hash]);
 		if (raw)
 			preempt_enable();
 		else
@@ -189,7 +189,7 @@ static inline void htab_unlock_bucket(const struct bpf_htab *htab,
 		raw_spin_unlock_irqrestore(&b->raw_lock, flags);
 	else
 		spin_unlock_irqrestore(&b->lock, flags);
-	__this_cpu_dec(*htab->map_locked[hash]);
+	this_cpu_dec(*htab->map_locked[hash]);
 	if (raw)
 		preempt_enable();
 	else

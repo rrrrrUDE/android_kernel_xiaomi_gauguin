@@ -254,11 +254,11 @@ extern void __cant_sleep(const char *file, int line, int preempt_offset);
 
 #define might_sleep_if(cond) do { if (cond) might_sleep(); } while (0)
 
-#ifndef CONFIG_PREEMPT_RT
-# define cant_migrate()		cant_sleep()
+#ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+extern void __cant_migrate(const char *file, int line);
+#define cant_migrate() do { __cant_migrate(__FILE__, __LINE__); } while (0)
 #else
-  /* Placeholder for now */
-# define cant_migrate()		do { } while (0)
+#define cant_migrate() do { } while (0)
 #endif
 
 /**

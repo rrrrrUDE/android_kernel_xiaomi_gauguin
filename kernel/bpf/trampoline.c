@@ -559,11 +559,13 @@ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
 	     * Hence check that 'start' is not zero.
 	     */
 	    start) {
+		preempt_disable();
 		stats = this_cpu_ptr(prog->aux->stats);
 		u64_stats_update_begin(&stats->syncp);
 		stats->cnt++;
 		stats->nsecs += sched_clock() - start;
 		u64_stats_update_end(&stats->syncp);
+		preempt_enable();
 	}
 	migrate_enable();
 	rcu_read_unlock();
@@ -572,11 +574,13 @@ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
 void notrace __bpf_prog_enter_sleepable(void)
 {
 	rcu_read_lock_trace();
+	migrate_disable();
 	might_fault();
 }
 
 void notrace __bpf_prog_exit_sleepable(void)
 {
+	migrate_enable();
 	rcu_read_unlock_trace();
 }
 

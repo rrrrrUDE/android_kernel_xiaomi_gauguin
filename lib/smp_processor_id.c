@@ -15,7 +15,7 @@ notrace static unsigned int check_preemption_disabled(const char *what1,
 	if (likely(preempt_count()))
 		goto out;
 
-	if (irqs_disabled())
+	if (irqs_disabled() || READ_ONCE(current->migration_disabled))
 		goto out;
 
 	/*

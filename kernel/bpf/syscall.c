@@ -4762,10 +4762,6 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 	return err;
 }
 
-/* This 4.19 tree has no sleepable migrate_disable().  Syscall programs
- * therefore expose only helpers that do not require a stable CPU while the
- * program sleeps.  The test-run path invokes the program without pinning it.
- */
 static bool syscall_prog_is_valid_access(int off, int size,
 					 enum bpf_access_type type,
 					 const struct bpf_prog *prog,
@@ -4794,9 +4790,15 @@ static const struct bpf_func_proto bpf_sys_bpf_proto = {
 	.gpl_only	= false,
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_ANYTHING,
-	.arg2_type	= ARG_PTR_TO_MEM,
+	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
 	.arg3_type	= ARG_CONST_SIZE,
 };
+
+const struct bpf_func_proto * __weak
+tracing_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	return bpf_base_func_proto(func_id);
+}
 
 BPF_CALL_1(bpf_sys_close, u32, fd)
 {
@@ -4814,22 +4816,6 @@ static const struct bpf_func_proto *
 syscall_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
 	switch (func_id) {
-	case BPF_FUNC_map_lookup_elem:
-		return &bpf_map_lookup_elem_proto;
-	case BPF_FUNC_map_update_elem:
-		return &bpf_map_update_elem_proto;
-	case BPF_FUNC_map_delete_elem:
-		return &bpf_map_delete_elem_proto;
-	case BPF_FUNC_ktime_get_ns:
-		return &bpf_ktime_get_ns_proto;
-	case BPF_FUNC_ktime_get_boot_ns:
-		return &bpf_ktime_get_boot_ns_proto;
-	case BPF_FUNC_get_current_pid_tgid:
-		return &bpf_get_current_pid_tgid_proto;
-	case BPF_FUNC_get_current_uid_gid:
-		return &bpf_get_current_uid_gid_proto;
-	case BPF_FUNC_get_current_comm:
-		return &bpf_get_current_comm_proto;
 	case BPF_FUNC_sys_bpf:
 		return perfmon_capable() ? &bpf_sys_bpf_proto : NULL;
 	case BPF_FUNC_sys_close:
@@ -4837,7 +4823,7 @@ syscall_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	case BPF_FUNC_btf_find_by_name_kind:
 		return &bpf_btf_find_by_name_kind_proto;
 	default:
-		return NULL;
+		return tracing_prog_func_proto(func_id, prog);
 	}
 }
 
@@ -4878,11 +4864,8 @@ int bpf_prog_test_run_syscall(struct bpf_prog *prog,
 		}
 	}
 
-	/* The helper set above has no per-CPU helpers.  Do not use this tree's
-	 * bpf_prog_run_pin_on_cpu(): migrate_disable() disables preemption here.
-	 */
 	rcu_read_lock_trace();
-	retval = bpf_dispatcher_nop_func(ctx, prog->insnsi, prog->bpf_func);
+	retval = bpf_prog_run_pin_on_cpu(prog, ctx);
 	rcu_read_unlock_trace();
 
 	if (copy_to_user(&uattr->test.retval, &retval, sizeof(retval))) {

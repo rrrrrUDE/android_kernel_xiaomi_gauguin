@@ -433,6 +433,8 @@ struct bpf_subprog_info {
  * one verifier_env per bpf_check() call
  */
 struct bpf_verifier_env {
+	char type_str_buf[4][64];
+	u32 type_str_idx;
 	u32 insn_idx;
 	u32 prev_insn_idx;
 	struct bpf_prog *prog;		/* eBPF program being verified */

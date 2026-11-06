@@ -300,6 +300,19 @@ int map_set_for_each_callback_args(struct bpf_verifier_env *env,
 
 extern const struct bpf_map_ops bpf_map_offload_ops;
 
+/* Base type and orthogonal verifier type modifiers. */
+#define BPF_BASE_TYPE_BITS 8
+#define BPF_BASE_TYPE_MASK ((1U << BPF_BASE_TYPE_BITS) - 1)
+enum bpf_type_flag {
+	PTR_MAYBE_NULL = BIT(BPF_BASE_TYPE_BITS),
+	MEM_RDONLY = BIT(BPF_BASE_TYPE_BITS + 1),
+	__BPF_TYPE_LAST_FLAG = MEM_RDONLY,
+};
+#define BPF_BASE_TYPE_LIMIT (1U << BPF_BASE_TYPE_BITS)
+#define BPF_TYPE_LIMIT (__BPF_TYPE_LAST_FLAG | (__BPF_TYPE_LAST_FLAG - 1))
+#define type_flag(type) ((type) & ~BPF_BASE_TYPE_MASK)
+#define base_type(type) ((type) & BPF_BASE_TYPE_MASK)
+
 /* function argument constraints */
 enum bpf_arg_type {
 	ARG_DONTCARE = 0,	/* unused argument in helper function */
@@ -307,61 +320,75 @@ enum bpf_arg_type {
 	/* the following constraints used to prototype
 	 * bpf_map_lookup/update/delete_elem() functions
 	 */
-	ARG_CONST_MAP_PTR,	/* const argument used as pointer to bpf_map */
-	ARG_PTR_TO_MAP_KEY,	/* pointer to stack used as map key */
-	ARG_PTR_TO_MAP_VALUE,	/* pointer to stack used as map value */
-	ARG_PTR_TO_UNINIT_MAP_VALUE,	/* pointer to valid memory used to store a map value */
-	ARG_PTR_TO_MAP_VALUE_OR_NULL,	/* pointer to stack used as map value or NULL */
+	ARG_CONST_MAP_PTR = 1,	/* const argument used as pointer to bpf_map */
+	ARG_PTR_TO_MAP_KEY = 2,	/* pointer to stack used as map key */
+	ARG_PTR_TO_MAP_VALUE = 3,	/* pointer to stack used as map value */
+	ARG_PTR_TO_UNINIT_MAP_VALUE = 4,	/* pointer to valid memory used to store a map value */
+	ARG_PTR_TO_MAP_VALUE_OR_NULL = ARG_PTR_TO_MAP_VALUE | PTR_MAYBE_NULL,	/* pointer to stack used as map value or NULL */
 
 	/* the following constraints used to prototype bpf_memcmp() and other
 	 * functions that access data on eBPF program stack
 	 */
-	ARG_PTR_TO_MEM,		/* pointer to valid memory (stack, packet, map value) */
-	ARG_PTR_TO_MEM_OR_NULL, /* pointer to valid memory or NULL */
-	ARG_PTR_TO_UNINIT_MEM,	/* pointer to memory does not need to be initialized,
+	ARG_PTR_TO_MEM = 5,		/* pointer to valid memory (stack, packet, map value) */
+	ARG_PTR_TO_MEM_OR_NULL = ARG_PTR_TO_MEM | PTR_MAYBE_NULL, /* pointer to valid memory or NULL */
+	ARG_PTR_TO_UNINIT_MEM = 6,	/* pointer to memory does not need to be initialized,
 				 * helper function must fill all bytes or clear
 				 * them in error case.
 				 */
 
-	ARG_CONST_SIZE,		/* number of bytes accessed from memory */
-	ARG_CONST_SIZE_OR_ZERO,	/* number of bytes accessed from memory or 0 */
+	ARG_CONST_SIZE = 7,		/* number of bytes accessed from memory */
+	ARG_CONST_SIZE_OR_ZERO = 8,	/* number of bytes accessed from memory or 0 */
 
-	ARG_PTR_TO_CTX,		/* pointer to context */
-	ARG_PTR_TO_CTX_OR_NULL,	/* pointer to context or NULL */
-	ARG_ANYTHING,		/* any (initialized) argument is ok */
-	ARG_PTR_TO_SPIN_LOCK,	/* pointer to bpf_spin_lock */
-	ARG_PTR_TO_SOCK_COMMON,	/* pointer to sock_common */
-	ARG_PTR_TO_INT,		/* pointer to int */
-	ARG_PTR_TO_LONG,	/* pointer to long */
-	ARG_PTR_TO_SOCKET,	/* pointer to bpf_sock (fullsock) */
-	ARG_PTR_TO_SOCKET_OR_NULL,	/* pointer to bpf_sock (fullsock) or NULL */
-	ARG_PTR_TO_BTF_ID,	/* pointer to in-kernel struct */
-	ARG_PTR_TO_ALLOC_MEM,	/* pointer to dynamically allocated memory */
-	ARG_PTR_TO_ALLOC_MEM_OR_NULL,	/* pointer to dynamically allocated memory or NULL */
-	ARG_CONST_ALLOC_SIZE_OR_ZERO,	/* number of allocated bytes requested */
-	ARG_PTR_TO_BTF_ID_SOCK_COMMON,	/* pointer to in-kernel sock_common or bpf-mirrored bpf_sock */
-	ARG_PTR_TO_PERCPU_BTF_ID,	/* pointer to in-kernel percpu type */
-	ARG_PTR_TO_CONST_STR,	/* pointer to a null terminated read-only string */
-	ARG_PTR_TO_FUNC,	/* pointer to a BPF subprogram */
-	ARG_PTR_TO_TIMER,	/* pointer to bpf_timer in a map value */
-	ARG_PTR_TO_STACK_OR_NULL,	/* stack pointer or NULL */
-	__BPF_ARG_TYPE_MAX,
+	ARG_PTR_TO_CTX = 9,		/* pointer to context */
+	ARG_PTR_TO_CTX_OR_NULL = ARG_PTR_TO_CTX | PTR_MAYBE_NULL,	/* pointer to context or NULL */
+	ARG_ANYTHING = 10,		/* any (initialized) argument is ok */
+	ARG_PTR_TO_SPIN_LOCK = 11,	/* pointer to bpf_spin_lock */
+	ARG_PTR_TO_SOCK_COMMON = 12,	/* pointer to sock_common */
+	ARG_PTR_TO_INT = 13,		/* pointer to int */
+	ARG_PTR_TO_LONG = 14,	/* pointer to long */
+	ARG_PTR_TO_SOCKET = 15,	/* pointer to bpf_sock (fullsock) */
+	ARG_PTR_TO_SOCKET_OR_NULL = ARG_PTR_TO_SOCKET | PTR_MAYBE_NULL,	/* pointer to bpf_sock (fullsock) or NULL */
+	ARG_PTR_TO_BTF_ID = 16,	/* pointer to in-kernel struct */
+	ARG_PTR_TO_ALLOC_MEM = 17,	/* pointer to dynamically allocated memory */
+	ARG_PTR_TO_ALLOC_MEM_OR_NULL = ARG_PTR_TO_ALLOC_MEM | PTR_MAYBE_NULL,	/* pointer to dynamically allocated memory or NULL */
+	ARG_CONST_ALLOC_SIZE_OR_ZERO = 18,	/* number of allocated bytes requested */
+	ARG_PTR_TO_BTF_ID_SOCK_COMMON = 19,	/* pointer to in-kernel sock_common or bpf-mirrored bpf_sock */
+	ARG_PTR_TO_PERCPU_BTF_ID = 20,	/* pointer to in-kernel percpu type */
+	ARG_PTR_TO_CONST_STR = 21,	/* pointer to a null terminated read-only string */
+	ARG_PTR_TO_FUNC = 22,	/* pointer to a BPF subprogram */
+	ARG_PTR_TO_TIMER = 23,	/* pointer to bpf_timer in a map value */
+	ARG_PTR_TO_STACK = 24,
+	ARG_PTR_TO_STACK_OR_NULL = ARG_PTR_TO_STACK | PTR_MAYBE_NULL,	/* stack pointer or NULL */
+	__BPF_ARG_TYPE_MAX = ARG_PTR_TO_STACK + 1,
+	__BPF_ARG_TYPE_LIMIT = BPF_TYPE_LIMIT,
 };
+
+/* MEM_RDONLY is checked separately from the argument's nullable base type. */
+static inline enum bpf_arg_type bpf_arg_type_no_readonly(enum bpf_arg_type type)
+{
+	return type & ~MEM_RDONLY;
+}
 
 /* type of values returned from helper functions */
 enum bpf_return_type {
-	RET_INTEGER,			/* function returns integer */
-	RET_VOID,			/* function doesn't return anything */
-	RET_PTR_TO_MAP_VALUE,		/* returns a pointer to map elem value */
-	RET_PTR_TO_MAP_VALUE_OR_NULL,	/* returns a pointer to map elem value or NULL */
-	RET_PTR_TO_SOCKET_OR_NULL,	/* returns a pointer to a socket or NULL */
-	RET_PTR_TO_TCP_SOCK_OR_NULL,	/* returns a pointer to a tcp_sock or NULL */
-	RET_PTR_TO_SOCK_COMMON_OR_NULL,	/* returns a pointer to a sock_common or NULL */
-	RET_PTR_TO_ALLOC_MEM_OR_NULL,	/* returns a pointer to dynamically allocated memory or NULL */
-	RET_PTR_TO_BTF_ID,		/* returns a non-NULL pointer to a btf_id */
-	RET_PTR_TO_BTF_ID_OR_NULL,	/* returns a pointer to a btf_id or NULL */
-	RET_PTR_TO_MEM_OR_BTF_ID_OR_NULL, /* returns a pointer to a valid memory or a btf_id or NULL */
-	RET_PTR_TO_MEM_OR_BTF_ID,	/* returns a pointer to a valid memory or a btf_id */
+	RET_INTEGER = 0,			/* function returns integer */
+	RET_VOID = 1,			/* function doesn't return anything */
+	RET_PTR_TO_MAP_VALUE = 2,		/* returns a pointer to map elem value */
+	RET_PTR_TO_MAP_VALUE_OR_NULL = RET_PTR_TO_MAP_VALUE | PTR_MAYBE_NULL,	/* returns a pointer to map elem value or NULL */
+	RET_PTR_TO_SOCKET = 3,
+	RET_PTR_TO_SOCKET_OR_NULL = RET_PTR_TO_SOCKET | PTR_MAYBE_NULL,	/* returns a pointer to a socket or NULL */
+	RET_PTR_TO_TCP_SOCK = 4,
+	RET_PTR_TO_TCP_SOCK_OR_NULL = RET_PTR_TO_TCP_SOCK | PTR_MAYBE_NULL,	/* returns a pointer to a tcp_sock or NULL */
+	RET_PTR_TO_SOCK_COMMON = 5,
+	RET_PTR_TO_SOCK_COMMON_OR_NULL = RET_PTR_TO_SOCK_COMMON | PTR_MAYBE_NULL,	/* returns a pointer to a sock_common or NULL */
+	RET_PTR_TO_ALLOC_MEM = 6,
+	RET_PTR_TO_ALLOC_MEM_OR_NULL = RET_PTR_TO_ALLOC_MEM | PTR_MAYBE_NULL,	/* returns a pointer to dynamically allocated memory or NULL */
+	RET_PTR_TO_BTF_ID = 7,		/* returns a non-NULL pointer to a btf_id */
+	RET_PTR_TO_BTF_ID_OR_NULL = RET_PTR_TO_BTF_ID | PTR_MAYBE_NULL,	/* returns a pointer to a btf_id or NULL */
+	RET_PTR_TO_MEM_OR_BTF_ID = 8,	/* returns a pointer to a valid memory or a btf_id */
+	RET_PTR_TO_MEM_OR_BTF_ID_OR_NULL = RET_PTR_TO_MEM_OR_BTF_ID | PTR_MAYBE_NULL, /* returns a pointer to a valid memory or a btf_id or NULL */
+	__BPF_RET_TYPE_MAX = RET_PTR_TO_MEM_OR_BTF_ID + 1,
+	__BPF_RET_TYPE_LIMIT = BPF_TYPE_LIMIT,
 };
 
 /* eBPF function prototype used by verifier to allow BPF_CALLs from eBPF programs
@@ -420,25 +447,25 @@ enum bpf_access_type {
  */
 enum bpf_reg_type {
 	NOT_INIT = 0,		 /* nothing was written into register */
-	SCALAR_VALUE,		 /* reg doesn't contain a valid pointer */
-	PTR_TO_CTX,		 /* reg points to bpf_context */
-	CONST_PTR_TO_MAP,	 /* reg points to struct bpf_map */
-	PTR_TO_MAP_VALUE,	 /* reg points to map element value */
-	PTR_TO_MAP_VALUE_OR_NULL,/* points to map elem value or NULL */
-	PTR_TO_MAP_KEY,		 /* reg points to a map element key */
-	PTR_TO_STACK,		 /* reg == frame_pointer + offset */
-	PTR_TO_PACKET_META,	 /* skb->data - meta_len */
-	PTR_TO_PACKET,		 /* reg points to skb->data */
-	PTR_TO_PACKET_END,	 /* skb->data + headlen */
-	PTR_TO_FLOW_KEYS,	 /* reg points to bpf_flow_keys */
-	PTR_TO_SOCKET,		 /* reg points to struct bpf_sock */
-	PTR_TO_SOCKET_OR_NULL,	 /* reg points to struct bpf_sock or NULL */
-	PTR_TO_SOCK_COMMON,	 /* reg points to sock_common */
-	PTR_TO_SOCK_COMMON_OR_NULL, /* reg points to sock_common or NULL */
-	PTR_TO_TCP_SOCK,	 /* reg points to struct tcp_sock */
-	PTR_TO_TCP_SOCK_OR_NULL, /* reg points to struct tcp_sock or NULL */
-	PTR_TO_TP_BUFFER,	 /* reg points to a writable raw tp's buffer */
-	PTR_TO_XDP_SOCK,	 /* reg points to struct xdp_sock */
+	SCALAR_VALUE = 1,		 /* reg doesn't contain a valid pointer */
+	PTR_TO_CTX = 2,		 /* reg points to bpf_context */
+	CONST_PTR_TO_MAP = 3,	 /* reg points to struct bpf_map */
+	PTR_TO_MAP_VALUE = 4,	 /* reg points to map element value */
+	PTR_TO_MAP_VALUE_OR_NULL = PTR_TO_MAP_VALUE | PTR_MAYBE_NULL,/* points to map elem value or NULL */
+	PTR_TO_MAP_KEY = 5,		 /* reg points to a map element key */
+	PTR_TO_STACK = 6,		 /* reg == frame_pointer + offset */
+	PTR_TO_PACKET_META = 7,	 /* skb->data - meta_len */
+	PTR_TO_PACKET = 8,		 /* reg points to skb->data */
+	PTR_TO_PACKET_END = 9,	 /* skb->data + headlen */
+	PTR_TO_FLOW_KEYS = 10,	 /* reg points to bpf_flow_keys */
+	PTR_TO_SOCKET = 11,		 /* reg points to struct bpf_sock */
+	PTR_TO_SOCKET_OR_NULL = PTR_TO_SOCKET | PTR_MAYBE_NULL,	 /* reg points to struct bpf_sock or NULL */
+	PTR_TO_SOCK_COMMON = 12,	 /* reg points to sock_common */
+	PTR_TO_SOCK_COMMON_OR_NULL = PTR_TO_SOCK_COMMON | PTR_MAYBE_NULL, /* reg points to sock_common or NULL */
+	PTR_TO_TCP_SOCK = 13,	 /* reg points to struct tcp_sock */
+	PTR_TO_TCP_SOCK_OR_NULL = PTR_TO_TCP_SOCK | PTR_MAYBE_NULL, /* reg points to struct tcp_sock or NULL */
+	PTR_TO_TP_BUFFER = 14,	 /* reg points to a writable raw tp's buffer */
+	PTR_TO_XDP_SOCK = 15,	 /* reg points to struct xdp_sock */
 	/* PTR_TO_BTF_ID points to a kernel struct that does not need
 	 * to be null checked by the BPF program. This does not imply the
 	 * pointer is _not_ null and in practice this can easily be a null
@@ -449,20 +476,24 @@ enum bpf_reg_type {
 	 * Further, when passed into helpers the helpers can not, without
 	 * additional context, assume the value is non-null.
 	 */
-	PTR_TO_BTF_ID,
+	PTR_TO_BTF_ID = 16,
 	/* PTR_TO_BTF_ID_OR_NULL points to a kernel struct that has not
 	 * been checked for null. Used primarily to inform the verifier
 	 * an explicit null check is required for this struct.
 	 */
-	PTR_TO_BTF_ID_OR_NULL,
-	PTR_TO_MEM,		 /* reg points to valid memory region */
-	PTR_TO_MEM_OR_NULL,	 /* reg points to valid memory region or NULL */
-	PTR_TO_RDONLY_BUF,	 /* reg points to a readonly buffer */
-	PTR_TO_RDONLY_BUF_OR_NULL, /* reg points to a readonly buffer or NULL */
-	PTR_TO_RDWR_BUF,	 /* reg points to a read/write buffer */
-	PTR_TO_RDWR_BUF_OR_NULL, /* reg points to a read/write buffer or NULL */
-	PTR_TO_PERCPU_BTF_ID,	 /* reg points to a percpu kernel variable */
-	PTR_TO_FUNC,		 /* reg points to a BPF subprogram */
+	PTR_TO_BTF_ID_OR_NULL = PTR_TO_BTF_ID | PTR_MAYBE_NULL,
+	PTR_TO_MEM = 17,		 /* reg points to valid memory region */
+	PTR_TO_MEM_OR_NULL = PTR_TO_MEM | PTR_MAYBE_NULL,	 /* reg points to valid memory region or NULL */
+	PTR_TO_BUF = 18,         /* buffer size supplied by the context */
+	/* Compatibility names for existing 4.19 iterator providers. */
+	PTR_TO_RDONLY_BUF = PTR_TO_BUF | MEM_RDONLY,
+	PTR_TO_RDONLY_BUF_OR_NULL = PTR_TO_BUF | MEM_RDONLY | PTR_MAYBE_NULL,
+	PTR_TO_RDWR_BUF = PTR_TO_BUF,
+	PTR_TO_RDWR_BUF_OR_NULL = PTR_TO_BUF | PTR_MAYBE_NULL,
+	PTR_TO_PERCPU_BTF_ID = 20,	 /* reg points to a percpu kernel variable */
+	PTR_TO_FUNC = 21,		 /* reg points to a BPF subprogram */
+	__BPF_REG_TYPE_MAX = PTR_TO_FUNC + 1,
+	__BPF_REG_TYPE_LIMIT = BPF_TYPE_LIMIT,
 };
 
 /* The information passed from prog-specific *_is_valid_access
@@ -1275,27 +1306,18 @@ extern struct mutex bpf_stats_enabled_mutex;
  * these events can happen inside a region which holds a map bucket lock
  * and can deadlock on it.
  *
- * Use the preemption safe inc/dec variants on RT because migrate disable
- * is preemptible on RT and preemption in the middle of the RMW operation
- * might lead to inconsistent state. Use the raw variants for non RT
- * kernels as migrate_disable() maps to preempt_disable() so the slightly
- * more expensive save operation can be avoided.
+ * Migration protection is preemptible. Use interrupt-safe per-CPU RMW
+ * operations even on non-RT kernels.
  */
 static inline void bpf_disable_instrumentation(void)
 {
 	migrate_disable();
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		this_cpu_inc(bpf_prog_active);
-	else
-		__this_cpu_inc(bpf_prog_active);
+	this_cpu_inc(bpf_prog_active);
 }
 
 static inline void bpf_enable_instrumentation(void)
 {
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		this_cpu_dec(bpf_prog_active);
-	else
-		__this_cpu_dec(bpf_prog_active);
+	this_cpu_dec(bpf_prog_active);
 	migrate_enable();
 }
 
