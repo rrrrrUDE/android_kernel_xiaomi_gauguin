@@ -51,6 +51,9 @@ extern const struct ipv6_stub *ipv6_stub __read_mostly;
 
 /* A stub used by bpf helpers. Similarly ugly as ipv6_stub */
 struct ipv6_bpf_stub {
+	int (*ipv6_dev_get_saddr)(struct net *net, const struct net_device *dev,
+				  const struct in6_addr *daddr, unsigned int prefs,
+				  struct in6_addr *saddr);
 	int (*inet6_bind)(struct sock *sk, struct sockaddr *uaddr, int addr_len,
 			  u32 flags);
 	struct sock *(*udp6_lib_lookup)(struct net *net,

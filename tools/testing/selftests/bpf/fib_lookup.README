@@ -1,0 +1,40 @@
+BPF FIB lookup on 4.19
+======================
+
+Reference: local android-5.15-mainline (including its FIB helper extensions).
+
+The helper supports DIRECT, OUTPUT, SKIP_NEIGH, TBID and SRC for XDP and TC.
+The existing 64-byte UAPI layout is preserved: mtu_result aliases tot_len,
+and tbid aliases the VLAN output fields. TBID is consumed only with DIRECT,
+as in the reference tree. SKIP_NEIGH leaves smac/dmac untouched. IPv6 source
+selection uses the route preferred source or the IPv6 module stub, using the
+original destination for address selection even when a gateway is returned.
+MTU is returned on size failure and on successful lookups with an MTU check;
+TC with zero input length reports the egress device MTU after its skb check.
+Flow keys are zero initialized before policy or direct-table lookup.
+
+Routing-core boundary:
+This is a helper extension on the native 4.19 FIB, not an import of the 5.15
+routing subsystem. IPv4 routes via IPv6 gateways (RTA_VIA), nexthop objects,
+and nexthop groups are absent from the native IPv4 routing core. They cannot
+be represented by its fib_nh_gw4 field. The helper therefore does not provide
+those 5.15 routing-core capabilities; no synthetic fallback is introduced.
+Existing 4.19 multipath and VRF/table selection are retained.
+
+Host regression:
+  python3 tools/testing/selftests/bpf/test_fib_lookup.py
+
+The test executes production helper functions with route/neighbour stubs.
+It checks both families, all 32 flag combinations, policy/direct selection,
+missing tables/neighbours, route errors, source-address failure/preference,
+MTU handling, invalid arguments and ABI size/offsets. It does not validate
+live routing, ECMP hashing, neighbour concurrency, module unload or packets.
+
+Device validation still required:
+Use XDP and TC programs in isolated network namespaces with IPv4/IPv6 veth
+routes. Check direct and policy routes, explicit tables and VRFs, missing
+neighbours with/without SKIP_NEIGH, route preferred sources and missing IPv6
+sources, reject routes, route/gateway changes, ECMP and packet-size/MTU
+boundaries (including TC GSO and zero tot_len). Inspect all output fields.
+Repeat with IPv6 built-in, modular and disabled as appropriate. No defconfig
+or boot command-line changes are included.
