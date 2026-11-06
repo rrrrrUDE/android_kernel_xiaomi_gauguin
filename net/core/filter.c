@@ -5562,8 +5562,12 @@ static int bpf_ipv4_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 		return BPF_FIB_LKUP_RET_UNSUPP_LWT;
 
 	dev = nh->fib_nh_dev;
-	if (nh->fib_nh_gw4)
+	if (nh->fib_nh_gw_family == AF_INET6) {
+		params->family = AF_INET6;
+		memcpy(params->ipv6_dst, &nh->fib_nh_gw6, sizeof(nh->fib_nh_gw6));
+	} else if (nh->fib_nh_gw_family == AF_INET) {
 		params->ipv4_dst = nh->fib_nh_gw4;
+	}
 
 	params->rt_metric = res.fi->fib_priority;
 	params->ifindex = dev->ifindex;
@@ -5577,7 +5581,10 @@ static int bpf_ipv4_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 	/* xdp and cls_bpf programs are run in RCU-bh so
 	 * rcu_read_lock_bh is not needed here
 	 */
-	neigh = __ipv4_neigh_lookup_noref(dev, (__force u32)params->ipv4_dst);
+	if (nh->fib_nh_gw_family == AF_INET6)
+		neigh = __ipv6_neigh_lookup_noref_stub(dev, params->ipv6_dst);
+	else
+		neigh = __ipv4_neigh_lookup_noref(dev, (__force u32)params->ipv4_dst);
 	if (!neigh || !(neigh->nud_state & NUD_VALID))
 		return BPF_FIB_LKUP_RET_NO_NEIGH;
 

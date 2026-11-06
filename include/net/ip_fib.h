@@ -36,6 +36,8 @@ struct fib_config {
 	u32			fc_table;
 	__be32			fc_dst;
 	__be32			fc_gw;
+	u8			fc_gw_family;
+	struct in6_addr		fc_gw6;
 	int			fc_oif;
 	u32			fc_flags;
 	u32			fc_priority;
@@ -90,7 +92,11 @@ struct fib_nh {
 	__u32			nh_tclassid;
 #endif
 	int			fib_nh_oif;
-	__be32			fib_nh_gw4;
+	u8			fib_nh_gw_family;
+	union {
+		__be32		fib_nh_gw4;
+		struct in6_addr	fib_nh_gw6;
+	};
 	__be32			nh_saddr;
 	int			nh_saddr_genid;
 	struct rtable __rcu * __percpu *nh_pcpu_rth_output;
@@ -450,5 +456,24 @@ static inline void fib_proc_exit(struct net *net)
 #endif
 
 u32 ip_mtu_from_fib_result(struct fib_result *res, __be32 daddr);
+
+int fib_gw_from_via(struct fib_config *cfg, struct nlattr *nla,
+		    struct netlink_ext_ack *extack);
+int fib_nh_put_gateway(struct sk_buff *skb, const struct fib_nh *nh);
+
+static inline bool fib_nh_gw_match(const struct fib_config *cfg,
+				 const struct fib_nh *nh)
+{
+	u8 family = cfg->fc_gw_family ? : (cfg->fc_gw ? AF_INET : 0);
+
+	if (!family)
+		return true;
+	if (family != nh->fib_nh_gw_family)
+		return false;
+	if (family == AF_INET6)
+		return !memcmp(&cfg->fc_gw6, &nh->fib_nh_gw6,
+			       sizeof(cfg->fc_gw6));
+	return cfg->fc_gw == nh->fib_nh_gw4;
+}
 
 #endif  /* _NET_FIB_H */

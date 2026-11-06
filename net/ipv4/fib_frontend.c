@@ -370,10 +370,10 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 	for (ret = 0; ret < res.fi->fib_nhs; ret++) {
 		struct fib_nh *nh = &res.fi->fib_nh[ret];
 
-		if (nh->nh_dev == dev) {
+		if (nh->fib_nh_dev == dev) {
 			dev_match = true;
 			break;
-		} else if (l3mdev_master_ifindex_rcu(nh->nh_dev) == dev->ifindex) {
+		} else if (l3mdev_master_ifindex_rcu(nh->fib_nh_dev) == dev->ifindex) {
 			dev_match = true;
 			break;
 		}
@@ -645,6 +645,7 @@ const struct nla_policy rtm_ipv4_policy[RTA_MAX + 1] = {
 	[RTA_IIF]		= { .type = NLA_U32 },
 	[RTA_OIF]		= { .type = NLA_U32 },
 	[RTA_GATEWAY]		= { .type = NLA_U32 },
+	[RTA_VIA]		= { .len = sizeof(struct rtvia) },
 	[RTA_PRIORITY]		= { .type = NLA_U32 },
 	[RTA_PREFSRC]		= { .type = NLA_U32 },
 	[RTA_METRICS]		= { .type = NLA_NESTED },
@@ -660,10 +661,55 @@ const struct nla_policy rtm_ipv4_policy[RTA_MAX + 1] = {
 	[RTA_DPORT]		= { .type = NLA_U16 },
 };
 
+int fib_gw_from_via(struct fib_config *cfg, struct nlattr *nla,
+		    struct netlink_ext_ack *extack)
+{
+	struct rtvia *via;
+	int alen;
+
+	if (nla_len(nla) < offsetof(struct rtvia, rtvia_addr)) {
+		NL_SET_ERR_MSG(extack, "Invalid attribute length for RTA_VIA");
+		return -EINVAL;
+	}
+
+	via = nla_data(nla);
+	alen = nla_len(nla) - offsetof(struct rtvia, rtvia_addr);
+
+	switch (via->rtvia_family) {
+	case AF_INET:
+		if (alen != sizeof(__be32)) {
+			NL_SET_ERR_MSG(extack, "Invalid IPv4 address in RTA_VIA");
+			return -EINVAL;
+		}
+		cfg->fc_gw_family = AF_INET;
+		memcpy(&cfg->fc_gw, via->rtvia_addr, sizeof(cfg->fc_gw));
+		break;
+	case AF_INET6:
+#if IS_ENABLED(CONFIG_IPV6)
+		if (alen != sizeof(struct in6_addr)) {
+			NL_SET_ERR_MSG(extack, "Invalid IPv6 address in RTA_VIA");
+			return -EINVAL;
+		}
+		cfg->fc_gw_family = AF_INET6;
+		memcpy(&cfg->fc_gw6, via->rtvia_addr, sizeof(cfg->fc_gw6));
+#else
+		NL_SET_ERR_MSG(extack, "IPv6 support not enabled in kernel");
+		return -EINVAL;
+#endif
+		break;
+	default:
+		NL_SET_ERR_MSG(extack, "Unsupported address family in RTA_VIA");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 			     struct nlmsghdr *nlh, struct fib_config *cfg,
 			     struct netlink_ext_ack *extack)
 {
+	bool has_gw = false, has_via = false;
 	struct nlattr *attr;
 	int err, remaining;
 	struct rtmsg *rtm;
@@ -704,12 +750,16 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 			cfg->fc_oif = nla_get_u32(attr);
 			break;
 		case RTA_GATEWAY:
+			has_gw = true;
+			cfg->fc_gw_family = AF_INET;
 			cfg->fc_gw = nla_get_be32(attr);
 			break;
 		case RTA_VIA:
-			NL_SET_ERR_MSG(extack, "IPv4 does not support RTA_VIA attribute");
-			err = -EINVAL;
-			goto errout;
+			has_via = true;
+			err = fib_gw_from_via(cfg, attr, extack);
+			if (err)
+				goto errout;
+			break;
 		case RTA_PRIORITY:
 			cfg->fc_priority = nla_get_u32(attr);
 			break;
@@ -746,6 +796,11 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 				goto errout;
 			break;
 		}
+	}
+
+	if (has_gw && has_via) {
+		NL_SET_ERR_MSG(extack, "RTA_GATEWAY and RTA_VIA are mutually exclusive");
+		return -EINVAL;
 	}
 
 	return 0;

@@ -49,8 +49,12 @@ struct ipv6_stub {
 };
 extern const struct ipv6_stub *ipv6_stub __read_mostly;
 
+struct fib_nh;
+
 /* A stub used by bpf helpers. Similarly ugly as ipv6_stub */
 struct ipv6_bpf_stub {
+	int (*fib4_check_nh_v6)(struct net *net, struct fib_nh *nh, u32 table,
+				struct netlink_ext_ack *extack);
 	int (*ipv6_dev_get_saddr)(struct net *net, const struct net_device *dev,
 				  const struct in6_addr *daddr, unsigned int prefs,
 				  struct in6_addr *saddr);

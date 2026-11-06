@@ -45,6 +45,8 @@
 #include <net/nexthop.h>
 #include <net/lwtunnel.h>
 #include <net/fib_notifier.h>
+#include <net/ipv6_stubs.h>
+#include <net/addrconf.h>
 
 #include "fib_lookup.h"
 
@@ -266,7 +268,11 @@ static inline int nh_comp(const struct fib_info *fi, const struct fib_info *ofi)
 
 	for_nexthops(fi) {
 		if (nh->fib_nh_oif != onh->fib_nh_oif ||
-		    nh->fib_nh_gw4 != onh->fib_nh_gw4 ||
+		    nh->fib_nh_gw_family != onh->fib_nh_gw_family ||
+		    (nh->fib_nh_gw_family == AF_INET6 ?
+		     memcmp(&nh->fib_nh_gw6, &onh->fib_nh_gw6,
+			    sizeof(nh->fib_nh_gw6)) :
+		     nh->fib_nh_gw4 != onh->fib_nh_gw4) ||
 		    nh->fib_nh_scope != onh->fib_nh_scope ||
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 		    nh->fib_nh_weight != onh->fib_nh_weight ||
@@ -350,6 +356,7 @@ int ip_fib_check_default(__be32 gw, struct net_device *dev)
 	head = &fib_info_devhash[hash];
 	hlist_for_each_entry(nh, head, nh_hash) {
 		if (nh->fib_nh_dev == dev &&
+		    nh->fib_nh_gw_family == AF_INET &&
 		    nh->fib_nh_gw4 == gw &&
 		    !(nh->fib_nh_flags & RTNH_F_DEAD)) {
 			spin_unlock(&fib_info_lock);
@@ -382,7 +389,8 @@ static inline size_t fib_nlmsg_size(struct fib_info *fi)
 		size_t nhsize = nla_total_size(sizeof(struct rtnexthop));
 
 		/* may contain flow and gateway attribute */
-		nhsize += 2 * nla_total_size(4);
+		nhsize += nla_total_size(4) +
+			  nla_total_size(sizeof(struct rtvia) + sizeof(struct in6_addr));
 
 		/* grab encap info */
 		for_nexthops(fi) {
@@ -440,6 +448,17 @@ static int fib_detect_death(struct fib_info *fi, int order,
 	struct neighbour *n;
 	int state = NUD_NONE;
 
+	if (fi->fib_nh[0].fib_nh_gw_family == AF_INET6) {
+		rcu_read_lock_bh();
+		n = __ipv6_neigh_lookup_noref_stub(fi->fib_dev,
+						 &fi->fib_nh[0].fib_nh_gw6);
+		if (n)
+			state = READ_ONCE(n->nud_state);
+		rcu_read_unlock_bh();
+		if (!n)
+			return 0;
+		goto check_state;
+	}
 	n = neigh_lookup(&arp_tbl, &fi->fib_nh[0].fib_nh_gw4, fi->fib_dev);
 	if (n) {
 		state = n->nud_state;
@@ -447,6 +466,7 @@ static int fib_detect_death(struct fib_info *fi, int order,
 	} else {
 		return 0;
 	}
+check_state:
 	if (state == NUD_REACHABLE)
 		return 0;
 	if ((state & NUD_VALID) && order != dflt)
@@ -505,14 +525,35 @@ static int fib_get_nhs(struct fib_info *fi, struct rtnexthop *rtnh,
 		nexthop_nh->fib_nh_flags =
 			(cfg->fc_flags & ~0xFF) | rtnh->rtnh_flags;
 		nexthop_nh->fib_nh_oif = rtnh->rtnh_ifindex;
-		nexthop_nh->nh_weight = rtnh->rtnh_hops + 1;
+		nexthop_nh->fib_nh_weight = rtnh->rtnh_hops + 1;
 
 		attrlen = rtnh_attrlen(rtnh);
 		if (attrlen > 0) {
 			struct nlattr *nla, *attrs = rtnh_attrs(rtnh);
+			struct nlattr *via;
+			struct fib_config gwcfg = {};
 
 			nla = nla_find(attrs, attrlen, RTA_GATEWAY);
-			nexthop_nh->fib_nh_gw = nla ? nla_get_in_addr(nla) : 0;
+			via = nla_find(attrs, attrlen, RTA_VIA);
+			if (nla && via) {
+				NL_SET_ERR_MSG(extack, "RTA_GATEWAY and RTA_VIA are mutually exclusive");
+				return -EINVAL;
+			}
+			if (via) {
+				ret = fib_gw_from_via(&gwcfg, via, extack);
+				if (ret)
+					return ret;
+			} else if (nla) {
+				if (nla_len(nla) != sizeof(__be32))
+					return -EINVAL;
+				gwcfg.fc_gw_family = AF_INET;
+				gwcfg.fc_gw = nla_get_in_addr(nla);
+			}
+			nexthop_nh->fib_nh_gw_family = gwcfg.fc_gw_family;
+			if (gwcfg.fc_gw_family == AF_INET6)
+				nexthop_nh->fib_nh_gw6 = gwcfg.fc_gw6;
+			else
+				nexthop_nh->fib_nh_gw4 = gwcfg.fc_gw;
 #ifdef CONFIG_IP_ROUTE_CLASSID
 			nla = nla_find(attrs, attrlen, RTA_FLOW);
 			nexthop_nh->nh_tclassid = nla ? nla_get_u32(nla) : 0;
@@ -639,7 +680,7 @@ int fib_nh_match(struct fib_config *cfg, struct fib_info *fi,
 	if (cfg->fc_priority && cfg->fc_priority != fi->fib_priority)
 		return 1;
 
-	if (cfg->fc_oif || cfg->fc_gw) {
+	if (cfg->fc_oif || cfg->fc_gw || cfg->fc_gw_family) {
 		if (cfg->fc_encap) {
 			if (fib_encap_match(cfg->fc_encap_type, cfg->fc_encap,
 					    fi->fib_nh, cfg, extack))
@@ -651,7 +692,7 @@ int fib_nh_match(struct fib_config *cfg, struct fib_info *fi,
 			return 1;
 #endif
 		if ((!cfg->fc_oif || cfg->fc_oif == fi->fib_nh->fib_nh_oif) &&
-		    (!cfg->fc_gw  || cfg->fc_gw == fi->fib_nh->fib_nh_gw4))
+		    fib_nh_gw_match(cfg, fi->fib_nh))
 			return 0;
 		return 1;
 	}
@@ -677,8 +718,20 @@ int fib_nh_match(struct fib_config *cfg, struct fib_info *fi,
 			struct nlattr *nla, *attrs = rtnh_attrs(rtnh);
 
 			nla = nla_find(attrs, attrlen, RTA_GATEWAY);
-			if (nla && nla_get_in_addr(nla) != nh->fib_nh_gw4)
+			if (nla && (nla_len(nla) != sizeof(__be32) ||
+				    nh->fib_nh_gw_family != AF_INET ||
+				    nla_get_in_addr(nla) != nh->fib_nh_gw4))
 				return 1;
+			nla = nla_find(attrs, attrlen, RTA_VIA);
+			if (nla) {
+				struct fib_config gwcfg = {};
+				int err = fib_gw_from_via(&gwcfg, nla, extack);
+
+				if (err)
+					return err;
+				if (!fib_nh_gw_match(&gwcfg, nh))
+					return 1;
+			}
 #ifdef CONFIG_IP_ROUTE_CLASSID
 			nla = nla_find(attrs, attrlen, RTA_FLOW);
 			if (nla && nla_get_u32(nla) != nh->nh_tclassid)
@@ -784,6 +837,21 @@ static int fib_check_nh(struct fib_config *cfg, struct fib_nh *nh,
 	struct net_device *dev;
 
 	net = cfg->fc_nlinfo.nl_net;
+	if (nh->fib_nh_gw_family == AF_INET6) {
+#if IS_ENABLED(CONFIG_IPV6)
+		if (!ipv6_bpf_stub || !ipv6_bpf_stub->fib4_check_nh_v6)
+			return -EAFNOSUPPORT;
+		if (cfg->fc_scope >= RT_SCOPE_LINK) {
+			NL_SET_ERR_MSG(extack, "Nexthop has invalid scope");
+			return -EINVAL;
+		}
+		err = ipv6_bpf_stub->fib4_check_nh_v6(net, nh, cfg->fc_table,
+						     extack);
+		return err;
+#else
+		return -EAFNOSUPPORT;
+#endif
+	}
 	if (nh->fib_nh_gw4) {
 		struct fib_result res;
 
@@ -987,7 +1055,8 @@ static void fib_info_hash_move(struct hlist_head *new_info_hash,
 __be32 fib_info_update_nh_saddr(struct net *net, struct fib_nh *nh)
 {
 	nh->nh_saddr = inet_select_addr(nh->fib_nh_dev,
-					nh->fib_nh_gw4,
+					nh->fib_nh_gw_family == AF_INET ?
+					nh->fib_nh_gw4 : 0,
 					nh->nh_parent->fib_scope);
 	nh->nh_saddr_genid = atomic_read(&net->ipv4.dev_addr_genid);
 
@@ -1124,7 +1193,7 @@ struct fib_info *fib_create_info(struct fib_config *cfg,
 				       "Nexthop device index does not match RTA_OIF");
 			goto err_inval;
 		}
-		if (cfg->fc_gw && fi->fib_nh->fib_nh_gw != cfg->fc_gw) {
+		if (!fib_nh_gw_match(cfg, fi->fib_nh)) {
 			NL_SET_ERR_MSG(extack,
 				       "Nexthop gateway does not match RTA_GATEWAY");
 			goto err_inval;
@@ -1161,7 +1230,12 @@ struct fib_info *fib_create_info(struct fib_config *cfg,
 			nh->fib_nh_lws = lwtstate_get(lwtstate);
 		}
 		nh->fib_nh_oif = cfg->fc_oif;
-		nh->fib_nh_gw4 = cfg->fc_gw;
+		nh->fib_nh_gw_family = cfg->fc_gw_family ? :
+					   (cfg->fc_gw ? AF_INET : 0);
+		if (nh->fib_nh_gw_family == AF_INET6)
+			nh->fib_nh_gw6 = cfg->fc_gw6;
+		else
+			nh->fib_nh_gw4 = cfg->fc_gw;
 		nh->fib_nh_flags = cfg->fc_flags;
 #ifdef CONFIG_IP_ROUTE_CLASSID
 		nh->nh_tclassid = cfg->fc_flow;
@@ -1169,12 +1243,12 @@ struct fib_info *fib_create_info(struct fib_config *cfg,
 			fi->fib_net->ipv4.fib_num_tclassid_users++;
 #endif
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
-		nh->nh_weight = 1;
+		nh->fib_nh_weight = 1;
 #endif
 	}
 
 	if (fib_props[cfg->fc_type].error) {
-		if (cfg->fc_gw || cfg->fc_oif || cfg->fc_mp) {
+		if (cfg->fc_gw || cfg->fc_gw_family || cfg->fc_oif || cfg->fc_mp) {
 			NL_SET_ERR_MSG(extack,
 				       "Gateway, device and multipath can not be specified for this route type");
 			goto err_inval;
@@ -1208,7 +1282,7 @@ struct fib_info *fib_create_info(struct fib_config *cfg,
 				       "Route with host scope can not have multiple nexthops");
 			goto err_inval;
 		}
-		if (nh->fib_nh_gw4) {
+		if (nh->fib_nh_gw_family) {
 			NL_SET_ERR_MSG(extack,
 				       "Route with host scope can not have a gateway");
 			goto err_inval;
@@ -1288,6 +1362,21 @@ failure:
 	return ERR_PTR(err);
 }
 
+int fib_nh_put_gateway(struct sk_buff *skb, const struct fib_nh *nh)
+{
+	if (nh->fib_nh_gw_family == AF_INET6) {
+		struct {
+			__kernel_sa_family_t family;
+			struct in6_addr addr;
+		} __packed via = { .family = AF_INET6, .addr = nh->fib_nh_gw6 };
+
+		return nla_put(skb, RTA_VIA, sizeof(via), &via);
+	}
+	if (nh->fib_nh_gw_family == AF_INET)
+		return nla_put_in_addr(skb, RTA_GATEWAY, nh->fib_nh_gw4);
+	return 0;
+}
+
 int fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
 		  u32 tb_id, u8 type, __be32 dst, int dst_len, u8 tos,
 		  struct fib_info *fi, unsigned int flags)
@@ -1328,8 +1417,7 @@ int fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
 	    nla_put_in_addr(skb, RTA_PREFSRC, fi->fib_prefsrc))
 		goto nla_put_failure;
 	if (fi->fib_nhs == 1) {
-		if (fi->fib_nh->fib_nh_gw4 &&
-		    nla_put_in_addr(skb, RTA_GATEWAY, fi->fib_nh->fib_nh_gw4))
+		if (fib_nh_put_gateway(skb, fi->fib_nh))
 			goto nla_put_failure;
 		if (fi->fib_nh->fib_nh_oif &&
 		    nla_put_u32(skb, RTA_OIF, fi->fib_nh->fib_nh_oif))
@@ -1383,8 +1471,7 @@ int fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
 			rtnh->rtnh_hops = nh->fib_nh_weight - 1;
 			rtnh->rtnh_ifindex = nh->fib_nh_oif;
 
-			if (nh->fib_nh_gw4 &&
-			    nla_put_in_addr(skb, RTA_GATEWAY, nh->fib_nh_gw4))
+			if (fib_nh_put_gateway(skb, nh))
 				goto nla_put_failure;
 #ifdef CONFIG_IP_ROUTE_CLASSID
 			if (nh->nh_tclassid &&
@@ -1627,7 +1714,7 @@ static void fib_select_default(const struct flowi4 *flp, struct fib_result *res)
 		if (next_fi->fib_scope != res->scope ||
 		    fa->fa_type != RTN_UNICAST)
 			continue;
-		if (!next_fi->fib_nh[0].fib_nh_gw4 ||
+		if (!next_fi->fib_nh[0].fib_nh_gw_family ||
 		    next_fi->fib_nh[0].fib_nh_scope != RT_SCOPE_LINK)
 			continue;
 
@@ -1713,7 +1800,8 @@ int fib_sync_up(struct net_device *dev, unsigned int nh_flags)
 			    !(nexthop_nh->fib_nh_dev->flags & IFF_UP))
 				continue;
 			if (nexthop_nh->fib_nh_dev != dev ||
-			    !__in_dev_get_rtnl(dev))
+			    (nexthop_nh->fib_nh_gw_family == AF_INET6 ?
+			     !__in6_dev_get(dev) : !__in_dev_get_rtnl(dev)))
 				continue;
 			alive++;
 			nexthop_nh->fib_nh_flags &= ~nh_flags;
@@ -1741,8 +1829,12 @@ static bool fib_good_nh(const struct fib_nh *nh)
 
 		rcu_read_lock_bh();
 
-		n = __ipv4_neigh_lookup_noref(nh->fib_nh_dev,
-					      (__force u32)nh->fib_nh_gw4);
+		if (nh->fib_nh_gw_family == AF_INET6)
+			n = __ipv6_neigh_lookup_noref_stub(nh->fib_nh_dev,
+							 &nh->fib_nh_gw6);
+		else
+			n = __ipv4_neigh_lookup_noref(nh->fib_nh_dev,
+						(__force u32)nh->fib_nh_gw4);
 		if (n)
 			state = n->nud_state;
 

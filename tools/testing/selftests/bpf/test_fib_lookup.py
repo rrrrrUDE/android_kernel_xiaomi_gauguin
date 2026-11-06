@@ -52,8 +52,8 @@ struct net_device { int ifindex,mtu; char dev_addr[6]; } test_dev={7,1500,{1,2,3
 struct in_device { int forwarding; } idev4={1};
 struct inet6_dev { struct { int forwarding; } cnf; } idev6={{1}};
 struct neighbour { int nud_state; char ha[6]; } neigh={NUD_VALID,{6,5,4,3,2,1}};
-struct fib_nh { void *fib_nh_lws; struct net_device *fib_nh_dev; u32 fib_nh_gw4; };
-struct fib_info { int fib_nhs,fib_priority; struct fib_nh fib_nh[1]; } fi={1,42,{{0,&test_dev,99}}};
+struct fib_nh { void *fib_nh_lws; struct net_device *fib_nh_dev; int fib_nh_gw_family; union {u32 fib_nh_gw4; struct in6_addr fib_nh_gw6;}; };
+struct fib_info { int fib_nhs,fib_priority; struct fib_nh fib_nh[1]; } fi={1,42,{{.fib_nh_dev=&test_dev,.fib_nh_gw_family=AF_INET,.fib_nh_gw4=99}}};
 struct fib_result { int type,nh_sel; struct fib_info *fi; };
 struct fib_table { int unused; } table4;
 struct fib6_table { int unused; } table6;
@@ -141,6 +141,17 @@ int main(void) {
   assert(bpf_skb_fib_lookup(&skb,&p,sizeof(p),0)==BPF_FIB_LKUP_RET_FRAG_NEEDED&&p.mtu_result==1500);forwardable=true;
   p.tot_len=0;assert(bpf_skb_fib_lookup(&skb,&p,sizeof(p),0)==0&&p.mtu_result==1500);
  }
+ /* IPv4 destination routed through an IPv6 neighbour. */
+ struct bpf_fib_lookup via={.family=AF_INET,.ifindex=7,.tot_len=100};
+ fi.fib_nh[0].fib_nh_gw_family=AF_INET6;
+ fi.fib_nh[0].fib_nh_gw6=(struct in6_addr){{11,22,33,44}};
+ assert(bpf_xdp_fib_lookup(&x,&via,sizeof(via),BPF_FIB_LOOKUP_SRC)==0);
+ assert(via.family==AF_INET6&&via.ipv6_dst[0]==11&&via.ipv6_dst[3]==44&&via.ipv4_src==123);
+ via=(struct bpf_fib_lookup){.family=AF_INET,.ifindex=7,.tot_len=100};
+ neigh_calls=0;
+ assert(bpf_xdp_fib_lookup(&x,&via,sizeof(via),BPF_FIB_LOOKUP_SKIP_NEIGH)==0&&!neigh_calls&&via.family==AF_INET6);
+ fi.fib_nh[0].fib_nh_gw_family=AF_INET;
+ fi.fib_nh[0].fib_nh_gw4=99;
  struct bpf_fib_lookup p={.family=AF_INET6,.ifindex=7,.tot_len=100};
  src_err=-EADDRNOTAVAIL;neigh_calls=0;
  assert(bpf_xdp_fib_lookup(&x,&p,sizeof(p),BPF_FIB_LOOKUP_SRC)==BPF_FIB_LKUP_RET_NO_SRC_ADDR&&!neigh_calls);

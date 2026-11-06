@@ -3013,6 +3013,59 @@ out:
 	return err;
 }
 
+/* Validate IPv6 gateways for IPv4 routes with the native IPv6 rules. */
+int fib4_check_nh_v6(struct net *net, struct fib_nh *nh, u32 table,
+		    struct netlink_ext_ack *extack)
+{
+	struct fib6_config cfg = {
+		.fc_table = table,
+		.fc_flags = nh->fib_nh_flags | RTF_GATEWAY,
+		.fc_ifindex = nh->fib_nh_oif,
+		.fc_gateway = nh->fib_nh_gw6,
+	};
+	struct net_device *dev = NULL;
+	struct inet6_dev *idev = NULL;
+	int err;
+
+	if (cfg.fc_ifindex) {
+		dev = dev_get_by_index(net, cfg.fc_ifindex);
+		if (!dev)
+			return -ENODEV;
+		idev = in6_dev_get(dev);
+		if (!idev) {
+			err = -EACCES;
+			goto out;
+		}
+	}
+	if ((cfg.fc_flags & RTNH_F_ONLINK) && !dev) {
+		err = -ENODEV;
+		goto out;
+	}
+	err = ip6_validate_gw(net, &cfg, &dev, &idev, extack);
+	if (err)
+		goto out;
+	if (!idev || idev->cnf.disable_ipv6) {
+		err = -EACCES;
+		goto out;
+	}
+	if (!(dev->flags & IFF_UP)) {
+		err = -ENETDOWN;
+		goto out;
+	}
+	nh->fib_nh_dev = dev;
+	nh->fib_nh_oif = dev->ifindex;
+	nh->fib_nh_scope = RT_SCOPE_LINK;
+	if (!netif_carrier_ok(dev))
+		nh->fib_nh_flags |= RTNH_F_LINKDOWN;
+	dev = NULL; /* transfer the device reference to the FIB nexthop */
+out:
+	if (idev)
+		in6_dev_put(idev);
+	if (dev)
+		dev_put(dev);
+	return err;
+}
+
 static struct fib6_info *ip6_route_info_create(struct fib6_config *cfg,
 					      gfp_t gfp_flags,
 					      struct netlink_ext_ack *extack)

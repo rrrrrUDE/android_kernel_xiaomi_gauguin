@@ -1478,7 +1478,7 @@ static bool rt_bind_exception(struct rtable *rt, struct fib_nh_exception *fnhe,
 			orig = NULL;
 		}
 		fill_route_from_fnhe(rt, fnhe);
-		if (!rt->rt_gw4) {
+		if (!rt->rt_gw_family) {
 			rt->rt_gw4 = daddr;
 			rt->rt_gw_family = AF_INET;
 		}
@@ -1609,9 +1609,12 @@ static void rt_set_nexthop(struct rtable *rt, __be32 daddr,
 	if (fi) {
 		struct fib_nh *nh = &FIB_RES_NH(*res);
 
-		if (nh->fib_nh_gw4 && nh->fib_nh_scope == RT_SCOPE_LINK) {
-			rt->rt_gw4 = nh->fib_nh_gw4;
-			rt->rt_gw_family = AF_INET;
+		if (nh->fib_nh_gw_family && nh->fib_nh_scope == RT_SCOPE_LINK) {
+			rt->rt_gw_family = nh->fib_nh_gw_family;
+			if (rt->rt_gw_family == AF_INET6)
+				rt->rt_gw6 = nh->fib_nh_gw6;
+			else
+				rt->rt_gw4 = nh->fib_nh_gw4;
 		}
 		dst_init_metrics(&rt->dst, fi->fib_metrics->metrics, true);
 		if (fi->fib_metrics != &dst_default_metrics) {
@@ -1632,7 +1635,7 @@ static void rt_set_nexthop(struct rtable *rt, __be32 daddr,
 			 * However, if we are unsuccessful at storing this
 			 * route into the cache we really need to set it.
 			 */
-			if (!rt->rt_gw4) {
+			if (!rt->rt_gw_family) {
 				rt->rt_gw_family = AF_INET;
 				rt->rt_gw4 = daddr;
 			}
@@ -1806,7 +1809,8 @@ static int __mkroute_input(struct sk_buff *skb,
 	}
 
 	do_cache = res->fi && !itag;
-	if (out_dev == in_dev && err && IN_DEV_TX_REDIRECTS(out_dev) &&
+	if (FIB_RES_NH(*res).fib_nh_gw_family != AF_INET6 &&
+	    out_dev == in_dev && err && IN_DEV_TX_REDIRECTS(out_dev) &&
 	    skb->protocol == htons(ETH_P_IP) &&
 	    (IN_DEV_SHARED_MEDIA(out_dev) ||
 	     inet_addr_onlink(out_dev, saddr, FIB_RES_GW(*res))))
@@ -2351,7 +2355,7 @@ static struct rtable *__mkroute_output(const struct fib_result *res,
 		} else {
 			if (unlikely(fl4->flowi4_flags &
 				     FLOWI_FLAG_KNOWN_NH &&
-				     !(nh->fib_nh_gw4 &&
+				     !(nh->fib_nh_gw_family &&
 				       nh->fib_nh_scope == RT_SCOPE_LINK))) {
 				do_cache = false;
 				goto add;
@@ -2666,6 +2670,8 @@ struct dst_entry *ipv4_blackhole_route(struct net *net, struct dst_entry *dst_or
 		rt->rt_gw_family = ort->rt_gw_family;
 		if (rt->rt_gw_family == AF_INET)
 			rt->rt_gw4 = ort->rt_gw4;
+		else if (rt->rt_gw_family == AF_INET6)
+			rt->rt_gw6 = ort->rt_gw6;
 
 		INIT_LIST_HEAD(&rt->rt_uncached);
 	}
@@ -2749,6 +2755,15 @@ static int rt_fill_info(struct net *net, __be32 dst, __be32 src,
 	if (rt->rt_gw_family == AF_INET &&
 	    nla_put_in_addr(skb, RTA_GATEWAY, rt->rt_gw4))
 		goto nla_put_failure;
+	if (rt->rt_gw_family == AF_INET6) {
+		struct {
+			__kernel_sa_family_t family;
+			struct in6_addr addr;
+		} __packed via = { .family = AF_INET6, .addr = rt->rt_gw6 };
+
+		if (nla_put(skb, RTA_VIA, sizeof(via), &via))
+			goto nla_put_failure;
+	}
 
 	expires = rt->dst.expires;
 	if (expires) {
