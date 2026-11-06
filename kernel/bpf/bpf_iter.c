@@ -666,7 +666,18 @@ BPF_CALL_4(bpf_for_each_map_elem, struct bpf_map *, map, void *, callback_fn,
 	   void *, callback_ctx, u64, flags)
 {
 	return map->ops->map_for_each_callback(map, callback_fn, callback_ctx,
-					   flags);
+					   flags, NULL);
+}
+
+/* The verifier exposes only four arguments. ARM64 supplies the counter
+ * pointer itself, so a BPF program cannot forge this kernel stack pointer.
+ */
+BPF_CALL_5(bpf_for_each_map_elem_tail_call, struct bpf_map *, map,
+	   void *, callback_fn, void *, callback_ctx, u64, flags,
+	   u64 *, counter)
+{
+	return map->ops->map_for_each_callback(map, callback_fn, callback_ctx,
+					   flags, counter);
 }
 
 const struct bpf_func_proto bpf_for_each_map_elem_proto = {

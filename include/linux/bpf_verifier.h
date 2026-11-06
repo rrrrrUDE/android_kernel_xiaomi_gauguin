@@ -207,6 +207,8 @@ struct bpf_func_state {
 	u32 subprogno;
 	/* This frame is entered by a BPF helper callback, not a BPF-to-BPF call. */
 	bool in_callback_fn;
+	/* Nearest synchronous callback frame; inherited by ordinary callees. */
+	u32 callback_frameno;
 	u32 async_entry_cnt;
 	bool in_async_callback_fn;
 

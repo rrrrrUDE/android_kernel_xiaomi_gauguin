@@ -1,0 +1,79 @@
+Map callback subprogram and nesting tests
+========================================
+
+Host reference-scope checks (executes extracted verifier routines):
+
+  python3 tools/testing/selftests/bpf/test_callback_reference_scope.py
+
+Build runtime tests with a recent clang:
+
+  clang -O2 -g -target bpf -Itools/testing/selftests/bpf \
+    -I/usr/include/$(gcc -dumpmachine) \
+    -c tools/testing/selftests/bpf/map_callback_nested.c \
+    -o /tmp/map_callback_nested.o
+  clang -O2 -g -target bpf -Itools/testing/selftests/bpf \
+    -I/usr/include/$(gcc -dumpmachine) \
+    -c tools/testing/selftests/bpf/map_callback_reference.c \
+    -o /tmp/map_callback_reference.o
+
+Build the reference test again with -DBAD_RELEASE and -DLEAK_REFERENCE,
+using different output filenames. Both variants must fail verification:
+BAD_RELEASE tries to release the outer frame's reference through a
+callback subprogram; LEAK_REFERENCE leaks a callback-owned reference
+returned by a subprogram. The default reference test must load.
+
+On the patched device, with a recent bpftool, load the nested object as
+classifier, pin its maps, and run it once with a packet input. The result
+map key 0 must contain the 64-bit integer 18. It covers:
+
+  main -> outer callback -> ordinary subprogram -> inner callback
+       -> ordinary subprogram returning a value outside [0,1]
+
+Example (adapt temporary paths for Android):
+
+  mkdir -p /sys/fs/bpf/callback_nested_maps
+  bpftool prog load /tmp/map_callback_nested.o /sys/fs/bpf/callback_nested \
+    type classifier pinmaps /sys/fs/bpf/callback_nested_maps
+  printf '\0' > /tmp/callback_packet
+  bpftool prog run pinned /sys/fs/bpf/callback_nested \
+    data_in /tmp/callback_packet
+  bpftool map dump pinned /sys/fs/bpf/callback_nested_maps/result
+
+Keep the existing for_each_map_elem_bad_return and bad_ctx rejection tests.
+Host compilation and reference-scope tests do not prove verifier acceptance,
+JIT execution, recursion rejection, or concurrent map mutation on the device.
+
+ARM64 tail calls now use a stack-backed shared counter. JIT-to-JIT calls
+pass it as private AAPCS argument x5; the private for_each helper passes it
+through C map iteration into each callback. Timer callbacks pass NULL and
+start a fresh counter. Top-level BPF entries always start a fresh counter.
+The public BPF helper prototype remains four arguments, so BPF bytecode
+cannot supply the private kernel stack pointer.
+
+Run the emitted-code regression on the host:
+
+  python3 tools/testing/selftests/bpf/test_arm64_callback_tail.py
+
+This executes production JIT prologue/tail/epilogue instructions with a
+modeled C-helper ABI boundary. It checks repeated callbacks, ordinary
+subprogram calls, shared counter exhaustion, invalid indices, empty slots,
+and stack/register restoration. Real kernel concurrency and verifier load
+acceptance still require device execution.
+
+Build map_callback_tail_call.c with the same clang options as the other
+objects. On the device load both programs with a recent bpftool, sharing
+its maps, and put callback_tail_target's fd into targets[0]. Run the entry
+once. result[0] must equal 33, preserving this tree's existing ARM64 limit
+comparison (counter > MAX_TAIL_CALL_CNT). Reset result[0] and repeat: each
+new top-level invocation must start a fresh counter. Remove targets[0]
+and repeat: the helper must fall through and return without a tail target.
+
+The cycle under test is:
+
+  entry -> map helper -> callback -> tail target -> map helper -> callback
+
+Also test ordinary-subprogram tail calls and nested callbacks. Stack depth
+limits remain enforced; ARM64 accounts for saved native registers, the
+counter slot, and retained C map-helper frames before permitting a tail
+call from a nested frame. Some deeper combinations are intentionally
+rejected rather than exceeding the kernel stack bound.

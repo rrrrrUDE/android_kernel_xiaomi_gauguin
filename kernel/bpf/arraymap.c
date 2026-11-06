@@ -670,7 +670,8 @@ static const struct bpf_iter_seq_info iter_seq_info = {
 };
 
 static int bpf_for_each_array_elem(struct bpf_map *map, void *callback_fn,
-				   void *callback_ctx, u64 flags)
+				   void *callback_ctx, u64 flags,
+				   u64 *tail_call_cnt)
 {
 	struct bpf_array *array = container_of(map, struct bpf_array, map);
 	bool is_percpu = map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY;
@@ -687,9 +688,9 @@ static int bpf_for_each_array_elem(struct bpf_map *map, void *callback_fn,
 			array->value + array->elem_size * i;
 		key = i;
 		num_elems++;
-		ret = BPF_CAST_CALL(callback_fn)((u64)(long)map,
+		ret = bpf_map_callback_call(callback_fn, (u64)(long)map,
 			(u64)(long)&key, (u64)(long)val,
-			(u64)(long)callback_ctx, 0);
+			(u64)(long)callback_ctx, tail_call_cnt);
 		if (ret)
 			break;
 	}

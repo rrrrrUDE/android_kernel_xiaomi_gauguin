@@ -146,7 +146,7 @@ struct bpf_map_ops {
 					      struct bpf_func_state *caller,
 					      struct bpf_func_state *callee);
 	int (*map_for_each_callback)(struct bpf_map *map, void *callback_fn,
-				     void *callback_ctx, u64 flags);
+				     void *callback_ctx, u64 flags, u64 *tail_call_cnt);
 
 	/* BTF name and id of struct allocated by map_alloc */
 	const char * const map_btf_name;
@@ -2046,6 +2046,23 @@ extern const struct bpf_func_proto bpf_get_socket_ptr_cookie_proto;
 extern const struct bpf_func_proto bpf_sk_setsockopt_proto;
 extern const struct bpf_func_proto bpf_sk_getsockopt_proto;
 extern const struct bpf_func_proto bpf_for_each_map_elem_proto;
+/* ARM64 JIT-private entry: the fifth argument is never supplied by BPF. */
+u64 bpf_for_each_map_elem_tail_call(u64 map, u64 callback_fn,
+				   u64 callback_ctx, u64 flags, u64 counter);
+
+static inline u64 bpf_map_callback_call(void *fn, u64 map, u64 key,
+				       u64 value, u64 ctx, u64 *counter)
+{
+#ifdef CONFIG_ARM64
+	/* x5 is a private JIT argument, outside the five BPF registers. */
+	return ((u64 (*)(u64, u64, u64, u64, u64, u64 *))fn)
+		(map, key, value, ctx, 0, counter);
+#else
+	return ((u64 (*)(u64, u64, u64, u64, u64))fn)
+		(map, key, value, ctx, 0);
+#endif
+}
+
 extern const struct bpf_func_proto bpf_copy_from_user_proto;
 extern const struct bpf_func_proto bpf_snprintf_btf_proto;
 extern const struct bpf_func_proto bpf_snprintf_proto;

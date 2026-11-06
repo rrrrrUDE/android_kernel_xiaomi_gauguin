@@ -64,8 +64,8 @@ typedef u32 __le32;
 #define BPF_TRAMP_F_SKIP_FRAME 4
 #define BPF_TRAMP_F_IP_ARG 8
 #define IS_ENABLED(x) 1
-struct bpf_prog_aux { bool sleepable; unsigned int stack_depth; };
-struct bpf_prog { bool jited; void *bpf_func; void *insnsi;
+struct bpf_prog_aux { bool sleepable; unsigned int stack_depth, func_idx; };
+struct bpf_prog { bool jited, is_func; void *bpf_func; void *insnsi;
                   struct bpf_prog_aux *aux; };
 struct bpf_tramp_progs { struct bpf_prog *progs[40]; int nr_progs; };
 struct btf_func_model { u8 ret_size, nr_args, arg_size[12]; };
@@ -344,7 +344,7 @@ def main():
             assert words[0] == 0x910003c9 and words[1] == 0xd503201f
             # Tail calls jump directly to the stack allocation instruction.
             assert words[lib.tail_offset()] == 0xd10003ff | (((depth + 15) & ~15) << 10)
-            assert lib.prologue(depth, 1) == lib.tail_offset()
+            assert lib.prologue(depth, 1) == lib.tail_offset() + 1
         # Exercise production compare-and-replace for freplace and fentry.
         for kind in (0, 1):
             lib.patch_site()

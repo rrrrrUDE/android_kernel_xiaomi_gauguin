@@ -464,7 +464,7 @@ static inline int epilogue_offset(const struct jit_ctx *ctx)
 #define STACK_ALIGN(sz) (((sz) + 15) & ~15)
 
 /* Tail call offset to jump into */
-#define PROLOGUE_OFFSET 9
+#define PROLOGUE_OFFSET 12
 
 static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 {
@@ -486,7 +486,9 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	 *                        |FP/LR|
 	 * current A64_FP =>  -16:+-----+
 	 *                        | ... | callee saved registers
-	 * BPF fp register => -64:+-----+ <= (BPF_FP)
+	 *                    -64:+-----+
+	 *                        |counter + padding|
+	 * BPF fp register => -80:+-----+ <= (BPF_FP)
 	 *                        |     |
 	 *                        | ... | BPF prog stack
 	 *                        |     |
@@ -514,12 +516,22 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	emit(A64_PUSH(r8, r9, A64_SP), ctx);
 	emit(A64_PUSH(fp, tcc, A64_SP), ctx);
 
-	/* Set up BPF prog stack base register */
+	/* A local fallback counter outlives every tail target that reuses this
+	 * frame. Ordinary subprograms and synchronous callbacks inherit x5.
+	 * Keep both entry variants the same size for tail-call entry offsets.
+	 */
+	emit(A64_PUSH(A64_ZR, A64_ZR, A64_SP), ctx);
 	emit(A64_MOV(1, fp, A64_SP), ctx);
+	emit(A64_MOV(1, tcc, A64_SP), ctx);
+	if (prog->is_func && prog->aux->func_idx) {
+		emit(A64_CBZ(1, A64_R(5), 2), ctx);
+		emit(A64_MOV(1, tcc, A64_R(5)), ctx);
+	} else {
+		emit(aarch64_insn_gen_nop(), ctx);
+		emit(aarch64_insn_gen_nop(), ctx);
+	}
 
 	if (!ebpf_from_cbpf) {
-		/* Initialize tail_call_cnt */
-		emit(A64_MOVZ(1, tcc, 0, 0), ctx);
 
 		cur_offset = ctx->idx - idx0;
 		if (cur_offset != PROLOGUE_OFFSET) {
@@ -536,7 +548,6 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	return 0;
 }
 
-static int out_offset = -1; /* initialized on the first pass of build_body() */
 static int emit_bpf_tail_call(struct jit_ctx *ctx)
 {
 	/* bpf_tail_call(void *prog_ctx, struct bpf_array *array, u64 index) */
@@ -546,10 +557,8 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
 	const u8 tmp = bpf2a64[TMP_REG_1];
 	const u8 prg = bpf2a64[TMP_REG_2];
 	const u8 tcc = bpf2a64[TCALL_CNT];
-	const int idx0 = ctx->idx;
-#define cur_offset (ctx->idx - idx0)
-#define jmp_offset (out_offset - (cur_offset))
 	size_t off;
+	int bounds_branch, count_branch, null_branch;
 
 	/* if (index >= array->map.max_entries)
 	 *     goto out;
@@ -559,16 +568,20 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
 	emit(A64_LDR32(tmp, r2, tmp), ctx);
 	emit(A64_MOV(0, r3, r3), ctx);
 	emit(A64_CMP(0, r3, tmp), ctx);
-	emit(A64_B_(A64_COND_CS, jmp_offset), ctx);
+	bounds_branch = ctx->idx;
+	emit(A64_B_(A64_COND_CS, 0), ctx);
 
 	/* if (tail_call_cnt > MAX_TAIL_CALL_CNT)
 	 *     goto out;
 	 * tail_call_cnt++;
 	 */
+	emit(A64_LDR64(A64_R(12), tcc, A64_ZR), ctx);
 	emit_a64_mov_i64(tmp, MAX_TAIL_CALL_CNT, ctx);
-	emit(A64_CMP(1, tcc, tmp), ctx);
-	emit(A64_B_(A64_COND_HI, jmp_offset), ctx);
-	emit(A64_ADD_I(1, tcc, tcc, 1), ctx);
+	emit(A64_CMP(1, A64_R(12), tmp), ctx);
+	count_branch = ctx->idx;
+	emit(A64_B_(A64_COND_HI, 0), ctx);
+	emit(A64_ADD_I(1, A64_R(12), A64_R(12), 1), ctx);
+	emit(A64_STR64(A64_R(12), tcc, A64_ZR), ctx);
 
 	/* prog = array->ptrs[index];
 	 * if (prog == NULL)
@@ -579,7 +592,8 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
 	emit(A64_ADD(1, tmp, r2, tmp), ctx);
 	emit(A64_LSL(1, prg, r3, 3), ctx);
 	emit(A64_LDR64(prg, tmp, prg), ctx);
-	emit(A64_CBZ(1, prg, jmp_offset), ctx);
+	null_branch = ctx->idx;
+	emit(A64_CBZ(1, prg, 0), ctx);
 
 	/* goto *(prog->bpf_func + prologue_offset); */
 	off = offsetof(struct bpf_prog, bpf_func);
@@ -589,17 +603,18 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
 	emit(A64_ADD_I(1, A64_SP, A64_SP, ctx->stack_size), ctx);
 	emit(A64_BR(tmp), ctx);
 
-	/* out: */
-	if (out_offset == -1)
-		out_offset = cur_offset;
-	if (cur_offset != out_offset) {
-		pr_err_once("tail_call out_offset = %d, expected %d!\n",
-			    cur_offset, out_offset);
-		return -1;
+	/* Patch exits using this emission's positions, with no global size
+	 * cache shared by concurrently compiled programs.
+	 */
+	if (ctx->image) {
+		ctx->image[bounds_branch] = cpu_to_le32(A64_B_(A64_COND_CS,
+			ctx->idx - bounds_branch));
+		ctx->image[count_branch] = cpu_to_le32(A64_B_(A64_COND_HI,
+			ctx->idx - count_branch));
+		ctx->image[null_branch] = cpu_to_le32(A64_CBZ(1, prg,
+			ctx->idx - null_branch));
 	}
 	return 0;
-#undef cur_offset
-#undef jmp_offset
 }
 
 static void build_epilogue(struct jit_ctx *ctx)
@@ -614,6 +629,8 @@ static void build_epilogue(struct jit_ctx *ctx)
 	/* We're done with BPF stack */
 	emit(A64_ADD_I(1, A64_SP, A64_SP, ctx->stack_size), ctx);
 
+	/* Discard the local counter before restoring callee-saved registers. */
+	emit(A64_ADD_I(1, A64_SP, A64_SP, 16), ctx);
 	/* Restore fs (x25) and x26 */
 	emit(A64_POP(fp, A64_R(26), A64_SP), ctx);
 
@@ -972,8 +989,16 @@ emit_cond_jmp:
 	case BPF_JMP | BPF_CALL:
 	{
 		const u8 r0 = bpf2a64[BPF_REG_0];
-		const u64 func = (u64)__bpf_call_base + imm;
+		u64 func = (u64)__bpf_call_base + imm;
 
+		if (insn->src_reg == BPF_PSEUDO_CALL) {
+			/* Sixth AAPCS argument is private to the JIT. */
+			emit(A64_MOV(1, A64_R(5), bpf2a64[TCALL_CNT]), ctx);
+		} else if (func == (u64)bpf_for_each_map_elem_proto.func) {
+			/* The public helper has only four arguments. */
+			emit(A64_MOV(1, A64_R(4), bpf2a64[TCALL_CNT]), ctx);
+			func = (u64)bpf_for_each_map_elem_tail_call;
+		}
 		if (ctx->prog->is_func)
 			emit_addr_mov_i64(tmp, func, ctx);
 		else

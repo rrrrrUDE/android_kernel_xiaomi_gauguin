@@ -807,8 +807,7 @@ static int acquire_reference_state(struct bpf_verifier_env *env, int insn_idx)
 	id = ++env->id_gen;
 	state->refs[new_ofs].id = id;
 	state->refs[new_ofs].insn_idx = insn_idx;
-	state->refs[new_ofs].callback_ref = state->in_callback_fn ?
-					   state->frameno : 0;
+	state->refs[new_ofs].callback_ref = state->callback_frameno;
 
 	return id;
 }
@@ -821,8 +820,8 @@ static int release_reference_state(struct bpf_func_state *state, int ptr_id)
 	last_idx = state->acquired_refs - 1;
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].id == ptr_id) {
-			if (state->in_callback_fn &&
-			    state->refs[i].callback_ref != state->frameno)
+			if (state->callback_frameno &&
+			    state->refs[i].callback_ref != state->callback_frameno)
 				return -EINVAL;
 			if (last_idx && i != last_idx)
 				memcpy(&state->refs[i], &state->refs[last_idx],
@@ -3734,6 +3733,8 @@ static int check_max_stack_depth(struct bpf_verifier_env *env)
 	int ret_insn[MAX_CALL_FRAMES];
 	int ret_prog[MAX_CALL_FRAMES];
 	int j;
+	int native_depth = 0;
+	int ret_native[MAX_CALL_FRAMES];
 
 process_func:
 	/* protect against potential stack overflow that might happen when
@@ -3755,10 +3756,11 @@ process_func:
 	 * tailcall will unwind the current stack frame but it will not get rid
 	 * of caller's stack as shown on the example above.
 	 */
-	if (idx && subprog[idx].has_tail_call && depth >= 256) {
+	if (idx && subprog[idx].has_tail_call &&
+	    depth + native_depth >= 256) {
 		verbose(env,
 			"tail_calls are not allowed when call stack of previous frames is %d bytes. Too large\n",
-			depth);
+			depth + native_depth);
 		return -EACCES;
 	}
 	/* round up to 32-bytes, since this is granularity
@@ -3780,6 +3782,15 @@ continue_func:
 		/* remember insn and function to return to */
 		ret_insn[frame] = i + 1;
 		ret_prog[frame] = idx;
+		ret_native[frame] = native_depth;
+		if (IS_ENABLED(CONFIG_ARM64)) {
+			/* JIT saved registers and counter slot survive subprog
+			 * tail calls. Map callbacks also retain C helper frames.
+			 */
+			native_depth += 80;
+			if (bpf_pseudo_func(&insn[i]))
+				native_depth += 128;
+		}
 
 		/* find the callee */
 		i = i + insn[i].imm + 1;
@@ -3819,6 +3830,7 @@ continue_func:
 		return 0;
 	depth -= round_up(max_t(u32, subprog[idx].stack_depth, 1), 32);
 	frame--;
+	native_depth = ret_native[frame];
 	i = ret_insn[frame];
 	idx = ret_prog[frame];
 	goto continue_func;
@@ -5313,7 +5325,8 @@ static bool may_update_sockmap(struct bpf_verifier_env *env, int func_id)
 
 static bool allow_tail_call_in_subprogs(struct bpf_verifier_env *env)
 {
-	return env->prog->jit_requested && IS_ENABLED(CONFIG_X86_64);
+	return env->prog->jit_requested &&
+	       (IS_ENABLED(CONFIG_X86_64) || IS_ENABLED(CONFIG_ARM64));
 }
 
 static int check_map_func_compatibility(struct bpf_verifier_env *env,
@@ -5737,12 +5750,6 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	int i, err, subprog, target_insn;
 	bool is_global = false;
 
-	/* Keep inherited references within this callback's frame. */
-	if (cur_func(env)->in_callback_fn) {
-		verbose(env, "subprogram calls inside map callbacks are not supported\n");
-		return -EINVAL;
-	}
-
 	if (state->curframe + 1 >= MAX_CALL_FRAMES) {
 		verbose(env, "the call stack of %d frames is too deep\n",
 			state->curframe + 2);
@@ -5806,6 +5813,8 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			state->curframe + 1 /* frameno within this callchain */,
 			subprog /* subprog number within this prog */);
 
+	/* Ordinary callees remain in the enclosing callback reference scope. */
+	callee->callback_frameno = caller->callback_frameno;
 	/* Transfer references to the callee */
 	err = transfer_reference_state(callee, caller);
 	if (err)
@@ -6003,21 +6012,31 @@ record_func_key(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 	return 0;
 }
 
-static int check_reference_leak(struct bpf_verifier_env *env)
+static int check_reference_leak_scope(struct bpf_verifier_env *env,
+				      bool tail_call)
 {
 	struct bpf_func_state *state = cur_func(env);
 	bool leaked = false;
 	int i;
 
+	/* Ordinary subprograms may transfer live references back to callers. */
+	if (!tail_call && state->frameno && !state->in_callback_fn)
+		return 0;
+
 	for (i = 0; i < state->acquired_refs; i++) {
-		if (state->in_callback_fn &&
-		    state->refs[i].callback_ref != state->frameno)
+		if (state->callback_frameno &&
+		    state->refs[i].callback_ref != state->callback_frameno)
 			continue;
 		verbose(env, "Unreleased reference id=%d alloc_insn=%d\n",
 			state->refs[i].id, state->refs[i].insn_idx);
 		leaked = true;
 	}
 	return leaked ? -EINVAL : 0;
+}
+
+static int check_reference_leak(struct bpf_verifier_env *env)
+{
+	return check_reference_leak_scope(env, false);
 }
 
 static int check_bpf_snprintf_call(struct bpf_verifier_env *env,
@@ -6062,10 +6081,6 @@ static int check_map_elem_callback(struct bpf_verifier_env *env,
 	struct bpf_map *map;
 	int err;
 
-	if (caller->in_callback_fn) {
-		verbose(env, "nested map callbacks are not supported\n");
-		return -EINVAL;
-	}
 	if (state->curframe + 1 >= MAX_CALL_FRAMES ||
 	    state->frame[state->curframe + 1] ||
 	    subprogno >= env->subprog_cnt)
@@ -6096,6 +6111,7 @@ static int check_map_elem_callback(struct bpf_verifier_env *env,
 		return err;
 	}
 	callee->in_callback_fn = true;
+	callee->callback_frameno = callee->frameno;
 	state->curframe++;
 	*insn_idx = env->subprog_info[subprogno].start - 1;
 	return 0;
@@ -6233,10 +6249,6 @@ static int check_helper_call(struct bpf_verifier_env *env, int func_id,
 			func_id);
 		return -EINVAL;
 	}
-	if (cur_func(env)->in_callback_fn && func_id == BPF_FUNC_tail_call) {
-		verbose(env, "tail calls inside map callbacks are not supported\n");
-		return -EINVAL;
-	}
 
 	/* eBPF programs must be GPL compatible to use GPL-ed functions */
 	if (!env->prog->gpl_compatible && fn->gpl_only) {
@@ -6299,7 +6311,7 @@ static int check_helper_call(struct bpf_verifier_env *env, int func_id,
 	}
 
 	if (func_id == BPF_FUNC_tail_call) {
-		err = check_reference_leak(env);
+		err = check_reference_leak_scope(env, true);
 		if (err) {
 			verbose(env, "tail_call would lead to reference leak\n");
 			return err;
@@ -9214,7 +9226,7 @@ static int check_ld_abs(struct bpf_verifier_env *env, struct bpf_insn *insn)
 	 * gen_ld_abs() may terminate the program at runtime, leading to
 	 * reference leak.
 	 */
-	err = check_reference_leak(env);
+	err = check_reference_leak_scope(env, true);
 	if (err) {
 		verbose(env, "BPF_LD_[ABS|IND] cannot be mixed with socket references\n");
 		return err;
@@ -10336,6 +10348,12 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 			      struct bpf_func_state *cur)
 {
 	int i;
+
+	/* Callback and ordinary returns have different constraints. */
+	if (old->in_callback_fn != cur->in_callback_fn ||
+	    old->callback_frameno != cur->callback_frameno ||
+	    old->in_async_callback_fn != cur->in_async_callback_fn)
+		return false;
 
 	memset(env->idmap_scratch, 0, sizeof(env->idmap_scratch));
 	for (i = 0; i < MAX_BPF_REG; i++)
