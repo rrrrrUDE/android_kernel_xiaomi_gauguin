@@ -1,0 +1,53 @@
+BPF memory cgroup accounting on 4.19
+===================================
+
+The BPF map/program RLIMIT_MEMLOCK charge is removed, including when MEMCG
+is disabled, matching the 5.15 policy. The retained map page estimates only
+supply legacy fdinfo; they are not a cgroup usage counter. Program creator
+UID references remain for program information.
+
+Map creation storage and BPF program/aux/stat allocations use ACCOUNT flags.
+Maps pin their creator memcg for subsequent hash, trie, local storage,
+timer, devmap, cpumap and sockhash allocations, including interrupt updates.
+Charge scopes restore prior process/interrupt context on allocation failure.
+Offline creators fall back to their nearest online ancestor.
+
+4.19 dependencies:
+
+* Prime per-memcg kmalloc caches before map/program creation. The old slab
+  allocator otherwise allows initial allocations into global caches while
+  asynchronously creating cgroup caches. Failed preparation rejects creation.
+* Per-CPU objects share backing pages. The allocator tracks accounted objects
+  and charges their CPU-expanded, page-rounded logical sizes to the native
+  memory/kmem counters. Metadata failure or allocation failure rolls back;
+  free_percpu releases the charge regardless of the freeing task's cgroup.
+  This intentionally uses 4.19 page granularity, rather than importing 5.15's
+  byte-granular obj_cgroup allocator. Small objects can cost more than 5.15.
+* Native 4.19 slab accounting releases slab pages when caches release them;
+  usage need not fall immediately when a single object is freed. Removed
+  cgroups can retain outstanding charges until the allocations are freed.
+
+Host regression (kernel allocators, CSS and locks are stubbed):
+
+  python3 tools/testing/selftests/bpf/test_memcg_scopes.py
+  python3 tools/testing/selftests/bpf/test_memcg_percpu.py
+
+Device regression:
+
+Compile memcg_accounting_user.c with an Android ARM64 compiler and exported
+UAPI from this tree. Run as root in a dedicated memory cgroup with sufficient
+headroom; keep unrelated workload out of both measurement cgroups. The test
+sets its own MEMLOCK limit to zero, creates array/percpu/dynamic hash maps,
+and pauses for inspection and migration into a second cgroup before updates.
+Use memory.usage_in_bytes and memory.kmem.usage_in_bytes on cgroup v1, or
+memory.current on v2. Dynamic growth should belong to the creator, not the
+updating task's new cgroup. After exit, wait for deferred map frees and
+allocator reclaim before comparing baseline usage. Repeat with low memory
+limits to verify failures and rollback, with the original cgroup removed
+while maps remain pinned, and with programs that allocate timer/local storage
+from IRQ contexts. Host tests do not validate those kernel execution paths.
+
+Accounting needs MEMCG and MEMCG_KMEM enabled and active at runtime. Remove
+boot arguments such as cgroup_disable=memory or cgroup.memory=nokmem to test
+it. This patch does not change defconfig or the boot command line. With
+accounting disabled, allocations still work but are not cgroup charged.

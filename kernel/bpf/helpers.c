@@ -1133,8 +1133,8 @@ BPF_CALL_3(bpf_timer_init, struct bpf_timer_kern *, timer, struct bpf_map *, map
 		ret = -EBUSY;
 		goto out;
 	}
-	/* Account the dynamically allocated timer to the current memcg. */
-	t = kmalloc_node(sizeof(*t), GFP_ATOMIC | __GFP_ACCOUNT,
+	/* Charge timers to their map owner, including updates from interrupts. */
+	t = bpf_map_kmalloc_node(map, sizeof(*t), GFP_ATOMIC,
 			 map->numa_node);
 	if (!t) {
 		ret = -ENOMEM;

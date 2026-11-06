@@ -1283,6 +1283,9 @@ int memcg_kmem_charge(struct page *page, gfp_t gfp, int order);
 void memcg_kmem_uncharge(struct page *page, int order);
 
 #ifdef CONFIG_MEMCG_KMEM
+int memcg_kmem_prepare_bpf(void);
+struct mem_cgroup *memcg_kmem_charge_percpu(gfp_t gfp, unsigned int nr_pages);
+void memcg_kmem_uncharge_percpu(struct mem_cgroup *memcg, unsigned int nr_pages);
 extern struct static_key_false memcg_kmem_enabled_key;
 extern struct workqueue_struct *memcg_kmem_cache_wq;
 
@@ -1324,6 +1327,11 @@ extern void memcg_set_shrinker_bit(struct mem_cgroup *memcg,
 static inline bool memcg_kmem_enabled(void)
 {
 	return false;
+}
+
+static inline int memcg_kmem_prepare_bpf(void)
+{
+	return 0;
 }
 
 static inline int memcg_cache_id(struct mem_cgroup *memcg)

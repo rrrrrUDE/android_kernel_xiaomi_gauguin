@@ -79,6 +79,9 @@ EXPORT_SYMBOL(memory_cgrp_subsys);
 
 struct mem_cgroup *root_mem_cgroup __read_mostly;
 
+DEFINE_PER_CPU(struct mem_cgroup *, int_active_memcg);
+EXPORT_PER_CPU_SYMBOL_GPL(int_active_memcg);
+
 #define MEM_CGROUP_RECLAIM_RETRIES	5
 
 /* Socket memory accounting disabled? */
@@ -884,14 +887,27 @@ EXPORT_SYMBOL(get_mem_cgroup_from_page);
 /**
  * If current->active_memcg is non-NULL, do not fallback to current->mm->memcg.
  */
+static __always_inline struct mem_cgroup *active_memcg(void)
+{
+	return in_task() ? current->active_memcg : this_cpu_read(int_active_memcg);
+}
+
 static __always_inline struct mem_cgroup *get_mem_cgroup_from_current(void)
 {
-	if (unlikely(current->active_memcg)) {
-		struct mem_cgroup *memcg = root_mem_cgroup;
+	struct mem_cgroup *memcg = active_memcg();
 
+	if (unlikely(memcg)) {
 		rcu_read_lock();
-		if (css_tryget_online(&current->active_memcg->css))
-			memcg = current->active_memcg;
+		/* A map can outlive its creator's cgroup. Charge its nearest
+		 * online ancestor instead of falling back to the updating task.
+		 */
+		while (!css_tryget_online(&memcg->css)) {
+			memcg = parent_mem_cgroup(memcg);
+			if (!memcg) {
+				memcg = root_mem_cgroup;
+				break;
+			}
+		}
 		rcu_read_unlock();
 		return memcg;
 	}
@@ -2500,6 +2516,51 @@ static void memcg_free_cache_id(int id)
 	ida_simple_remove(&memcg_cache_ida, id);
 }
 
+/* BPF cannot let the first allocation escape into a global slab while
+ * 4.19 asynchronously creates the per-cgroup cache. Prime kmalloc caches
+ * before publishing a map or loading a program, including online ancestors
+ * used when a pinned map's original cgroup is later removed.
+ */
+int memcg_kmem_prepare_bpf(void)
+{
+	struct mem_cgroup *owner, *memcg;
+	struct kmem_cache *cache;
+	int type, index, id, ret = 0;
+
+	if (!memcg_kmem_enabled() || mem_cgroup_disabled())
+		return 0;
+	owner = get_mem_cgroup_from_current();
+	for (memcg = owner; memcg && !mem_cgroup_is_root(memcg);
+	     memcg = parent_mem_cgroup(memcg)) {
+		id = READ_ONCE(memcg->kmemcg_id);
+		if (id < 0)
+			continue;
+		for (type = 0; type < NR_KMALLOC_TYPES; type++) {
+			for (index = 0; index <= KMALLOC_SHIFT_HIGH; index++) {
+				cache = kmalloc_caches[type][index];
+				if (!cache)
+					continue;
+				rcu_read_lock();
+				if (cache_from_memcg_idx(cache, id)) {
+					rcu_read_unlock();
+					continue;
+				}
+				rcu_read_unlock();
+				memcg_create_kmem_cache(memcg, cache);
+				rcu_read_lock();
+				if (!cache_from_memcg_idx(cache, id))
+					ret = -ENOMEM;
+				rcu_read_unlock();
+				if (ret)
+					goto out;
+			}
+		}
+	}
+out:
+	mem_cgroup_put(owner);
+	return ret;
+}
+
 struct memcg_kmem_cache_create_work {
 	struct mem_cgroup *memcg;
 	struct kmem_cache *cachep;
@@ -2561,7 +2622,8 @@ static void memcg_schedule_kmem_cache_create(struct mem_cgroup *memcg,
 
 static inline bool memcg_kmem_bypass(void)
 {
-	if (in_interrupt() || !current->mm || (current->flags & PF_KTHREAD))
+	if (!active_memcg() &&
+	    (in_interrupt() || !current->mm || (current->flags & PF_KTHREAD)))
 		return true;
 	return false;
 }
@@ -2729,6 +2791,51 @@ void memcg_kmem_uncharge(struct page *page, int order)
 
 	css_put_many(&memcg->css, nr_pages);
 }
+/* Per-CPU objects share backing pages. Charge their logical allocation
+ * separately, using the native 4.19 page counters and reference protocol.
+ */
+struct mem_cgroup *memcg_kmem_charge_percpu(gfp_t gfp, unsigned int nr_pages)
+{
+	struct mem_cgroup *memcg;
+	struct page_counter *counter;
+	int ret;
+
+	if (!memcg_kmem_enabled() || mem_cgroup_disabled() || memcg_kmem_bypass())
+		return NULL;
+	memcg = get_mem_cgroup_from_current();
+	if (mem_cgroup_is_root(memcg)) {
+		mem_cgroup_put(memcg);
+		return NULL;
+	}
+	ret = try_charge(memcg, gfp, nr_pages);
+	if (ret)
+		goto out;
+	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys) &&
+	    !page_counter_try_charge(&memcg->kmem, nr_pages, &counter)) {
+		cancel_charge(memcg, nr_pages);
+		ret = -ENOMEM;
+		goto out;
+	}
+	/* try_charge holds nr_pages css references until uncharge. */
+	mem_cgroup_put(memcg);
+	return memcg;
+out:
+	mem_cgroup_put(memcg);
+	return ERR_PTR(ret);
+}
+
+void memcg_kmem_uncharge_percpu(struct mem_cgroup *memcg, unsigned int nr_pages)
+{
+	if (!memcg)
+		return;
+	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
+		page_counter_uncharge(&memcg->kmem, nr_pages);
+	page_counter_uncharge(&memcg->memory, nr_pages);
+	if (do_memsw_account())
+		page_counter_uncharge(&memcg->memsw, nr_pages);
+	css_put_many(&memcg->css, nr_pages);
+}
+
 #endif /* CONFIG_MEMCG_KMEM */
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE

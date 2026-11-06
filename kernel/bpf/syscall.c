@@ -8,6 +8,8 @@
 #include <linux/btf.h>
 #include <linux/syscalls.h>
 #include <linux/slab.h>
+#include <linux/memcontrol.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
 #include <linux/vmalloc.h>
 #include <linux/mmzone.h>
@@ -313,7 +315,7 @@ static void *__bpf_map_area_alloc(u64 size, int numa_node, bool mmapable)
 	 * __GFP_RETRY_MAYFAIL to avoid such situations.
 	 */
 
-	const gfp_t gfp = __GFP_NOWARN | __GFP_ZERO;
+	const gfp_t gfp = __GFP_NOWARN | __GFP_ZERO | __GFP_ACCOUNT;
 	unsigned int flags = 0;
 	unsigned long align = 1;
 	void *area;
@@ -375,49 +377,19 @@ void bpf_map_init_from_attr(struct bpf_map *map, union bpf_attr *attr)
 	map->numa_node = bpf_map_attr_numa_node(attr);
 }
 
-static int bpf_charge_memlock(struct user_struct *user, u32 pages)
-{
-	unsigned long memlock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
-
-	if (atomic_long_add_return(pages, &user->locked_vm) > memlock_limit) {
-		atomic_long_sub(pages, &user->locked_vm);
-		return -EPERM;
-	}
-	return 0;
-}
-
-static void bpf_uncharge_memlock(struct user_struct *user, u32 pages)
-{
-	if (user)
-		atomic_long_sub(pages, &user->locked_vm);
-}
-
+/* Legacy map implementations retain allocation estimates for fdinfo. Actual
+ * limits and ownership are enforced by the accounted allocators, not rlimits.
+ */
 int bpf_map_charge_init(struct bpf_map_memory *mem, u64 size)
 {
-	u32 pages = round_up(size, PAGE_SIZE) >> PAGE_SHIFT;
-	struct user_struct *user;
-	int ret;
-
 	if (size >= U32_MAX - PAGE_SIZE)
 		return -E2BIG;
-
-	user = get_current_user();
-	ret = bpf_charge_memlock(user, pages);
-	if (ret) {
-		free_uid(user);
-		return ret;
-	}
-
-	mem->pages = pages;
-	mem->user = user;
-
+	mem->pages = round_up(size, PAGE_SIZE) >> PAGE_SHIFT;
 	return 0;
 }
 
 void bpf_map_charge_finish(struct bpf_map_memory *mem)
 {
-	bpf_uncharge_memlock(mem->user, mem->pages);
-	free_uid(mem->user);
 }
 
 void bpf_map_charge_move(struct bpf_map_memory *dst,
@@ -431,18 +403,12 @@ void bpf_map_charge_move(struct bpf_map_memory *dst,
 
 int bpf_map_charge_memlock(struct bpf_map *map, u32 pages)
 {
-	int ret;
-
-	ret = bpf_charge_memlock(map->memory.user, pages);
-	if (ret)
-		return ret;
 	map->memory.pages += pages;
-	return ret;
+	return 0;
 }
 
 void bpf_map_uncharge_memlock(struct bpf_map *map, u32 pages)
 {
-	bpf_uncharge_memlock(map->memory.user, pages);
 	map->memory.pages -= pages;
 }
 
@@ -490,6 +456,65 @@ void bpf_map_free_id(struct bpf_map *map, bool do_idr_lock)
 		__release(&map_idr_lock);
 }
 
+#ifdef CONFIG_MEMCG_KMEM
+static void bpf_map_save_memcg(struct bpf_map *map)
+{
+	map->memcg = get_mem_cgroup_from_mm(current->mm);
+}
+
+static void bpf_map_release_memcg(struct bpf_map *map)
+{
+	mem_cgroup_put(map->memcg);
+}
+
+void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
+			   int node)
+{
+	struct mem_cgroup *old_memcg;
+	void *ptr;
+
+	old_memcg = set_active_memcg(map->memcg);
+	ptr = kmalloc_node(size, flags | __GFP_ACCOUNT, node);
+	set_active_memcg(old_memcg);
+
+	return ptr;
+}
+
+void *bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags)
+{
+	struct mem_cgroup *old_memcg;
+	void *ptr;
+
+	old_memcg = set_active_memcg(map->memcg);
+	ptr = kzalloc(size, flags | __GFP_ACCOUNT);
+	set_active_memcg(old_memcg);
+
+	return ptr;
+}
+
+void __percpu *bpf_map_alloc_percpu(const struct bpf_map *map, size_t size,
+				    size_t align, gfp_t flags)
+{
+	struct mem_cgroup *old_memcg;
+	void __percpu *ptr;
+
+	old_memcg = set_active_memcg(map->memcg);
+	ptr = __alloc_percpu_gfp(size, align, flags | __GFP_ACCOUNT);
+	set_active_memcg(old_memcg);
+
+	return ptr;
+}
+
+#else
+static void bpf_map_save_memcg(struct bpf_map *map)
+{
+}
+
+static void bpf_map_release_memcg(struct bpf_map *map)
+{
+}
+#endif
+
 /* called from workqueue */
 static void bpf_map_free_deferred(struct work_struct *work)
 {
@@ -498,6 +523,7 @@ static void bpf_map_free_deferred(struct work_struct *work)
 
 	bpf_map_charge_move(&mem, &map->memory);
 	security_bpf_map_free(map);
+	bpf_map_release_memcg(map);
 	/* implementation dependent freeing */
 	map->ops->map_free(map);
 	bpf_map_charge_finish(&mem);
@@ -867,10 +893,16 @@ static int map_create(union bpf_attr *attr)
 	     !node_online(numa_node)))
 		return -EINVAL;
 
+	err = memcg_kmem_prepare_bpf();
+	if (err)
+		return err;
+
 	/* find map type and init map: hashtable vs rbtree vs bloom vs ... */
 	map = find_and_alloc_map(attr);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+
+	bpf_map_save_memcg(map);
 
 	err = bpf_obj_name_cpy(map->name, attr->map_name,
 			       sizeof(attr->map_name));
@@ -938,6 +970,7 @@ static int map_create(union bpf_attr *attr)
 free_map_sec:
 	security_bpf_map_free(map);
 free_map:
+	bpf_map_release_memcg(map);
 	btf_put(map->btf);
 	bpf_map_charge_move(&mem, &map->memory);
 	map->ops->map_free(map);
@@ -1714,49 +1747,15 @@ static void bpf_audit_prog(const struct bpf_prog *prog, unsigned int op)
 	audit_log_end(ab);
 }
 
-int __bpf_prog_charge(struct user_struct *user, u32 pages)
+static int bpf_prog_save_user(struct bpf_prog *prog)
 {
-	unsigned long memlock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
-	unsigned long user_bufs;
-
-	if (user) {
-		user_bufs = atomic_long_add_return(pages, &user->locked_vm);
-		if (user_bufs > memlock_limit) {
-			atomic_long_sub(pages, &user->locked_vm);
-			return -EPERM;
-		}
-	}
-
+	prog->aux->user = get_current_user();
 	return 0;
 }
 
-void __bpf_prog_uncharge(struct user_struct *user, u32 pages)
+static void bpf_prog_release_user(struct bpf_prog *prog)
 {
-	if (user)
-		atomic_long_sub(pages, &user->locked_vm);
-}
-
-static int bpf_prog_charge_memlock(struct bpf_prog *prog)
-{
-	struct user_struct *user = get_current_user();
-	int ret;
-
-	ret = __bpf_prog_charge(user, prog->pages);
-	if (ret) {
-		free_uid(user);
-		return ret;
-	}
-
-	prog->aux->user = user;
-	return 0;
-}
-
-static void bpf_prog_uncharge_memlock(struct bpf_prog *prog)
-{
-	struct user_struct *user = prog->aux->user;
-
-	__bpf_prog_uncharge(user, prog->pages);
-	free_uid(user);
+	free_uid(prog->aux->user);
 }
 
 static int bpf_prog_alloc_id(struct bpf_prog *prog)
@@ -1808,7 +1807,7 @@ static void __bpf_prog_put_rcu(struct rcu_head *rcu)
 
 	kvfree(aux->func_info);
 	kfree(aux->func_info_aux);
-	bpf_prog_uncharge_memlock(aux->prog);
+	bpf_prog_release_user(aux->prog);
 	security_bpf_prog_free(aux);
 	bpf_prog_free(aux->prog);
 }
@@ -2287,6 +2286,10 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr)
 	}
 
 	/* plain bpf_prog allocation */
+	err = memcg_kmem_prepare_bpf();
+	if (err)
+		goto put_attach_target;
+
 	prog = bpf_prog_alloc(bpf_prog_size(attr->insn_cnt), GFP_USER);
 	if (!prog) {
 		err = -ENOMEM;
@@ -2305,7 +2308,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr)
 	if (err)
 		goto free_prog_nouncharge;
 
-	err = bpf_prog_charge_memlock(prog);
+	err = bpf_prog_save_user(prog);
 	if (err)
 		goto free_prog_sec;
 
@@ -2384,7 +2387,7 @@ free_used_maps:
 	__bpf_prog_put_noref(prog, prog->aux->func_cnt);
 	return err;
 free_prog:
-	bpf_prog_uncharge_memlock(prog);
+	bpf_prog_release_user(prog);
 free_prog_sec:
 	security_bpf_prog_free(prog->aux);
 free_prog_nouncharge:
