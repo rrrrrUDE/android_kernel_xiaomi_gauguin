@@ -22,6 +22,9 @@
 #include <linux/bpf.h>
 #include <linux/extable.h>
 #include <linux/filter.h>
+#include <linux/ftrace.h>
+#include <linux/cpu.h>
+#include <linux/memory.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 
@@ -137,90 +140,210 @@ static inline void emit_a64_mov_i64(const int reg, const u64 val,
 	}
 }
 
-/* Direct ftrace enters with x9 holding the original LR and x30 the
- * address following the patched BL.  Preserve both across BPF calls.
+/* Direct ftrace and the JIT patch site both pass the original LR in x9.
+ * x30 points past the patched BL. No target frame has been allocated yet.
  */
-static int prepare_fentry_trampoline(void *image, void *image_end,
-				     const struct btf_func_model *m,
-				     u32 flags, struct bpf_tramp_progs *tprogs,
-				     void *orig_call)
-{
-	struct jit_ctx ctx = { .image = image };
-	bool ip_arg = flags & BPF_TRAMP_F_IP_ARG;
-	unsigned int nr = tprogs[BPF_TRAMP_FENTRY].nr_progs;
-	unsigned int ctx_off = ip_arg ? sizeof(u64) : 0;
-	unsigned int stack_size = 80;
-	int i;
+#define TRAMP_STACK_SIZE 224
+#define TRAMP_REGS_OFF 144
+/* Reserve outgoing stack arguments before the BPF context. */
+#define TRAMP_CTX_OFF 32
 
-	if (!orig_call || m->nr_args > 8 ||
-	    flags & ~(BPF_TRAMP_F_RESTORE_REGS | BPF_TRAMP_F_IP_ARG) ||
-	    !(flags & BPF_TRAMP_F_RESTORE_REGS) ||
-	    tprogs[BPF_TRAMP_FEXIT].nr_progs ||
-	    tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs ||
-	    (u8 *)image_end - (u8 *)image < (100 + nr * 40) * sizeof(u32))
+static void tramp_call(struct jit_ctx *ctx, unsigned long func)
+{
+	emit_a64_mov_i64(A64_R(10), func, ctx);
+	emit(A64_BLR(A64_R(10)), ctx);
+}
+
+static void tramp_store(struct jit_ctx *ctx, int reg, unsigned int off)
+{
+	emit_a64_mov_i(1, A64_R(10), off, ctx);
+	emit(A64_STR64(reg, A64_SP, A64_R(10)), ctx);
+}
+
+static void tramp_load(struct jit_ctx *ctx, int reg, unsigned int off)
+{
+	emit_a64_mov_i(1, A64_R(10), off, ctx);
+	emit(A64_LDR64(reg, A64_SP, A64_R(10)), ctx);
+}
+
+static void tramp_invoke(struct jit_ctx *ctx, struct bpf_prog *prog,
+			 unsigned int ctx_off, unsigned int ret_off,
+			 bool save_ret)
+{
+	bool sleepable = prog->aux->sleepable;
+
+	tramp_call(ctx, sleepable ? (unsigned long)__bpf_prog_enter_sleepable :
+		   (unsigned long)__bpf_prog_enter);
+	if (!sleepable)
+		emit(A64_MOV(1, A64_R(20), A64_R(0)), ctx);
+	emit(A64_ADD_I(1, A64_R(0), A64_SP, ctx_off), ctx);
+	if (!prog->jited)
+		emit_a64_mov_i64(A64_R(1), (unsigned long)prog->insnsi, ctx);
+	tramp_call(ctx, (unsigned long)prog->bpf_func);
+	if (save_ret)
+		tramp_store(ctx, A64_R(0), ret_off);
+	if (!sleepable) {
+		emit_a64_mov_i64(A64_R(0), (unsigned long)prog, ctx);
+		emit(A64_MOV(1, A64_R(1), A64_R(20)), ctx);
+	}
+	tramp_call(ctx, sleepable ? (unsigned long)__bpf_prog_exit_sleepable :
+		   (unsigned long)__bpf_prog_exit);
+}
+
+static int build_trampoline(struct jit_ctx *ctx, struct bpf_tramp_image *im,
+			    const struct btf_func_model *m, u32 flags,
+			    struct bpf_tramp_progs *tprogs, void *orig_call,
+			    unsigned long resume)
+{
+	bool call_orig = flags & BPF_TRAMP_F_CALL_ORIG;
+	bool ip_arg = flags & BPF_TRAMP_F_IP_ARG;
+	unsigned int ctx_off = TRAMP_CTX_OFF + (ip_arg ? 8 : 0);
+	unsigned int ret_off = ctx_off + m->nr_args * 8;
+	int branches[BPF_MAX_TRAMP_PROGS], i, j, do_fexit;
+
+	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);
+	emit(A64_MOV(1, A64_FP, A64_SP), ctx);
+	emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), ctx);
+	emit(A64_PUSH(A64_R(9), A64_ZR, A64_SP), ctx);
+	emit(A64_SUB_I(1, A64_SP, A64_SP, TRAMP_STACK_SIZE), ctx);
+	/* Keep the original ABI registers separate from the BPF context. */
+	for (i = 0; i < 9; i++)
+		tramp_store(ctx, i, TRAMP_REGS_OFF + i * 8);
+	for (i = 0; i < m->nr_args; i++) {
+		int reg = i;
+
+		if (i >= 8) {
+			/* Incoming stack arguments start above the saved FP/LR. */
+			emit(A64_ADD_I(1, A64_R(11), A64_FP,
+				       16 + (i - 8) * 8), ctx);
+			emit(A64_LDR64(A64_R(11), A64_R(11), A64_ZR), ctx);
+			tramp_store(ctx, A64_R(11), (i - 8) * 8);
+			reg = A64_R(11);
+		}
+		if (m->arg_size[i] < 8) {
+			emit(A64_UBFM(1, A64_R(11), reg, 0,
+				      m->arg_size[i] * 8 - 1), ctx);
+			reg = A64_R(11);
+		}
+		tramp_store(ctx, reg, ctx_off + i * 8);
+	}
+	if (ip_arg) {
+		emit_a64_mov_i64(A64_R(11), (unsigned long)orig_call, ctx);
+		tramp_store(ctx, A64_R(11), ctx_off - 8);
+	}
+	if (call_orig) {
+		emit_a64_mov_i64(A64_R(0), (unsigned long)im, ctx);
+		tramp_call(ctx, (unsigned long)__bpf_tramp_enter);
+		tramp_store(ctx, A64_ZR, ret_off);
+	}
+	for (i = 0; i < tprogs[BPF_TRAMP_FENTRY].nr_progs; i++)
+		tramp_invoke(ctx, tprogs[BPF_TRAMP_FENTRY].progs[i],
+			     ctx_off, ret_off, false);
+	for (i = 0; i < tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs; i++) {
+		tramp_invoke(ctx, tprogs[BPF_TRAMP_MODIFY_RETURN].progs[i],
+			     ctx_off, ret_off, true);
+		tramp_load(ctx, A64_R(11), ret_off);
+		branches[i] = ctx->idx;
+		emit(A64_CBNZ(1, A64_R(11), 0), ctx);
+	}
+	if (call_orig) {
+		for (i = 0; i < 9; i++)
+			tramp_load(ctx, i, TRAMP_REGS_OFF + i * 8);
+		/* Skip the entry patch site, avoiding recursive tracing. */
+		tramp_call(ctx, resume);
+		tramp_store(ctx, A64_R(0), ret_off);
+		if (ctx->image)
+			im->ip_after_call = ctx->image + ctx->idx;
+		emit(aarch64_insn_gen_nop(), ctx);
+	}
+	do_fexit = ctx->idx;
+	if (ctx->image)
+		for (i = 0; i < tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs; i++) {
+			j = branches[i];
+			ctx->image[j] = cpu_to_le32(A64_CBNZ(1, A64_R(11), do_fexit - j));
+		}
+	for (i = 0; i < tprogs[BPF_TRAMP_FEXIT].nr_progs; i++)
+		tramp_invoke(ctx, tprogs[BPF_TRAMP_FEXIT].progs[i],
+			     ctx_off, ret_off, false);
+	if (call_orig) {
+		if (ctx->image)
+			im->ip_epilogue = ctx->image + ctx->idx;
+		emit_a64_mov_i64(A64_R(0), (unsigned long)im, ctx);
+		tramp_call(ctx, (unsigned long)__bpf_tramp_exit);
+		tramp_load(ctx, A64_R(0), ret_off);
+	} else {
+		for (i = 0; i < 9; i++)
+			tramp_load(ctx, i, TRAMP_REGS_OFF + i * 8);
+	}
+	emit(A64_ADD_I(1, A64_SP, A64_SP, TRAMP_STACK_SIZE), ctx);
+	emit(A64_POP(A64_R(9), A64_ZR, A64_SP), ctx);
+	emit(A64_POP(A64_R(19), A64_R(20), A64_SP), ctx);
+	emit(A64_POP(A64_FP, A64_LR, A64_SP), ctx);
+	if (call_orig) {
+		emit(A64_MOV(1, A64_LR, A64_R(9)), ctx);
+		emit(A64_RET(A64_LR), ctx);
+	} else {
+		emit(A64_MOV(1, A64_R(10), A64_LR), ctx);
+		emit(A64_MOV(1, A64_LR, A64_R(9)), ctx);
+		emit(A64_RET(A64_R(10)), ctx);
+	}
+	return ctx->idx * sizeof(u32);
+}
+
+static int prepare_trampoline(struct bpf_tramp_image *im, void *image,
+			      void *image_end, const struct btf_func_model *m,
+			      u32 flags, struct bpf_tramp_progs *tprogs,
+			      void *orig_call)
+{
+	struct jit_ctx ctx = {};
+	unsigned long patch, resume;
+	u32 insn;
+	int i, j, size;
+	bool call_orig = flags & BPF_TRAMP_F_CALL_ORIG;
+
+	if (m->nr_args >= MAX_BPF_FUNC_ARGS || m->ret_size > 8 || !orig_call ||
+	    (flags & ~(BPF_TRAMP_F_RESTORE_REGS | BPF_TRAMP_F_CALL_ORIG |
+		       BPF_TRAMP_F_SKIP_FRAME | BPF_TRAMP_F_IP_ARG)) ||
+	    (call_orig ? !(flags & BPF_TRAMP_F_SKIP_FRAME) ||
+			 (flags & BPF_TRAMP_F_RESTORE_REGS) :
+			 !(flags & BPF_TRAMP_F_RESTORE_REGS) ||
+			 (flags & BPF_TRAMP_F_SKIP_FRAME)))
 		return -ENOTSUPP;
 	for (i = 0; i < m->nr_args; i++)
 		if (m->arg_size[i] != 1 && m->arg_size[i] != 2 &&
 		    m->arg_size[i] != 4 && m->arg_size[i] != 8)
 			return -ENOTSUPP;
-	for (i = 0; i < nr; i++)
-		if (!tprogs[BPF_TRAMP_FENTRY].progs[i]->jited)
+	for (i = 0; i < BPF_TRAMP_MAX; i++) {
+		if (tprogs[i].nr_progs < 0 ||
+		    tprogs[i].nr_progs > BPF_MAX_TRAMP_PROGS)
+			return -E2BIG;
+		for (j = 0; j < tprogs[i].nr_progs; j++)
+			if (!tprogs[i].progs[j] || !tprogs[i].progs[j]->bpf_func)
+				return -EINVAL;
+	}
+	if (!call_orig && (tprogs[BPF_TRAMP_FEXIT].nr_progs ||
+			   tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs))
+		return -EINVAL;
+	patch = ftrace_location((unsigned long)orig_call);
+	if (patch && !IS_ENABLED(CONFIG_DYNAMIC_FTRACE_WITH_REGS))
+		return -ENOTSUPP;
+	if (!patch) {
+		/* Only JIT functions carrying our explicit entry ABI qualify. */
+		if (!is_bpf_text_address((unsigned long)orig_call) ||
+		    aarch64_insn_read(orig_call, &insn) ||
+		    insn != A64_MOV(1, A64_R(9), A64_LR))
 			return -ENOTSUPP;
-
-	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), &ctx);
-	emit(A64_MOV(1, A64_FP, A64_SP), &ctx);
-	emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), &ctx);
-	emit(A64_PUSH(A64_R(9), A64_ZR, A64_SP), &ctx);
-	emit(A64_SUB_I(1, A64_SP, A64_SP, stack_size), &ctx);
-	/* Preserve all argument registers, including the indirect result x8. */
-	for (i = 0; i < 9; i++) {
-		emit_a64_mov_i(1, A64_R(10), ctx_off + i * 8, &ctx);
-		if (i < m->nr_args && m->arg_size[i] < sizeof(u64)) {
-			emit(A64_UBFM(1, A64_R(11), i, 0,
-				      m->arg_size[i] * 8 - 1), &ctx);
-			emit(A64_STR64(A64_R(11), A64_SP, A64_R(10)), &ctx);
-		} else {
-			emit(A64_STR64(i, A64_SP, A64_R(10)), &ctx);
-		}
+		patch = (unsigned long)orig_call + AARCH64_INSN_SIZE;
 	}
-	if (ip_arg) {
-		emit_a64_mov_i64(A64_R(10), (unsigned long)orig_call, &ctx);
-		emit(A64_STR64(A64_R(10), A64_SP, A64_ZR), &ctx);
-	}
-	for (i = 0; i < nr; i++) {
-		struct bpf_prog *prog = tprogs[BPF_TRAMP_FENTRY].progs[i];
-		bool sleepable = prog->aux->sleepable;
-
-		emit_a64_mov_i64(A64_R(19), (unsigned long)prog, &ctx);
-		emit_a64_mov_i64(A64_R(10), sleepable ?
-			(unsigned long)__bpf_prog_enter_sleepable :
-			(unsigned long)__bpf_prog_enter, &ctx);
-		emit(A64_BLR(A64_R(10)), &ctx);
-		emit(A64_MOV(1, A64_R(20), A64_R(0)), &ctx);
-		emit(A64_ADD_I(1, A64_R(0), A64_SP, ctx_off), &ctx);
-		emit_a64_mov_i64(A64_R(10), (unsigned long)prog->bpf_func, &ctx);
-		emit(A64_BLR(A64_R(10)), &ctx);
-		emit(A64_MOV(1, A64_R(0), A64_R(19)), &ctx);
-		emit(A64_MOV(1, A64_R(1), A64_R(20)), &ctx);
-		emit_a64_mov_i64(A64_R(10), sleepable ?
-			(unsigned long)__bpf_prog_exit_sleepable :
-			(unsigned long)__bpf_prog_exit, &ctx);
-		emit(A64_BLR(A64_R(10)), &ctx);
-	}
-	for (i = 0; i < 9; i++) {
-		emit_a64_mov_i(1, A64_R(10), ctx_off + i * 8, &ctx);
-		emit(A64_LDR64(i, A64_SP, A64_R(10)), &ctx);
-	}
-	emit(A64_ADD_I(1, A64_SP, A64_SP, stack_size), &ctx);
-	emit(A64_POP(A64_R(9), A64_ZR, A64_SP), &ctx);
-	emit(A64_POP(A64_R(19), A64_R(20), A64_SP), &ctx);
-	emit(A64_POP(A64_FP, A64_LR, A64_SP), &ctx);
-	emit(A64_MOV(1, A64_R(10), A64_LR), &ctx);
-	emit(A64_MOV(1, A64_LR, A64_R(9)), &ctx);
-	emit(A64_RET(A64_R(10)), &ctx);
-	flush_icache_range((unsigned long)image,
-			   (unsigned long)image + ctx.idx * sizeof(u32));
-	return ctx.idx * sizeof(u32);
+	resume = patch + AARCH64_INSN_SIZE;
+	size = build_trampoline(&ctx, im, m, flags, tprogs, orig_call, resume);
+	if (size > (u8 *)image_end - (u8 *)image)
+		return -E2BIG;
+	ctx.idx = 0;
+	ctx.image = image;
+	build_trampoline(&ctx, im, m, flags, tprogs, orig_call, resume);
+	flush_icache_range((unsigned long)image, (unsigned long)image + size);
+	return size;
 }
 
 /* Struct_ops callbacks use a normal AAPCS entry. */
@@ -234,7 +357,7 @@ int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
 	int i;
 
 	if (im && orig_call)
-		return prepare_fentry_trampoline(image, image_end, m, flags,
+		return prepare_trampoline(im, image, image_end, m, flags,
 					     tprogs, orig_call);
 
 	if (im || orig_call ||
@@ -341,7 +464,7 @@ static inline int epilogue_offset(const struct jit_ctx *ctx)
 #define STACK_ALIGN(sz) (((sz) + 15) & ~15)
 
 /* Tail call offset to jump into */
-#define PROLOGUE_OFFSET 7
+#define PROLOGUE_OFFSET 9
 
 static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 {
@@ -377,6 +500,10 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	 *                          low
 	 *
 	 */
+
+	/* Stable patch site shared by fentry/fexit and freplace. */
+	emit(A64_MOV(1, A64_R(9), A64_LR), ctx);
+	emit(aarch64_insn_gen_nop(), ctx);
 
 	/* Save FP and LR registers to stay align with ARM64 AAPCS */
 	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);
@@ -1236,4 +1363,63 @@ void *bpf_jit_alloc_exec(unsigned long size)
 void bpf_jit_free_exec(void *addr)
 {
 	return vfree(addr);
+}
+
+/* All runtime patches are one aligned B/BL/NOP instruction. Serialize the
+ * compare-and-replace and synchronize instruction fetch on every online CPU.
+ */
+int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type type,
+		       void *old_addr, void *new_addr)
+{
+	unsigned long pc = (unsigned long)ip;
+	u32 old_insn, new_insn, actual;
+	enum aarch64_insn_branch_type branch;
+	void *addrs[1];
+	int ret;
+
+	if ((pc & 3) || !is_bpf_text_address(pc))
+		return -EINVAL;
+	if (type != BPF_MOD_CALL && type != BPF_MOD_JUMP)
+		return -EINVAL;
+	branch = type == BPF_MOD_CALL ? AARCH64_INSN_BRANCH_LINK :
+				       AARCH64_INSN_BRANCH_NOLINK;
+	cpus_read_lock();
+	mutex_lock(&text_mutex);
+	ret = aarch64_insn_read((void *)pc, &actual);
+	if (ret)
+		goto out;
+	/* Function entry points retain MOV x9, LR; patch the following NOP.
+	 * Trampoline teardown points already point directly at their NOP.
+	 */
+	if (actual == A64_MOV(1, A64_R(9), A64_LR))
+		pc += AARCH64_INSN_SIZE;
+	if ((old_addr && (((long)old_addr - (long)pc) & 3)) ||
+	    (new_addr && (((long)new_addr - (long)pc) & 3))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if ((old_addr && ((long)old_addr - (long)pc < -(long)SZ_128M ||
+			 (long)old_addr - (long)pc >= (long)SZ_128M)) ||
+	    (new_addr && ((long)new_addr - (long)pc < -(long)SZ_128M ||
+			 (long)new_addr - (long)pc >= (long)SZ_128M))) {
+		ret = -ERANGE;
+		goto out;
+	}
+	old_insn = old_addr ? aarch64_insn_gen_branch_imm(pc,
+		(unsigned long)old_addr, branch) : aarch64_insn_gen_nop();
+	new_insn = new_addr ? aarch64_insn_gen_branch_imm(pc,
+		(unsigned long)new_addr, branch) : aarch64_insn_gen_nop();
+	ret = aarch64_insn_read((void *)pc, &actual);
+	if (ret)
+		goto out;
+	if (actual != old_insn) {
+		ret = -EBUSY;
+		goto out;
+	}
+	addrs[0] = (void *)pc;
+	ret = aarch64_insn_patch_text(addrs, &new_insn, 1);
+out:
+	mutex_unlock(&text_mutex);
+	cpus_read_unlock();
+	return ret;
 }

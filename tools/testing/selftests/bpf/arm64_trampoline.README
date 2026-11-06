@@ -1,0 +1,46 @@
+ARM64 trampoline backport validation
+===================================
+
+Host instruction tests:
+
+  python3 tools/testing/selftests/bpf/test_arm64_trampoline.py
+
+Requires Python 3 and a host C compiler (HOSTCC defaults to cc). The test
+extracts the actual trampoline generator, JIT prologue, text-poke routine,
+and ARM64 instruction encoders from this source tree. It executes generated
+instructions in a small interpreter with ABI-conforming caller-clobbered
+register destruction at every external call.
+
+Coverage includes fentry argument preservation, fexit return contexts,
+fmod_ret zero/nonzero chains, IP context, scalar widths, 0 through 11 argument
+boundary cases including stack arguments, sleepable and non-sleepable hooks,
+interpreted and JIT program dispatch, trampoline reference enter/exit,
+detach-time fexit bypass, JIT tail-call prologue offsets, and CALL/JUMP
+install/replace/remove instruction validation and branch-range checks.
+
+The host test stubs RCU, synchronization, symbol lookup, and text writes.
+It cannot validate kernel concurrency, cache maintenance, actual attach
+verification, or device execution. Do not report its results as a device
+selftest pass.
+
+Device validation still required on the patched ARM64 kernel:
+
+* Load fentry/fexit programs against an eligible BTF kernel function and
+  against a BPF program/subprogram; verify arguments and return values.
+* Attach multiple fmod_ret programs to an ALLOW_ERROR_INJECTION target.
+  Verify zero continues, nonzero skips the original, and fexit sees the
+  selected return value. The existing verifier controls eligible targets.
+* Load a BPF_PROG_TYPE_EXT replacement with matching BTF, execute the target,
+  detach, and verify the original result is restored. Repeat replace/detach.
+* Run attach/update/detach while the original function sleeps and while
+  other CPUs invoke it. Repeat with BPF statistics enabled and disabled,
+  and with normal function/function-graph tracing enabled.
+* Re-run existing JIT, BPF-to-BPF call, tail-call, and line-info tests.
+
+ABI scope: the BTF model in this tree describes scalar/pointer arguments
+(up to 11) and scalar returns up to 64 bits. Aggregate, floating-point,
+and variadic calling conventions are not added by this backport. Generated
+trampolines must fit the core's one-page allocation. Text changes outside
+ARM64's +/-128 MiB direct-branch range return -ERANGE without patching code.
+Kernel-function tracing requires DYNAMIC_FTRACE_WITH_REGS; BPF JIT text
+patches do not depend on enabling function tracing.
