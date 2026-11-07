@@ -41,7 +41,7 @@ ifeq ($(skip-inst),)
 kbuild-file := $(srctree)/$(obj)/Kbuild
 -include $(kbuild-file)
 
-installdir    := $(INSTALL_HDR_PATH)/$(dst)
+installdir    := $(abspath $(INSTALL_HDR_PATH)/$(dst))
 gendir        := $(objtree)/$(subst include/,include/generated/,$(obj))
 header-files  := $(notdir $(wildcard $(srcdir)/*.h))
 header-files  += $(notdir $(wildcard $(srcdir)/*.agh))
@@ -103,7 +103,8 @@ $(install-file): scripts/headers_install.sh \
 		 $(addprefix $(gendir)/,$(genhdr-files)) FORCE
 	$(if $(unwanted),$(call cmd,remove),)
 	$(if $(wildcard $(dir $@)),,$(shell mkdir -p $(dir $@)))
-	$(call if_changed,install)
+	$(if $(filter-out $(wildcard $(output-files)),$(output-files)),\
+		$(call cmd,install),$(call if_changed,install))
 
 else
 __headers: $(check-file)

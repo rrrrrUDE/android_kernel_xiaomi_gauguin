@@ -9,14 +9,25 @@
 PHONY := all
 all:
 
-kbuild-file := $(srctree)/arch/$(SRCARCH)/include/$(src)/Kbuild
+# Resolve source and output roots once so this helper also works when invoked
+# from a directory other than the kernel object tree.
+srctree_abs := $(abspath $(srctree))
+objtree_abs := $(if $(objtree),$(abspath $(objtree)),$(CURDIR))
+# Architecture Kbuild fragments may include shared files by source-root path.
+MAKEFLAGS += -I$(srctree_abs)
+
+kbuild-file := $(srctree_abs)/arch/$(SRCARCH)/include/$(src)/Kbuild
 -include $(kbuild-file)
 
-include scripts/Kbuild.include
+include $(srctree_abs)/scripts/Kbuild.include
 
-# Generated wrappers belong to this output tree.  Relative targets can be
-# satisfied through VPATH by stale wrappers in the source tree during O= builds.
+# Generated wrappers belong to the selected output tree. Relative obj values
+# are relative to objtree, never to the caller's current working directory.
+ifneq ($(filter /%,$(obj)),)
 override obj := $(abspath $(obj))
+else
+override obj := $(abspath $(objtree_abs)/$(obj))
+endif
 
 # Create output directory if not already present
 _dummy := $(shell [ -d $(obj) ] || mkdir -p $(obj))
