@@ -8,6 +8,7 @@
  * based on fib_frontend.c; Author: Alexey Kuznetsov, <kuznet@ms2.inr.ac.ru>
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#include <net/nexthop_objects.h>
 #include <linux/module.h>
 #include <linux/skbuff.h>
 #include <linux/netdevice.h>
@@ -48,10 +49,10 @@ static bool rpfilter_lookup_reverse(struct net *net, struct flowi4 *fl4,
 	}
 	dev_match = false;
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
-	for (ret = 0; ret < res.fi->fib_nhs; ret++) {
-		struct fib_nh *nh = &res.fi->fib_nh[ret];
+	for (ret = 0; ret < fib_info_num_path(res.fi); ret++) {
+		struct fib_nh_common *nh = fib_info_nhc(res.fi, ret);
 
-		if (nh->fib_nh_dev == dev) {
+		if (nh->nhc_dev == dev) {
 			dev_match = true;
 			break;
 		}

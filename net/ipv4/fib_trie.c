@@ -82,6 +82,7 @@
 #include <net/tcp.h>
 #include <net/sock.h>
 #include <net/ip_fib.h>
+#include <net/nexthop_objects.h>
 #include <net/fib_notifier.h>
 #include <trace/events/fib.h>
 #include "fib_lookup.h"
@@ -1312,6 +1313,28 @@ static inline t_key prefix_mismatch(t_key key, struct key_vector *n)
 	return (key ^ prefix) & (prefix | -prefix);
 }
 
+/* Caller holds RCU; shared objects and embedded nexthops use the same rules. */
+bool fib_lookup_good_nhc(const struct fib_nh_common *nhc, int fib_flags,
+			 const struct flowi4 *flp)
+{
+	struct in_device *in_dev;
+
+	if (nhc->nhc_flags & RTNH_F_DEAD)
+		return false;
+
+	in_dev = __in_dev_get_rcu(nhc->nhc_dev);
+	if (in_dev && IN_DEV_IGNORE_ROUTES_WITH_LINKDOWN(in_dev) &&
+	    nhc->nhc_flags & RTNH_F_LINKDOWN &&
+	    !(fib_flags & FIB_LOOKUP_IGNORE_LINKSTATE))
+		return false;
+
+	if (!(flp->flowi4_flags & FLOWI_FLAG_SKIP_NH_OIF) &&
+	    flp->flowi4_oif && flp->flowi4_oif != nhc->nhc_oif)
+		return false;
+
+	return true;
+}
+
 /* should be called with rcu_read_lock */
 int fib_table_lookup(struct fib_table *tb, const struct flowi4 *flp,
 		     struct fib_result *res, int fib_flags)
@@ -1444,6 +1467,7 @@ found:
 	/* Step 3: Process the leaf, if that fails fall back to backtracing */
 	hlist_for_each_entry_rcu(fa, &n->leaf, fa_list) {
 		struct fib_info *fi = fa->fa_info;
+		struct fib_nh_common *nhc;
 		int nhsel, err;
 
 		if ((BITS_PER_LONG > KEYLENGTH) || (fa->fa_slen < KEYLENGTH)) {
@@ -1459,6 +1483,7 @@ found:
 		fib_alias_accessed(fa);
 		err = fib_props[fa->fa_type].error;
 		if (unlikely(err < 0)) {
+out_reject:
 #ifdef CONFIG_IP_FIB_TRIE_STATS
 			this_cpu_inc(stats->semantic_match_passed);
 #endif
@@ -1467,29 +1492,29 @@ found:
 		}
 		if (fi->fib_flags & RTNH_F_DEAD)
 			continue;
-		for (nhsel = 0; nhsel < fi->fib_nhs; nhsel++) {
-			const struct fib_nh *nh = &fi->fib_nh[nhsel];
-			struct in_device *in_dev = __in_dev_get_rcu(nh->fib_nh_dev);
-
-			if (nh->fib_nh_flags & RTNH_F_DEAD)
-				continue;
-			if (in_dev &&
-			    IN_DEV_IGNORE_ROUTES_WITH_LINKDOWN(in_dev) &&
-			    nh->fib_nh_flags & RTNH_F_LINKDOWN &&
-			    !(fib_flags & FIB_LOOKUP_IGNORE_LINKSTATE))
-				continue;
-			if (!(flp->flowi4_flags & FLOWI_FLAG_SKIP_NH_OIF)) {
-				if (flp->flowi4_oif &&
-				    flp->flowi4_oif != nh->fib_nh_oif)
-					continue;
+		if (unlikely(fi->nh)) {
+			if (nexthop_is_blackhole(fi->nh)) {
+				err = fib_props[RTN_BLACKHOLE].error;
+				goto out_reject;
 			}
-
+			nhc = nexthop_get_nhc_lookup(fi->nh, fib_flags, flp,
+						     &nhsel);
+			if (nhc)
+				goto set_result;
+			continue;
+		}
+		for (nhsel = 0; nhsel < fi->fib_nhs; nhsel++) {
+			nhc = &fi->fib_nh[nhsel].nh_common;
+			if (!fib_lookup_good_nhc(nhc, fib_flags, flp))
+				continue;
+set_result:
 			if (!(fib_flags & FIB_LOOKUP_NOREF))
 				refcount_inc(&fi->fib_clntref);
 
 			res->prefix = htonl(n->key);
 			res->prefixlen = KEYLENGTH - fa->fa_slen;
 			res->nh_sel = nhsel;
+			res->nhc = nhc;
 			res->type = fa->fa_type;
 			res->scope = fi->fib_scope;
 			res->fi = fi;
@@ -1498,7 +1523,10 @@ found:
 #ifdef CONFIG_IP_FIB_TRIE_STATS
 			this_cpu_inc(stats->semantic_match_passed);
 #endif
-			trace_fib_table_lookup(tb->tb_id, flp, nh, err);
+			trace_fib_table_lookup(tb->tb_id, flp,
+				nhc->nhc_family == AF_INET ?
+				container_of(nhc, struct fib_nh, nh_common) : NULL,
+				err);
 
 			return err;
 		}
@@ -1941,6 +1969,70 @@ int fib_table_flush(struct net *net, struct fib_table *tb, bool flush_all)
 
 	pr_debug("trie_flush found=%d\n", found);
 	return found;
+}
+
+/* derived from fib_trie_free */
+static void __fib_info_notify_update(struct net *net, struct fib_table *tb,
+				     struct nl_info *info)
+{
+	struct trie *t = (struct trie *)tb->tb_data;
+	struct key_vector *pn = t->kv;
+	unsigned long cindex = 1;
+	struct fib_alias *fa;
+
+	for (;;) {
+		struct key_vector *n;
+
+		if (!(cindex--)) {
+			t_key pkey = pn->key;
+
+			if (IS_TRIE(pn))
+				break;
+
+			pn = node_parent(pn);
+			cindex = get_index(pkey, pn);
+			continue;
+		}
+
+		/* grab the next available node */
+		n = get_child(pn, cindex);
+		if (!n)
+			continue;
+
+		if (IS_TNODE(n)) {
+			/* record pn and cindex for leaf walking */
+			pn = n;
+			cindex = 1ul << n->bits;
+
+			continue;
+		}
+
+		hlist_for_each_entry(fa, &n->leaf, fa_list) {
+			struct fib_info *fi = fa->fa_info;
+
+			if (!fi || !fi->nh_updated || fa->tb_id != tb->tb_id)
+				continue;
+
+			rtmsg_fib(RTM_NEWROUTE, htonl(n->key), fa,
+				  KEYLENGTH - fa->fa_slen, tb->tb_id,
+				  info, NLM_F_REPLACE);
+		}
+	}
+}
+
+void fib_info_notify_update(struct net *net, struct nl_info *info)
+{
+	unsigned int h;
+
+	ASSERT_RTNL();
+
+	for (h = 0; h < FIB_TABLE_HASHSZ; h++) {
+		struct hlist_head *head = &net->ipv4.fib_table_hash[h];
+		struct fib_table *tb;
+
+		hlist_for_each_entry(tb, head, tb_hlist)
+			__fib_info_notify_update(net, tb, info);
+	}
 }
 
 static void fib_leaf_notify(struct net *net, struct key_vector *l,
@@ -2634,13 +2726,13 @@ static void fib_route_seq_stop(struct seq_file *seq, void *v)
 	rcu_read_unlock();
 }
 
-static unsigned int fib_flag_trans(int type, __be32 mask, const struct fib_info *fi)
+static unsigned int fib_flag_trans(int type, __be32 mask, struct fib_info *fi)
 {
 	unsigned int flags = 0;
 
 	if (type == RTN_UNREACHABLE || type == RTN_PROHIBIT)
 		flags = RTF_REJECT;
-	if (fi && fi->fib_nh->fib_nh_gw_family)
+	if (fi && fib_info_nhc(fi, 0)->nhc_gw_family)
 		flags |= RTF_GATEWAY;
 	if (mask == htonl(0xFFFFFFFF))
 		flags |= RTF_HOST;
@@ -2672,7 +2764,8 @@ static int fib_route_seq_show(struct seq_file *seq, void *v)
 	prefix = htonl(l->key);
 
 	hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
-		const struct fib_info *fi = fa->fa_info;
+		struct fib_info *fi = fa->fa_info;
+		const struct fib_nh_common *nhc = fi ? fib_info_nhc(fi, 0) : NULL;
 		__be32 mask = inet_make_mask(KEYLENGTH - fa->fa_slen);
 		unsigned int flags = fib_flag_trans(fa->fa_type, mask, fi);
 
@@ -2689,10 +2782,10 @@ static int fib_route_seq_show(struct seq_file *seq, void *v)
 			seq_printf(seq,
 				   "%s\t%08X\t%08X\t%04X\t%d\t%u\t"
 				   "%d\t%08X\t%d\t%u\t%u",
-				   fi->fib_dev ? fi->fib_dev->name : "*",
+				   nhc->nhc_dev ? nhc->nhc_dev->name : "*",
 				   prefix,
-				   fi->fib_nh->fib_nh_gw_family == AF_INET ?
-				   fi->fib_nh->fib_nh_gw4 : 0, flags, 0, 0,
+				   nhc->nhc_gw_family == AF_INET ?
+				   nhc->nhc_gw.ipv4 : 0, flags, 0, 0,
 				   fi->fib_priority,
 				   mask,
 				   (fi->fib_advmss ?

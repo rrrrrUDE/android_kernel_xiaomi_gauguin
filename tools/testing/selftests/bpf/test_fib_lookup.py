@@ -52,19 +52,29 @@ struct net_device { int ifindex,mtu; char dev_addr[6]; } test_dev={7,1500,{1,2,3
 struct in_device { int forwarding; } idev4={1};
 struct inet6_dev { struct { int forwarding; } cnf; } idev6={{1}};
 struct neighbour { int nud_state; char ha[6]; } neigh={NUD_VALID,{6,5,4,3,2,1}};
-struct fib_nh { void *fib_nh_lws; struct net_device *fib_nh_dev; int fib_nh_gw_family; union {u32 fib_nh_gw4; struct in6_addr fib_nh_gw6;}; };
-struct fib_info { int fib_nhs,fib_priority; struct fib_nh fib_nh[1]; } fi={1,42,{{.fib_nh_dev=&test_dev,.fib_nh_gw_family=AF_INET,.fib_nh_gw4=99}}};
-struct fib_result { int type,nh_sel; struct fib_info *fi; };
+struct fib_nh_common { void *nhc_lwtstate; struct net_device *nhc_dev; int nhc_gw_family; union {u32 ipv4; struct in6_addr ipv6;} nhc_gw; };
+struct fib_nh { struct fib_nh_common nh_common; };
+#define fib6_nh fib_nh
+#define fib_nh_lws nh_common.nhc_lwtstate
+#define fib_nh_dev nh_common.nhc_dev
+#define fib_nh_gw_family nh_common.nhc_gw_family
+#define fib_nh_gw4 nh_common.nhc_gw.ipv4
+#define fib_nh_gw6 nh_common.nhc_gw.ipv6
+struct fib_info { int fib_nhs,fib_priority; void *nh; struct fib_nh fib_nh[1]; } fi={.fib_nhs=1,.fib_priority=42,.fib_nh={{.fib_nh_dev=&test_dev,.fib_nh_gw_family=AF_INET,.fib_nh_gw4=99}}};
+struct fib_result { int type,nh_sel; struct fib_info *fi; struct fib_nh_common *nhc; };
 struct fib_table { int unused; } table4;
 struct fib6_table { int unused; } table6;
 struct fib6_info {
  int fib6_flags,fib6_type,fib6_nsiblings,fib6_metric;
- struct { void *nh_lwtstate; struct in6_addr nh_gw; struct net_device *nh_dev; } fib6_nh;
+ struct fib_nh fib6_nh;
  struct { int plen; struct in6_addr addr; } fib6_prefsrc;
-} f6={.fib6_type=RTN_UNICAST,.fib6_metric=43,.fib6_nh={.nh_dev=&test_dev}};
+} f6={.fib6_type=RTN_UNICAST,.fib6_metric=43,.fib6_nh={.fib_nh_dev=&test_dev}};
+struct fib6_result { struct fib6_info *f6i; struct fib6_nh *nh; int fib6_flags, fib6_type; };
+static struct fib6_nh *selected_nh6;
 struct flowi4 { int flowi4_iif,flowi4_oif,flowi4_tos,flowi4_scope,flowi4_flags,flowi4_proto; u32 daddr,saddr,fl4_sport,fl4_dport,flowi4_multipath_hash,flowi4_mark,flowi4_secid,flowi4_uid; struct { uint64_t tun_id; } flowi4_tun_key; };
 struct flowi6 { int flowi6_iif,flowi6_oif,flowi6_scope,flowi6_flags,flowi6_proto,flowi6_mark,flowi6_secid,flowi6_uid; u32 flowlabel,mp_hash,fl6_sport,fl6_dport; struct in6_addr daddr,saddr; struct { uint64_t tun_id; } flowi6_tun_key; };
 static int route_err,src_err,neigh_calls,table_calls,policy_calls;
+static struct fib_nh_common *selected_nhc;
 static u32 table_id,test_mtu=1400;
 static bool missing_table,missing_neigh,forwardable=true;
 #define dev_get_by_index_rcu(n,i) ((i)==7?&test_dev:NULL)
@@ -79,7 +89,7 @@ static bool missing_table,missing_neigh,forwardable=true;
 #define rt6_need_strict(a) 0
 #define dev_net(d) (&test_net)
 static struct fib_table *fib_get_table(struct net *n,u32 id) { table_id=id;table_calls++;return missing_table?NULL:&table4; }
-static int fib_table_lookup(struct fib_table *t,struct flowi4 *f,struct fib_result *r,int flags) { *r=(struct fib_result){RTN_UNICAST,0,&fi};return route_err; }
+static int fib_table_lookup(struct fib_table *t,struct flowi4 *f,struct fib_result *r,int flags) { *r=(struct fib_result){RTN_UNICAST,0,&fi,selected_nhc ? selected_nhc : &fi.fib_nh[0].nh_common};return route_err; }
 static int fib_lookup(struct net *n,struct flowi4 *f,struct fib_result *r,int flags) {policy_calls++;return fib_table_lookup(&table4,f,r,flags);}
 static struct neighbour *get_neigh(void) {neigh_calls++;return missing_neigh?NULL:&neigh;}
 #define __ipv4_neigh_lookup_noref(d,a) get_neigh()
@@ -88,8 +98,9 @@ static struct fib6_table *get_table6(struct net *n,u32 id) {table_id=id;table_ca
 static struct fib6_info *lookup6(struct net *n,struct fib6_table *t,int o,struct flowi6 *f,int strict) {return route_err?NULL:&f6;}
 static struct fib6_info *policy6(struct net *n,int o,struct flowi6 *f,int strict) {policy_calls++;return lookup6(n,&table6,o,f,strict);}
 static struct fib6_info *multi6(struct net *n,struct fib6_info *i,struct flowi6 *f,int o,void *s,int strict) {return i;}
-static u32 mtu6(struct fib6_info *i,struct in6_addr *d,struct in6_addr *s) {return test_mtu;}
-static struct {typeof(&get_table6) fib6_get_table; typeof(&lookup6) fib6_table_lookup; typeof(&policy6) fib6_lookup; typeof(&multi6) fib6_multipath_select; typeof(&mtu6) ip6_mtu_from_fib6;} stub={get_table6,lookup6,policy6,multi6,mtu6},*ipv6_stub=&stub;
+static void select6(const struct net *n,struct fib6_result *r,struct flowi6 *f,int o,const void *s,int strict) {r->nh=selected_nh6?selected_nh6:&r->f6i->fib6_nh;r->fib6_type=r->f6i->fib6_type;r->fib6_flags=r->f6i->fib6_flags;if(r->nh->fib_nh_gw_family)r->fib6_flags|=RTF_GATEWAY;}
+static u32 mtu6(struct fib6_info *i,struct fib6_nh *nh,struct in6_addr *d,struct in6_addr *s) {assert(nh==(selected_nh6?selected_nh6:&i->fib6_nh));return test_mtu;}
+static struct {typeof(&get_table6) fib6_get_table; typeof(&lookup6) fib6_table_lookup; typeof(&policy6) fib6_lookup; typeof(&multi6) fib6_multipath_select; typeof(&select6) fib6_select_path; typeof(&mtu6) ip6_mtu_from_fib6;} stub={get_table6,lookup6,policy6,multi6,select6,mtu6},*ipv6_stub=&stub;
 static int get_src6(struct net *n,const struct net_device *d,const struct in6_addr *dst,unsigned prefs,struct in6_addr *src) {if(src_err)return src_err;src->words[0]=321;return 0;}
 static struct {typeof(&get_src6) ipv6_dev_get_saddr;} bstub={get_src6},*ipv6_bpf_stub=&bstub;
 struct xdp_buff {struct {struct net_device *dev;} *rxq;};
@@ -141,6 +152,24 @@ int main(void) {
   assert(bpf_skb_fib_lookup(&skb,&p,sizeof(p),0)==BPF_FIB_LKUP_RET_FRAG_NEEDED&&p.mtu_result==1500);forwardable=true;
   p.tot_len=0;assert(bpf_skb_fib_lookup(&skb,&p,sizeof(p),0)==0&&p.mtu_result==1500);
  }
+ /* A selected shared path must override the unrelated embedded storage. */
+ struct fib_nh_common shared={.nhc_dev=&test_dev,.nhc_gw_family=AF_INET,.nhc_gw={.ipv4=777}};
+ selected_nhc=&shared;fi.nh=&shared;fi.fib_nhs=0;
+ struct bpf_fib_lookup shared_params={.family=AF_INET,.ifindex=7,.tot_len=100};
+ assert(bpf_xdp_fib_lookup(&x,&shared_params,sizeof(shared_params),0)==0);
+ assert(shared_params.ipv4_dst==777 && shared_params.rt_metric==42);
+ shared.nhc_lwtstate=&shared;
+ shared_params=(struct bpf_fib_lookup){.family=AF_INET,.ifindex=7,.tot_len=100};
+ assert(bpf_xdp_fib_lookup(&x,&shared_params,sizeof(shared_params),0)==BPF_FIB_LKUP_RET_UNSUPP_LWT);
+ selected_nhc=NULL;fi.nh=NULL;fi.fib_nhs=1;
+ struct fib6_nh shared6={.fib_nh_dev=&test_dev,.fib_nh_gw_family=AF_INET6,.fib_nh_gw6={{71,72,73,74}}};
+ selected_nh6=&shared6;
+ struct bpf_fib_lookup p6={.family=AF_INET6,.ifindex=7,.tot_len=100};
+ assert(bpf_xdp_fib_lookup(&x,&p6,sizeof(p6),0)==0);
+ assert(p6.ipv6_dst[0]==71&&p6.ipv6_dst[3]==74);
+ shared6.fib_nh_lws=&shared6;
+ assert(bpf_xdp_fib_lookup(&x,&p6,sizeof(p6),0)==BPF_FIB_LKUP_RET_UNSUPP_LWT);
+ selected_nh6=NULL;
  /* IPv4 destination routed through an IPv6 neighbour. */
  struct bpf_fib_lookup via={.family=AF_INET,.ifindex=7,.tot_len=100};
  fi.fib_nh[0].fib_nh_gw_family=AF_INET6;

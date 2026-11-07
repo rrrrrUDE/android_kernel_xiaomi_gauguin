@@ -5474,7 +5474,7 @@ static int bpf_ipv4_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 	struct neighbour *neigh;
 	struct net_device *dev;
 	struct fib_result res;
-	struct fib_nh *nh;
+	struct fib_nh_common *nh;
 	struct flowi4 fl4 = {};
 	int err;
 	u32 mtu = 0;
@@ -5544,7 +5544,7 @@ static int bpf_ipv4_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 	if (res.type != RTN_UNICAST)
 		return BPF_FIB_LKUP_RET_NOT_FWDED;
 
-	if (res.fi->fib_nhs > 1)
+	if (res.fi->nh || res.fi->fib_nhs > 1)
 		fib_select_path(net, &res, &fl4, NULL);
 
 	if (check_mtu) {
@@ -5555,18 +5555,18 @@ static int bpf_ipv4_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 		}
 	}
 
-	nh = &res.fi->fib_nh[res.nh_sel];
+	nh = res.nhc;
 
 	/* do not handle lwt encaps right now */
-	if (nh->fib_nh_lws)
+	if (nh->nhc_lwtstate)
 		return BPF_FIB_LKUP_RET_UNSUPP_LWT;
 
-	dev = nh->fib_nh_dev;
-	if (nh->fib_nh_gw_family == AF_INET6) {
+	dev = nh->nhc_dev;
+	if (nh->nhc_gw_family == AF_INET6) {
 		params->family = AF_INET6;
-		memcpy(params->ipv6_dst, &nh->fib_nh_gw6, sizeof(nh->fib_nh_gw6));
-	} else if (nh->fib_nh_gw_family == AF_INET) {
-		params->ipv4_dst = nh->fib_nh_gw4;
+		memcpy(params->ipv6_dst, &nh->nhc_gw.ipv6, sizeof(nh->nhc_gw.ipv6));
+	} else if (nh->nhc_gw_family == AF_INET) {
+		params->ipv4_dst = nh->nhc_gw.ipv4;
 	}
 
 	params->rt_metric = res.fi->fib_priority;
@@ -5581,7 +5581,7 @@ static int bpf_ipv4_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 	/* xdp and cls_bpf programs are run in RCU-bh so
 	 * rcu_read_lock_bh is not needed here
 	 */
-	if (nh->fib_nh_gw_family == AF_INET6)
+	if (nh->nhc_gw_family == AF_INET6)
 		neigh = __ipv6_neigh_lookup_noref_stub(dev, params->ipv6_dst);
 	else
 		neigh = __ipv4_neigh_lookup_noref(dev, (__force u32)params->ipv4_dst);
@@ -5606,6 +5606,7 @@ static int bpf_ipv6_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 	struct net_device *dev;
 	struct inet6_dev *idev;
 	struct fib6_info *f6i;
+	struct fib6_result res = {};
 	struct flowi6 fl6 = {};
 	int strict = 0;
 	int oif;
@@ -5668,8 +5669,13 @@ static int bpf_ipv6_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 	if (unlikely(IS_ERR_OR_NULL(f6i) || f6i == net->ipv6.fib6_null_entry))
 		return BPF_FIB_LKUP_RET_NOT_FWDED;
 
-	if (unlikely(f6i->fib6_flags & RTF_REJECT)) {
-		switch (f6i->fib6_type) {
+	res.f6i = f6i;
+	ipv6_stub->fib6_select_path(net, &res, &fl6, fl6.flowi6_oif,
+				    NULL, strict);
+	f6i = res.f6i;
+
+	if (unlikely(res.fib6_flags & RTF_REJECT)) {
+		switch (res.fib6_type) {
 		case RTN_BLACKHOLE:
 			return BPF_FIB_LKUP_RET_BLACKHOLE;
 		case RTN_UNREACHABLE:
@@ -5681,29 +5687,24 @@ static int bpf_ipv6_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
 		}
 	}
 
-	if (f6i->fib6_type != RTN_UNICAST)
+	if (res.fib6_type != RTN_UNICAST)
 		return BPF_FIB_LKUP_RET_NOT_FWDED;
 
-	if (f6i->fib6_nsiblings && fl6.flowi6_oif == 0)
-		f6i = ipv6_stub->fib6_multipath_select(net, f6i, &fl6,
-						       fl6.flowi6_oif, NULL,
-						       strict);
-
 	if (check_mtu) {
-		mtu = ipv6_stub->ip6_mtu_from_fib6(f6i, dst, src);
+		mtu = ipv6_stub->ip6_mtu_from_fib6(f6i, res.nh, dst, src);
 		if (params->tot_len > mtu) {
 			params->mtu_result = mtu;
 			return BPF_FIB_LKUP_RET_FRAG_NEEDED;
 		}
 	}
 
-	if (f6i->fib6_nh.nh_lwtstate)
+	if (res.nh->fib_nh_lws)
 		return BPF_FIB_LKUP_RET_UNSUPP_LWT;
 
-	if (f6i->fib6_flags & RTF_GATEWAY)
-		*dst = f6i->fib6_nh.nh_gw;
+	if (res.fib6_flags & RTF_GATEWAY)
+		*dst = res.nh->fib_nh_gw6;
 
-	dev = f6i->fib6_nh.nh_dev;
+	dev = res.nh->fib_nh_dev;
 	params->rt_metric = f6i->fib6_metric;
 	params->ifindex = dev->ifindex;
 

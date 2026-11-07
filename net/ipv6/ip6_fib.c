@@ -36,6 +36,7 @@
 #include <net/fib_notifier.h>
 
 #include <net/ip6_fib.h>
+#include <net/nexthop_objects.h>
 #include <net/ip6_route.h>
 
 static struct kmem_cache *fib6_node_kmem __read_mostly;
@@ -153,8 +154,8 @@ struct fib6_info *fib6_info_alloc(gfp_t gfp_flags)
 	if (!f6i)
 		return NULL;
 
-	f6i->rt6i_pcpu = alloc_percpu_gfp(struct rt6_info *, gfp_flags);
-	if (!f6i->rt6i_pcpu) {
+	f6i->fib6_nh.rt6i_pcpu = alloc_percpu_gfp(struct rt6_info *, gfp_flags);
+	if (!f6i->fib6_nh.rt6i_pcpu) {
 		kfree(f6i);
 		return NULL;
 	}
@@ -167,43 +168,69 @@ struct fib6_info *fib6_info_alloc(gfp_t gfp_flags)
 	return f6i;
 }
 
+void fib6_nh_release_dsts(struct fib6_nh *fib6_nh)
+{
+	int cpu;
+
+	if (!fib6_nh->rt6i_pcpu)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct rt6_info *pcpu_rt, **ppcpu_rt;
+
+		ppcpu_rt = per_cpu_ptr(fib6_nh->rt6i_pcpu, cpu);
+		pcpu_rt = xchg(ppcpu_rt, NULL);
+		if (pcpu_rt) {
+			dst_dev_put(&pcpu_rt->dst);
+			dst_release(&pcpu_rt->dst);
+		}
+	}
+}
+
+EXPORT_SYMBOL_GPL(fib6_nh_release_dsts);
+
+/* Called after route teardown and an RCU grace period. */
+void fib6_nh_release(struct fib6_nh *nh)
+{
+	struct rt6_exception_bucket *bucket;
+
+	fib6_nh_flush_exceptions(nh, NULL);
+	bucket = rcu_dereference_protected(nh->rt6i_exception_bucket, 1);
+	if (bucket) {
+		nh->rt6i_exception_bucket = NULL;
+		kfree(bucket);
+	}
+
+	if (nh->rt6i_pcpu) {
+		fib6_nh_release_dsts(nh);
+
+		free_percpu(nh->rt6i_pcpu);
+		nh->rt6i_pcpu = NULL;
+	}
+
+	fib_nh_common_release(&nh->nh_common);
+
+	if (nh->fib_nh_dev) {
+		dev_put(nh->fib_nh_dev);
+		nh->fib_nh_dev = NULL;
+	}
+}
+EXPORT_SYMBOL_GPL(fib6_nh_release);
+
 void fib6_info_destroy_rcu(struct rcu_head *head)
 {
 	struct fib6_info *f6i = container_of(head, struct fib6_info, rcu);
-	struct rt6_exception_bucket *bucket;
 	struct dst_metrics *m;
 
 	WARN_ON(f6i->fib6_node);
 
-	bucket = rcu_dereference_protected(f6i->rt6i_exception_bucket, 1);
-	if (bucket) {
-		f6i->rt6i_exception_bucket = NULL;
-		kfree(bucket);
+	if (f6i->nh) {
+		nexthop_put(f6i->nh);
+		/* fib6_info_alloc reserves native cache storage before attaching. */
+		free_percpu(f6i->fib6_nh.rt6i_pcpu);
+	} else {
+		fib6_nh_release(&f6i->fib6_nh);
 	}
-
-	if (f6i->rt6i_pcpu) {
-		int cpu;
-
-		for_each_possible_cpu(cpu) {
-			struct rt6_info **ppcpu_rt;
-			struct rt6_info *pcpu_rt;
-
-			ppcpu_rt = per_cpu_ptr(f6i->rt6i_pcpu, cpu);
-			pcpu_rt = *ppcpu_rt;
-			if (pcpu_rt) {
-				dst_dev_put(&pcpu_rt->dst);
-				dst_release(&pcpu_rt->dst);
-				*ppcpu_rt = NULL;
-			}
-		}
-
-		free_percpu(f6i->rt6i_pcpu);
-	}
-
-	lwtstate_put(f6i->fib6_nh.nh_lwtstate);
-
-	if (f6i->fib6_nh.nh_dev)
-		dev_put(f6i->fib6_nh.nh_dev);
 
 	m = f6i->fib6_metrics;
 	if (m != &dst_default_metrics && refcount_dec_and_test(&m->refcnt))
@@ -872,17 +899,16 @@ insert_above:
 	return ln;
 }
 
-static void fib6_drop_pcpu_from(struct fib6_info *f6i,
-				const struct fib6_table *table)
+static void __fib6_drop_pcpu_from(struct fib6_nh *fib6_nh,
+				  const struct fib6_info *match,
+				  const struct fib6_table *table)
 {
 	int cpu;
 
-	/* Make sure rt6_make_pcpu_route() wont add other percpu routes
-	 * while we are cleaning them here.
-	 */
-	f6i->fib6_destroying = 1;
-	mb(); /* paired with the cmpxchg() in rt6_make_pcpu_route() */
+	if (!fib6_nh->rt6i_pcpu)
+		return;
 
+	rcu_read_lock();
 	/* release the reference to this fib entry from
 	 * all of its cached pcpu routes
 	 */
@@ -890,14 +916,61 @@ static void fib6_drop_pcpu_from(struct fib6_info *f6i,
 		struct rt6_info **ppcpu_rt;
 		struct rt6_info *pcpu_rt;
 
-		ppcpu_rt = per_cpu_ptr(f6i->rt6i_pcpu, cpu);
-		pcpu_rt = *ppcpu_rt;
-		if (pcpu_rt) {
+		ppcpu_rt = per_cpu_ptr(fib6_nh->rt6i_pcpu, cpu);
+
+		/* Paired with xchg() in rt6_get_pcpu_route() */
+		pcpu_rt = READ_ONCE(*ppcpu_rt);
+
+		/* only dropping the 'from' reference if the cached route
+		 * is using 'match'. The cached pcpu_rt->from only changes
+		 * from a fib6_info to NULL (ip6_dst_destroy); it can never
+		 * change from one fib6_info reference to another
+		 */
+		if (pcpu_rt && rcu_access_pointer(pcpu_rt->from) == match) {
 			struct fib6_info *from;
 
 			from = xchg((__force struct fib6_info **)&pcpu_rt->from, NULL);
 			fib6_info_release(from);
 		}
+	}
+	rcu_read_unlock();
+}
+
+struct fib6_nh_pcpu_arg {
+	struct fib6_info	*from;
+	const struct fib6_table *table;
+};
+
+static int fib6_nh_drop_pcpu_from(struct fib6_nh *nh, void *_arg)
+{
+	struct fib6_nh_pcpu_arg *arg = _arg;
+
+	__fib6_drop_pcpu_from(nh, arg->from, arg->table);
+	return 0;
+}
+
+static void fib6_drop_pcpu_from(struct fib6_info *f6i,
+				const struct fib6_table *table)
+{
+	/* Make sure rt6_make_pcpu_route() wont add other percpu routes
+	 * while we are cleaning them here.
+	 */
+	f6i->fib6_destroying = 1;
+	mb(); /* paired with the cmpxchg() in rt6_make_pcpu_route() */
+
+	if (f6i->nh) {
+		struct fib6_nh_pcpu_arg arg = {
+			.from = f6i,
+			.table = table
+		};
+
+		nexthop_for_each_fib6_nh(f6i->nh, fib6_nh_drop_pcpu_from,
+					 &arg);
+	} else {
+		struct fib6_nh *fib6_nh;
+
+		fib6_nh = &f6i->fib6_nh;
+		__fib6_drop_pcpu_from(fib6_nh, f6i, table);
 	}
 }
 
@@ -906,10 +979,12 @@ static void fib6_purge_rt(struct fib6_info *rt, struct fib6_node *fn,
 {
 	struct fib6_table *table = rt->fib6_table;
 
+	if (rt->nh)
+		list_del_init(&rt->nh_list);
+
 	/* Flush all cached dst in exception table */
 	rt6_flush_exceptions(rt);
-	if (rt->rt6i_pcpu)
-		fib6_drop_pcpu_from(rt, table);
+	fib6_drop_pcpu_from(rt, table);
 
 	if (atomic_read(&rt->fib6_ref) != 1) {
 		/* This route is used as dummy address holder in some split
@@ -1212,6 +1287,13 @@ static void __fib6_update_sernum_upto_root(struct fib6_info *rt,
 void fib6_update_sernum_upto_root(struct net *net, struct fib6_info *rt)
 {
 	__fib6_update_sernum_upto_root(rt, fib6_new_sernum(net));
+}
+
+void fib6_update_sernum_stub(struct net *net, struct fib6_info *f6i)
+{
+	spin_lock_bh(&f6i->fib6_table->tb6_lock);
+	fib6_update_sernum_upto_root(net, f6i);
+	spin_unlock_bh(&f6i->fib6_table->tb6_lock);
 }
 
 /*
@@ -1750,6 +1832,9 @@ static void fib6_del_route(struct fib6_table *table, struct fib6_node *fn,
 	struct net *net = info->nl_net;
 
 	RT6_TRACE("fib6_del_route\n");
+
+	if (rt->nh)
+		list_del_init(&rt->nh_list);
 
 	/* Unlink it */
 	*rtp = rt->fib6_next;
@@ -2291,11 +2376,11 @@ static int ipv6_route_native_seq_show(struct seq_file *seq, void *v)
 	seq_puts(seq, "00000000000000000000000000000000 00 ");
 #endif
 	if (rt->fib6_flags & RTF_GATEWAY)
-		seq_printf(seq, "%pi6", &rt->fib6_nh.nh_gw);
+		seq_printf(seq, "%pi6", &fib6_info_nh(rt)->fib_nh_gw6);
 	else
 		seq_puts(seq, "00000000000000000000000000000000");
 
-	dev = rt->fib6_nh.nh_dev;
+	dev = fib6_info_nh_dev(rt);
 	seq_printf(seq, " %08x %08x %08x %08x %8s\n",
 		   rt->fib6_metric, atomic_read(&rt->fib6_ref), 0,
 		   rt->fib6_flags, dev ? dev->name : "");

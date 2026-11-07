@@ -43,6 +43,7 @@
 #include <net/sock.h>
 #include <net/arp.h>
 #include <net/ip_fib.h>
+#include <net/nexthop_objects.h>
 #include <net/rtnetlink.h>
 #include <net/xfrm.h>
 #include <net/l3mdev.h>
@@ -192,7 +193,7 @@ int fib_unmerge(struct net *net)
 	return 0;
 }
 
-static void fib_flush(struct net *net)
+void fib_flush(struct net *net)
 {
 	int flushed = 0;
 	unsigned int h;
@@ -234,7 +235,7 @@ static inline unsigned int __inet_dev_addr_type(struct net *net,
 	if (table) {
 		ret = RTN_UNICAST;
 		if (!fib_table_lookup(table, &fl4, &res, FIB_LOOKUP_NOREF)) {
-			if (!dev || dev == res.fi->fib_dev)
+			if (!dev || dev == FIB_RES_DEV(res))
 				ret = res.type;
 		}
 	}
@@ -367,13 +368,13 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 	dev_match = false;
 
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
-	for (ret = 0; ret < res.fi->fib_nhs; ret++) {
-		struct fib_nh *nh = &res.fi->fib_nh[ret];
+	for (ret = 0; ret < fib_info_num_path(res.fi); ret++) {
+		struct fib_nh_common *nh = fib_info_nhc(res.fi, ret);
 
-		if (nh->fib_nh_dev == dev) {
+		if (nh->nhc_dev == dev) {
 			dev_match = true;
 			break;
-		} else if (l3mdev_master_ifindex_rcu(nh->fib_nh_dev) == dev->ifindex) {
+		} else if (l3mdev_master_ifindex_rcu(nh->nhc_dev) == dev->ifindex) {
 			dev_match = true;
 			break;
 		}
@@ -383,7 +384,7 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 		dev_match = true;
 #endif
 	if (dev_match) {
-		ret = FIB_RES_NH(res).fib_nh_scope >= RT_SCOPE_HOST;
+		ret = FIB_RES_NHC(res)->nhc_scope >= RT_SCOPE_HOST;
 		return ret;
 	}
 	if (no_addr)
@@ -395,7 +396,7 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 	ret = 0;
 	if (fib_lookup(net, &fl4, &res, FIB_LOOKUP_IGNORE_LINKSTATE) == 0) {
 		if (res.type == RTN_UNICAST)
-			ret = FIB_RES_NH(res).fib_nh_scope >= RT_SCOPE_HOST;
+			ret = FIB_RES_NHC(res)->nhc_scope >= RT_SCOPE_HOST;
 	}
 	return ret;
 
@@ -653,6 +654,7 @@ const struct nla_policy rtm_ipv4_policy[RTA_MAX + 1] = {
 	[RTA_FLOW]		= { .type = NLA_U32 },
 	[RTA_ENCAP_TYPE]	= { .type = NLA_U16 },
 	[RTA_ENCAP]		= { .type = NLA_NESTED },
+	[RTA_NH_ID]		= { .type = NLA_U32 },
 	[RTA_UID]		= { .type = NLA_U32 },
 	[RTA_MARK]		= { .type = NLA_U32 },
 	[RTA_TABLE]		= { .type = NLA_U32 },
@@ -749,6 +751,13 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 		case RTA_OIF:
 			cfg->fc_oif = nla_get_u32(attr);
 			break;
+		case RTA_NH_ID:
+			cfg->fc_nh_id = nla_get_u32(attr);
+			if (!cfg->fc_nh_id) {
+				NL_SET_ERR_MSG(extack, "Invalid nexthop id");
+				return -EINVAL;
+			}
+			break;
 		case RTA_GATEWAY:
 			has_gw = true;
 			cfg->fc_gw_family = AF_INET;
@@ -796,6 +805,12 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 				goto errout;
 			break;
 		}
+	}
+
+	if (cfg->fc_nh_id && (has_gw || has_via || cfg->fc_oif || cfg->fc_mp ||
+			     cfg->fc_encap || cfg->fc_encap_type || cfg->fc_flow)) {
+		NL_SET_ERR_MSG(extack, "RTA_NH_ID cannot be combined with inline nexthop attributes");
+		return -EINVAL;
 	}
 
 	if (has_gw && has_via) {
@@ -1443,7 +1458,7 @@ static int __net_init fib_net_init(struct net *net)
 	int error;
 
 #ifdef CONFIG_IP_ROUTE_CLASSID
-	net->ipv4.fib_num_tclassid_users = 0;
+	atomic_set(&net->ipv4.fib_num_tclassid_users, 0);
 #endif
 	error = ip_fib_net_init(net);
 	if (error < 0)

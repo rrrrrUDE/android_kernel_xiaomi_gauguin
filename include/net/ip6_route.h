@@ -68,7 +68,8 @@ static inline bool rt6_need_strict(const struct in6_addr *daddr)
 
 static inline bool rt6_qualify_for_ecmp(const struct fib6_info *f6i)
 {
-	return (f6i->fib6_flags & (RTF_GATEWAY|RTF_ADDRCONF|RTF_DYNAMIC)) ==
+	return !f6i->nh &&
+	       (f6i->fib6_flags & (RTF_GATEWAY|RTF_ADDRCONF|RTF_DYNAMIC)) ==
 	       RTF_GATEWAY;
 }
 
@@ -282,9 +283,11 @@ static inline struct in6_addr *rt6_nexthop(struct rt6_info *rt,
 
 static inline bool rt6_duplicate_nexthop(struct fib6_info *a, struct fib6_info *b)
 {
-	return a->fib6_nh.nh_dev == b->fib6_nh.nh_dev &&
-	       ipv6_addr_equal(&a->fib6_nh.nh_gw, &b->fib6_nh.nh_gw) &&
-	       !lwtunnel_cmp_encap(a->fib6_nh.nh_lwtstate, b->fib6_nh.nh_lwtstate);
+	if (a->nh || b->nh)
+		return a->nh == b->nh;
+	return a->fib6_nh.fib_nh_dev == b->fib6_nh.fib_nh_dev &&
+	       ipv6_addr_equal(&a->fib6_nh.fib_nh_gw6, &b->fib6_nh.fib_nh_gw6) &&
+	       !lwtunnel_cmp_encap(a->fib6_nh.fib_nh_lws, b->fib6_nh.fib_nh_lws);
 }
 
 static inline unsigned int ip6_dst_mtu_forward(const struct dst_entry *dst)
@@ -309,7 +312,8 @@ out:
 	return mtu - lwtunnel_headroom(dst->lwtstate, mtu);
 }
 
-u32 ip6_mtu_from_fib6(struct fib6_info *f6i, struct in6_addr *daddr,
+u32 ip6_mtu_from_fib6(struct fib6_info *f6i, struct fib6_nh *nh,
+		      struct in6_addr *daddr,
 		      struct in6_addr *saddr);
 
 struct neighbour *ip6_neigh_lookup(const struct in6_addr *gw,

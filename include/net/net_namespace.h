@@ -18,6 +18,7 @@
 #include <net/netns/unix.h>
 #include <net/netns/packet.h>
 #include <net/netns/ipv4.h>
+#include <net/netns/nexthop.h>
 #include <net/netns/ipv6.h>
 #include <net/netns/ieee802154_6lowpan.h>
 #include <net/netns/sctp.h>
@@ -112,6 +113,7 @@ struct net {
 	struct netns_packet	packet;
 	struct netns_unix	unx;
 	struct netns_ipv4	ipv4;
+	struct netns_nexthop	nexthop;
 #if IS_ENABLED(CONFIG_IPV6)
 	struct netns_ipv6	ipv6;
 #endif

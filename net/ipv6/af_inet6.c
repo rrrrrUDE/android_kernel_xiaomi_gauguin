@@ -927,6 +927,12 @@ static struct pernet_operations inet6_net_ops = {
 };
 
 static const struct ipv6_stub ipv6_stub_impl = {
+	.ip6_del_rt = ip6_del_rt,
+	.fib6_update_sernum = fib6_update_sernum_stub,
+	.fib6_rt_update = fib6_rt_update,
+	.fib6_nh_init = fib6_nh_init,
+	.fib6_nh_release = fib6_nh_release,
+	.fib6_nh_release_dsts = fib6_nh_release_dsts,
 	.ipv6_sock_mc_join = ipv6_sock_mc_join,
 	.ipv6_sock_mc_drop = ipv6_sock_mc_drop,
 	.ipv6_dst_lookup_flow = ip6_dst_lookup_flow,
@@ -934,6 +940,7 @@ static const struct ipv6_stub ipv6_stub_impl = {
 	.fib6_table_lookup = fib6_table_lookup,
 	.fib6_lookup       = fib6_lookup,
 	.fib6_multipath_select = fib6_multipath_select,
+	.fib6_select_path = fib6_select_path,
 	.ip6_mtu_from_fib6 = ip6_mtu_from_fib6,
 	.udpv6_encap_enable = udpv6_encap_enable,
 	.ndisc_send_na = ndisc_send_na,

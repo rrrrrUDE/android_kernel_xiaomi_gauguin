@@ -22,6 +22,7 @@
 #include <net/netlink.h>
 #include <net/inetpeer.h>
 #include <net/fib_notifier.h>
+#include <net/ip_fib.h>
 
 #ifdef CONFIG_IPV6_MULTIPLE_TABLES
 #define FIB6_TABLE_HASHSZ 256
@@ -41,6 +42,7 @@ struct rt6_info;
 struct fib6_info;
 
 struct fib6_config {
+	u32		fc_nh_id;
 	u32		fc_table;
 	u32		fc_metric;
 	int		fc_dst_len;
@@ -50,7 +52,8 @@ struct fib6_config {
 	u32		fc_protocol;
 	u16		fc_type;        /* only 8 bits are used */
 	u16		fc_delete_all_nh : 1,
-			__unused : 15;
+			fc_is_fdb : 1,
+			__unused : 14;
 
 	struct in6_addr	fc_dst;
 	struct in6_addr	fc_src;
@@ -124,16 +127,15 @@ struct rt6_exception {
 #define FIB6_MAX_DEPTH 5
 
 struct fib6_nh {
-	struct in6_addr		nh_gw;
-	struct net_device	*nh_dev;
-	struct lwtunnel_state	*nh_lwtstate;
-
-	unsigned int		nh_flags;
-	atomic_t		nh_upper_bound;
-	int			nh_weight;
+	struct fib_nh_common	nh_common;
+	bool			exception_bucket_flushed;
+	struct rt6_info * __percpu *rt6i_pcpu;
+	struct rt6_exception_bucket __rcu *rt6i_exception_bucket;
 };
 
 struct fib6_info {
+	struct nexthop			*nh;
+	struct list_head		nh_list;
 	struct fib6_table		*fib6_table;
 	struct fib6_info __rcu		*fib6_next;
 	struct fib6_node __rcu		*fib6_node;
@@ -156,9 +158,6 @@ struct fib6_info {
 	struct rt6key			fib6_src;
 	struct rt6key			fib6_prefsrc;
 
-	struct rt6_info * __percpu	*rt6i_pcpu;
-	struct rt6_exception_bucket __rcu *rt6i_exception_bucket;
-
 #ifdef CONFIG_IPV6_ROUTER_PREF
 	unsigned long			last_probe;
 #endif
@@ -166,13 +165,12 @@ struct fib6_info {
 	u32				fib6_metric;
 	u8				fib6_protocol;
 	u8				fib6_type;
-	u8				exception_bucket_flushed:1,
-					should_flush:1,
+	u8				should_flush:1,
 					dst_nocount:1,
 					dst_nopolicy:1,
 					dst_host:1,
 					fib6_destroying:1,
-					unused:2;
+					unused:3;
 
 	struct fib6_nh			fib6_nh;
 	struct rcu_head			rcu;
@@ -276,6 +274,26 @@ static inline void ip6_rt_put(struct rt6_info *rt)
 	BUILD_BUG_ON(offsetof(struct rt6_info, dst) != 0);
 	dst_release(&rt->dst);
 }
+
+/* Init requires zeroed storage (an empty preallocated rt6i_pcpu is allowed). */
+int fib6_nh_init(struct net *net, struct fib6_nh *nh,
+		 struct fib6_config *cfg, gfp_t gfp_flags,
+		 struct netlink_ext_ack *extack);
+void fib6_nh_release(struct fib6_nh *nh);
+void fib6_nh_release_dsts(struct fib6_nh *nh);
+void fib6_nh_flush_exceptions(struct fib6_nh *nh, struct fib6_info *from);
+
+struct fib6_result {
+	struct fib6_nh *nh;
+	struct fib6_info *f6i;
+	u32 fib6_flags;
+	u8 fib6_type;
+	struct rt6_info *rt6;
+};
+
+void fib6_select_path(const struct net *net, struct fib6_result *res,
+		      struct flowi6 *fl6, int oif, const struct sk_buff *skb,
+		      int strict);
 
 struct fib6_info *fib6_info_alloc(gfp_t gfp_flags);
 void fib6_info_destroy_rcu(struct rcu_head *head);
@@ -417,15 +435,17 @@ int fib6_add(struct fib6_node *root, struct fib6_info *rt,
 	     struct nl_info *info, struct netlink_ext_ack *extack);
 int fib6_del(struct fib6_info *rt, struct nl_info *info);
 
+const struct fib6_nh *fib6_info_nh(const struct fib6_info *f6i);
+
 static inline struct net_device *fib6_info_nh_dev(const struct fib6_info *f6i)
 {
-	return f6i->fib6_nh.nh_dev;
+	return fib6_info_nh(f6i)->fib_nh_dev;
 }
 
 static inline
 struct lwtunnel_state *fib6_info_nh_lwt(const struct fib6_info *f6i)
 {
-	return f6i->fib6_nh.nh_lwtstate;
+	return fib6_info_nh(f6i)->fib_nh_lws;
 }
 
 void inet6_rt_notify(int event, struct fib6_info *rt, struct nl_info *info,
@@ -460,6 +480,8 @@ unsigned int fib6_tables_seq_read(struct net *net);
 int fib6_tables_dump(struct net *net, struct notifier_block *nb);
 
 void fib6_update_sernum(struct net *net, struct fib6_info *rt);
+void fib6_update_sernum_stub(struct net *net, struct fib6_info *f6i);
+void fib6_rt_update(struct net *net, struct fib6_info *rt, struct nl_info *info);
 void fib6_update_sernum_upto_root(struct net *net, struct fib6_info *rt);
 
 void fib6_metric_set(struct fib6_info *f6i, int metric, u32 val);
