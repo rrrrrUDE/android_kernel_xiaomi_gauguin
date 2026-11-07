@@ -15,7 +15,8 @@
 | 内核特性 (Kernel Feature) | Placeholder |
 |---------|-------------|
 | **Landlock 沙箱机制 (Landlock Sandbox Framework)** | ✅ Work well |
-| **调度器 (Scheduler)** | 🚧 WALT+EAS(Moving to BORE v7.0) |
+| **调度器 (Scheduler)** | ⚙️ BORE v7.0 |
+| **IO调度器 (IO Scheduler)** | ⚙️ ADIOS v3.3 |
 | **io_uring 支持 (io_uring Support)** | ✅ Work well |
 | **BBRv3 TCP 拥塞控制算法 (BBRv3 TCP Congestion Control)** | 🚧 BACKPORT Stage... |
 > 后续版本将持续同步更多上游内核特性、性能优化与安全增强，敬请期待！
