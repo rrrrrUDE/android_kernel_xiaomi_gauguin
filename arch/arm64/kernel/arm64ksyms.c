@@ -60,7 +60,7 @@ EXPORT_SYMBOL(__memset);
 EXPORT_SYMBOL(__memcpy);
 EXPORT_SYMBOL(__memmove);
 
-#ifdef CONFIG_FUNCTION_TRACER
+#if defined(CONFIG_FUNCTION_TRACER) && !defined(CONFIG_DYNAMIC_FTRACE_WITH_REGS)
 EXPORT_SYMBOL(_mcount);
 NOKPROBE_SYMBOL(_mcount);
 #endif
