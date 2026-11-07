@@ -80,6 +80,18 @@ config MQ_IOSCHED_KYBER
 	  synchronous writes, it will self-tune queue depths to achieve that
 	  goal.
 
+config MQ_IOSCHED_ADIOS
+	tristate "Adaptive Deadline I/O scheduler"
+	default y
+	help
+	  ADIOS uses adaptive latency prediction and deadline scheduling
+	  for multi-queue block devices.
+
+config MQ_IOSCHED_DEFAULT_ADIOS
+	bool "Use ADIOS as the default MQ I/O scheduler"
+	depends on MQ_IOSCHED_ADIOS=y
+	default y
+
 config IOSCHED_BFQ
 	tristate "BFQ I/O scheduler"
 	default n

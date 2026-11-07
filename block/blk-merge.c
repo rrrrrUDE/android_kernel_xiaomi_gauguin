@@ -757,7 +757,8 @@ static struct request *attempt_merge(struct request_queue *q,
 
 	req->__data_len += blk_rq_bytes(next);
 
-	if (req_op(req) != REQ_OP_DISCARD)
+	/* MQ schedulers must unlink next even for discard merges. */
+	if (q->mq_ops || req_op(req) != REQ_OP_DISCARD)
 		elv_merge_requests(q, req, next);
 
 	/*
