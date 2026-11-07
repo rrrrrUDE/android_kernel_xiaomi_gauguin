@@ -6,6 +6,9 @@
  *  Copyright (C) 1991-2002  Linus Torvalds
  */
 #include "sched.h"
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif
 
 #include <linux/nospec.h>
 
@@ -710,7 +713,11 @@ int tg_nop(struct task_group *tg, void *data)
 
 static void set_load_weight(struct task_struct *p, bool update_load)
 {
+#ifdef CONFIG_SCHED_BORE
+	int prio = effective_prio_bore(p);
+#else
 	int prio = p->static_prio - MAX_RT_PRIO;
+#endif
 	struct load_weight *load = &p->se.load;
 
 	/*
@@ -3224,6 +3231,9 @@ int wake_up_state(struct task_struct *p, unsigned int state)
  */
 static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
+#ifdef CONFIG_SCHED_BORE
+	reset_task_bore(p);
+#endif
 	p->cpus_ptr = &p->cpus_allowed;
 	p->migration_disabled = 0;
 	p->migration_pending = NULL;
@@ -3437,6 +3447,9 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	else
 		p->sched_class = &fair_sched_class;
 
+#ifdef CONFIG_SCHED_BORE
+	task_fork_bore(p, current, clone_flags, ktime_get_ns());
+#endif
 	init_entity_runnable_average(&p->se);
 
 	/*
@@ -3805,6 +3818,9 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	if (unlikely(prev_state == TASK_DEAD)) {
 		if (prev->sched_class->task_dead)
 			prev->sched_class->task_dead(prev);
+#ifdef CONFIG_SCHED_BORE
+		task_dead_bore(prev);
+#endif
 
 		/*
 		 * Remove function-return probe instances associated with this
@@ -7578,6 +7594,9 @@ void __init sched_init(void)
 	int i, j;
 	unsigned long alloc_size = 0, ptr;
 
+#ifdef CONFIG_SCHED_BORE
+	sched_init_bore();
+#endif
 	wait_bit_init();
 
 	init_clusters();

@@ -1223,6 +1223,16 @@ config SCHED_CASS
 	  their lowest P-state necessary to satisfy the overall load at any
 	  given moment.
 
+config SCHED_BORE
+	bool "Burst-Oriented Response Enhancer"
+	default y
+	help
+	  Prioritize short CPU bursts using BORE 7.0 penalty and inheritance
+	  accounting adapted to the Linux 4.19 CFS scheduler. Preserve WALT,
+	  group scheduling, idle policy and real-time scheduling semantics.
+	  Runtime controls are available under /proc/sys/kernel/sched_burst_*
+	  and /proc/sys/kernel/sched_bore.
+
 config SCHED_AUTOGROUP
 	bool "Automatic process group scheduling"
 	select CGROUPS

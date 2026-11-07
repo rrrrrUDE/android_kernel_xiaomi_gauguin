@@ -56,3 +56,12 @@ config HZ
 
 config SCHED_HRTICK
 	def_bool HIGH_RES_TIMERS
+
+config MIN_BASE_SLICE_NS
+	int "BORE minimum CPU slice in nanoseconds"
+	depends on SCHED_BORE
+	range 1 1000000000
+	default 2000000
+	help
+	  Lower bound for CFS slices, rounded up to a scheduler tick.
+	  The runtime control is kernel.sched_min_base_slice_ns.

@@ -21,6 +21,9 @@
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
 #include "sched.h"
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif
 
 #include <trace/events/sched.h>
 
@@ -98,7 +101,11 @@ unsigned int sysctl_sched_cstate_aware = 1;
  *
  * (default SCHED_TUNABLESCALING_LOG = *(1+ilog(ncpus))
  */
+#ifdef CONFIG_SCHED_BORE
+enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_NONE;
+#else
 enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
+#endif
 
 /*
  * Minimal preemption granularity for CPU-bound tasks:
@@ -230,6 +237,20 @@ static unsigned int get_update_sysctl_factor(void)
 	return factor;
 }
 
+#ifdef CONFIG_SCHED_BORE
+unsigned int sysctl_sched_min_base_slice = CONFIG_MIN_BASE_SLICE_NS;
+
+void sched_update_min_base_slice(void)
+{
+	unsigned int tick = NSEC_PER_SEC / HZ;
+
+	sysctl_sched_min_granularity = tick *
+		DIV_ROUND_UP(READ_ONCE(sysctl_sched_min_base_slice), tick);
+	sched_nr_latency = DIV_ROUND_UP(sysctl_sched_latency,
+				       sysctl_sched_min_granularity);
+}
+#endif
+
 static void update_sysctl(void)
 {
 	unsigned int factor = get_update_sysctl_factor();
@@ -240,6 +261,9 @@ static void update_sysctl(void)
 	SET_SYSCTL(sched_latency);
 	SET_SYSCTL(sched_wakeup_granularity);
 #undef SET_SYSCTL
+#ifdef CONFIG_SCHED_BORE
+	sched_update_min_base_slice();
+#endif
 }
 
 void sched_init_granularity(void)
@@ -733,6 +757,15 @@ static u64 __sched_period(unsigned long nr_running)
  *
  * s = p*P[w/rw]
  */
+#ifdef CONFIG_SCHED_BORE
+static u64 bore_base_slice(void)
+{
+	u64 tick = NSEC_PER_SEC / HZ;
+
+	return DIV_ROUND_UP_ULL((u64)READ_ONCE(sysctl_sched_min_base_slice), tick) * tick;
+}
+#endif
+
 static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	u64 slice = __sched_period(cfs_rq->nr_running + !se->on_rq);
@@ -904,6 +937,9 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	if (entity_is_task(curr)) {
 		struct task_struct *curtask = task_of(curr);
 
+#ifdef CONFIG_SCHED_BORE
+		update_curr_bore(curtask, delta_exec);
+#endif
 		trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
 		cgroup_account_cputime(curtask, delta_exec);
 		account_group_exec_runtime(curtask, delta_exec);
@@ -4154,6 +4190,13 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 		if (sched_feat(GENTLE_FAIR_SLEEPERS))
 			thresh >>= 1;
 
+#ifdef CONFIG_SCHED_BORE
+		if (static_branch_likely(&sched_bore_key) &&
+		    static_branch_unlikely(&sched_credit_key) && entity_is_task(se))
+			thresh = min_t(u64, thresh + bore_credit_ns(task_of(se)),
+				       (u64)sysctl_sched_latency +
+				       (u64)sched_credit_cap_us * 1000);
+#endif
 		vruntime -= thresh;
 #ifdef CONFIG_SCHED_WALT
 		if (entity_is_task(se)) {
@@ -5672,6 +5715,13 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	 * Let's update schedtune here to ensure the boost value of the
 	 * current task is not more accounted for in the selection of the OPP.
 	 */
+#ifdef CONFIG_SCHED_BORE
+	if (task_sleep) {
+		update_curr(cfs_rq_of(se));
+		bore_note_sleep(p, ktime_get_ns());
+		restart_burst_bore(p);
+	}
+#endif
 	schedtune_dequeue_task(p, cpu_of(rq));
 
 	for_each_sched_entity(se) {
@@ -8177,6 +8227,20 @@ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se)
 		return -1;
 
 	gran = wakeup_gran(se);
+#ifdef CONFIG_SCHED_BORE
+	/* CFS analogue of EEVDF slice protection: never delay past one slice. */
+	if (static_branch_likely(&sched_bore_key) && entity_is_task(curr) &&
+	    !task_of(curr)->bore.futex_waiting) {
+		unsigned int lv = READ_ONCE(sched_burst_protect_slice_lv);
+		u64 ran = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
+		bool protect = lv == 3 ||
+			(lv == 1 && curr->load.weight >= se->load.weight) ||
+			(lv == 2 && curr->load.weight > se->load.weight);
+
+		if (protect && ran < bore_base_slice())
+			gran = max_t(s64, gran, calc_delta_fair(bore_base_slice() - ran, curr));
+	}
+#endif
 	if (vdiff > gran)
 		return 1;
 
@@ -8469,6 +8533,11 @@ static void yield_task_fair(struct rq *rq)
 	/*
 	 * Are we the only task in the tree?
 	 */
+#ifdef CONFIG_SCHED_BORE
+	update_rq_clock(rq);
+	update_curr(cfs_rq);
+	restart_burst_bore(curr);
+#endif
 	if (unlikely(rq->nr_running == 1))
 		return;
 
@@ -12345,7 +12414,17 @@ static void switched_from_fair(struct rq *rq, struct task_struct *p)
 
 static void switched_to_fair(struct rq *rq, struct task_struct *p)
 {
+#ifdef CONFIG_SCHED_BORE
+	reset_task_bore(p);
+#endif
 	attach_task_cfs_rq(p);
+#ifdef CONFIG_SCHED_BORE
+	if (!task_has_idle_policy(p)) {
+		p->bore.stop_update = true;
+		reweight_task(p, effective_prio_bore(p));
+		p->bore.stop_update = false;
+	}
+#endif
 
 	if (task_on_rq_queued(p)) {
 		/*
