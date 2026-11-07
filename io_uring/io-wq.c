@@ -1229,14 +1229,13 @@ static void io_wq_cancel_tw_create(struct io_wq *wq)
 
 	while ((cb = task_work_cancel_match(wq->task, io_task_work_match, wq)) != NULL) {
 		struct io_worker *worker;
+		bool free_worker = cb->func == create_worker_cont;
 
 		worker = container_of(cb, struct io_worker, create_work);
+		/* This drops the callback reference and may release a live worker. */
 		io_worker_cancel_cb(worker);
-		/*
-		 * Only the worker continuation helper has worker allocated and
-		 * hence needs freeing.
-		 */
-		if (cb->func == create_worker_cont)
+		/* Only continuation helpers are owned by this cancellation path. */
+		if (free_worker)
 			kfree(worker);
 	}
 }

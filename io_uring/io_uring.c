@@ -9590,7 +9590,9 @@ static void io_ring_exit_work(struct work_struct *work)
 		 * cause a stuck task backtrace, and hence a potential panic
 		 * on stuck tasks if that is enabled.
 		 */
-	} while (!wait_for_completion_interruptible_timeout(&ctx->ref_comp, interval));
+		ret = wait_for_completion_interruptible_timeout(&ctx->ref_comp,
+							      interval);
+	} while (ret <= 0);
 
 	init_completion(&exit.completion);
 	init_task_work(&exit.task_work, io_tctx_exit_cb);
@@ -9615,7 +9617,10 @@ static void io_ring_exit_work(struct work_struct *work)
 		 * wait_for_completion_interruptible_timeout() on why this
 		 * wait is marked as interruptible.
 		 */
-		wait_for_completion_interruptible(&exit.completion);
+		/* The callback owns stack storage: never leave on interruption. */
+		do {
+			ret = wait_for_completion_interruptible(&exit.completion);
+		} while (ret);
 		mutex_lock(&ctx->uring_lock);
 	}
 	mutex_unlock(&ctx->uring_lock);
