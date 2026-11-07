@@ -369,3 +369,15 @@ void percpu_ref_reinit(struct percpu_ref *ref)
 	spin_unlock_irqrestore(&percpu_ref_switch_lock, flags);
 }
 EXPORT_SYMBOL_GPL(percpu_ref_reinit);
+
+void percpu_ref_resurrect(struct percpu_ref *ref)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&percpu_ref_switch_lock, flags);
+	ref->percpu_count_ptr &= ~__PERCPU_REF_DEAD;
+	percpu_ref_get(ref);
+	__percpu_ref_switch_mode(ref, NULL);
+	spin_unlock_irqrestore(&percpu_ref_switch_lock, flags);
+}
+EXPORT_SYMBOL_GPL(percpu_ref_resurrect);

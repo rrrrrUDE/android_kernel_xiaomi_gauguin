@@ -481,7 +481,7 @@ int bpf_iter_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 		return -EINVAL;
 
 	if (ulinfo) {
-		err = bpf_check_uarg_tail_zero(ulinfo, sizeof(linfo),
+		err = bpf_check_uarg_tail_zero(USER_BPFPTR(ulinfo), sizeof(linfo),
 					       linfo_len);
 		if (err)
 			return err;
@@ -661,3 +661,31 @@ int bpf_iter_run_prog(struct bpf_prog *prog, void *ctx)
 	 */
 	return ret == 0 ? 0 : -EAGAIN;
 }
+
+BPF_CALL_4(bpf_for_each_map_elem, struct bpf_map *, map, void *, callback_fn,
+	   void *, callback_ctx, u64, flags)
+{
+	return map->ops->map_for_each_callback(map, callback_fn, callback_ctx,
+					   flags, NULL);
+}
+
+/* The verifier exposes only four arguments. ARM64 supplies the counter
+ * pointer itself, so a BPF program cannot forge this kernel stack pointer.
+ */
+BPF_CALL_5(bpf_for_each_map_elem_tail_call, struct bpf_map *, map,
+	   void *, callback_fn, void *, callback_ctx, u64, flags,
+	   u64 *, counter)
+{
+	return map->ops->map_for_each_callback(map, callback_fn, callback_ctx,
+					   flags, counter);
+}
+
+const struct bpf_func_proto bpf_for_each_map_elem_proto = {
+	.func		= bpf_for_each_map_elem,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_CONST_MAP_PTR,
+	.arg2_type	= ARG_PTR_TO_FUNC,
+	.arg3_type	= ARG_PTR_TO_STACK_OR_NULL,
+	.arg4_type	= ARG_ANYTHING,
+};

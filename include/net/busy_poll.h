@@ -28,6 +28,7 @@
 #include <linux/sched/clock.h>
 #include <linux/sched/signal.h>
 #include <net/ip.h>
+#include <net/xdp.h>
 
 /*		0 - Reserved to indicate value not set
  *     1..NR_CPUS - Reserved for sender_cpu
@@ -146,6 +147,15 @@ static inline void sk_mark_napi_id_once(struct sock *sk,
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	if (!READ_ONCE(sk->sk_napi_id))
 		WRITE_ONCE(sk->sk_napi_id, skb->napi_id);
+#endif
+}
+
+static inline void sk_mark_napi_id_once_xdp(struct sock *sk,
+					    const struct xdp_buff *xdp)
+{
+#ifdef CONFIG_NET_RX_BUSY_POLL
+	if (!READ_ONCE(sk->sk_napi_id))
+		WRITE_ONCE(sk->sk_napi_id, xdp->rxq->napi_id);
 #endif
 }
 

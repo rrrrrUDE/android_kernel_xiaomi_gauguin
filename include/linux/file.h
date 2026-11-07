@@ -85,7 +85,9 @@ extern void set_close_on_exec(unsigned int fd, int flag);
 extern bool get_close_on_exec(unsigned int fd);
 extern int get_unused_fd_start_flags(unsigned start, unsigned flags);
 extern int get_unused_fd_flags(unsigned flags);
+extern int __get_unused_fd_flags(unsigned flags, unsigned long nofile);
 extern void put_unused_fd(unsigned int fd);
+extern int __close_fd_get_file(unsigned int fd, struct file **res);
 
 extern void fd_install(unsigned int fd, struct file *file);
 

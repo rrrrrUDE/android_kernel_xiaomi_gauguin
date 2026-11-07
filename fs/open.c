@@ -31,6 +31,7 @@
 #include <linux/ima.h>
 #include <linux/dnotify.h>
 #include <linux/compat.h>
+#include <uapi/linux/openat2.h>
 
 #include "internal.h"
 #include <trace/hooks/syscall_check.h>
@@ -969,7 +970,8 @@ struct file *open_with_fake_path(const struct path *path, int flags,
 }
 EXPORT_SYMBOL(open_with_fake_path);
 
-static inline int build_open_flags(int flags, umode_t mode, struct open_flags *op)
+static inline int build_open_flags_legacy(int flags, umode_t mode,
+					  struct open_flags *op)
 {
 	int lookup_flags = 0;
 	int acc_mode = ACC_MODE(flags);
@@ -1040,6 +1042,80 @@ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *o
 	return 0;
 }
 
+static inline bool open_will_create(u64 flags)
+{
+	return flags & (O_CREAT | __O_TMPFILE);
+}
+
+struct open_how build_open_how(int flags, umode_t mode)
+{
+	struct open_how how = {
+		.flags = flags & VALID_OPEN_FLAGS,
+		.mode = mode & S_IALLUGO,
+	};
+
+	if (how.flags & O_PATH)
+		how.flags &= O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC;
+	if (!open_will_create(how.flags))
+		how.mode = 0;
+	return how;
+}
+
+int build_open_flags(const struct open_how *how, struct open_flags *op)
+{
+	u64 flags = how->flags;
+	int acc_mode = ACC_MODE(flags);
+	int lookup_flags = 0;
+
+	flags &= ~(FMODE_NONOTIFY | O_CLOEXEC);
+	if (flags & ~VALID_OPEN_FLAGS)
+		return -EINVAL;
+	if (how->resolve & ~VALID_RESOLVE_FLAGS)
+		return -EINVAL;
+	/* These path-walk constraints need newer namei support. */
+	if (how->resolve)
+		return -EOPNOTSUPP;
+	if (open_will_create(flags)) {
+		if (how->mode & ~S_IALLUGO)
+			return -EINVAL;
+		op->mode = how->mode | S_IFREG;
+	} else {
+		if (how->mode)
+			return -EINVAL;
+		op->mode = 0;
+	}
+	if (flags & __O_TMPFILE) {
+		if ((flags & O_TMPFILE_MASK) != O_TMPFILE ||
+		    !(acc_mode & MAY_WRITE))
+			return -EINVAL;
+	}
+	if (flags & O_PATH) {
+		if (flags & ~(O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC))
+			return -EINVAL;
+		acc_mode = 0;
+	}
+	if (flags & __O_SYNC)
+		flags |= O_DSYNC;
+	op->open_flag = flags;
+	if (flags & O_TRUNC)
+		acc_mode |= MAY_WRITE;
+	if (flags & O_APPEND)
+		acc_mode |= MAY_APPEND;
+	op->acc_mode = acc_mode;
+	op->intent = flags & O_PATH ? 0 : LOOKUP_OPEN;
+	if (flags & O_CREAT) {
+		op->intent |= LOOKUP_CREATE;
+		if (flags & O_EXCL)
+			op->intent |= LOOKUP_EXCL;
+	}
+	if (flags & O_DIRECTORY)
+		lookup_flags |= LOOKUP_DIRECTORY;
+	if (!(flags & O_NOFOLLOW))
+		lookup_flags |= LOOKUP_FOLLOW;
+	op->lookup_flags = lookup_flags;
+	return 0;
+}
+
 /**
  * file_open_name - open file and return file pointer
  *
@@ -1054,7 +1130,7 @@ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *o
 struct file *file_open_name(struct filename *name, int flags, umode_t mode)
 {
 	struct open_flags op;
-	int err = build_open_flags(flags, mode, &op);
+	int err = build_open_flags_legacy(flags, mode, &op);
 	return err ? ERR_PTR(err) : do_filp_open(AT_FDCWD, name, &op);
 }
 
@@ -1086,7 +1162,7 @@ struct file *file_open_root(struct dentry *dentry, struct vfsmount *mnt,
 			    const char *filename, int flags, umode_t mode)
 {
 	struct open_flags op;
-	int err = build_open_flags(flags, mode, &op);
+	int err = build_open_flags_legacy(flags, mode, &op);
 	if (err)
 		return ERR_PTR(err);
 	return do_file_open_root(dentry, mnt, filename, &op);
@@ -1096,7 +1172,7 @@ EXPORT_SYMBOL(file_open_root);
 long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 {
 	struct open_flags op;
-	int fd = build_open_flags(flags, mode, &op);
+	int fd = build_open_flags_legacy(flags, mode, &op);
 	struct filename *tmp;
 
 	if (fd)

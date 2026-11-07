@@ -1,0 +1,33 @@
+BPF 4.19 compatibility follow-up
+================================
+
+Host checks (bounds, allocation and kernel services use stubs):
+
+  python3 tools/testing/selftests/bpf/test_adjust_room_eth.py
+  python3 tools/testing/selftests/bpf/test_global_memory_args.py
+  python3 tools/testing/selftests/bpf/test_helper_memory_modifiers.py
+
+The Ethernet check executes bpf_skb_net_grow() and checks ETH_P_TEB,
+inner header offsets, short Ethernet headers and unchanged legacy behavior.
+It does not validate real skb movement, GSO or actual packet transmission.
+The global argument check executes BTF matching and argument preparation;
+the memory check executes verifier helper/global memory dispatch.
+
+On-device checks still required:
+
+* Load global functions taking scalar/struct pointers; check NULL branches,
+  stack/map bounds, uninitialized input rejection and readonly input rejection.
+* Attach tracing programs to migrate_disable/migrate_enable, and to
+  preempt_count_add/sub when built as functions: loading must fail. Normal
+  kernel targets and BPF-program targets must retain their existing behavior.
+* Exercise TC adjust_room Ethernet encapsulation with IPv4/IPv6 traffic and
+  GSO, then inspect the resulting packets and segmentation behavior.
+* With NET=n and BPF_SYSCALL=y, create TASK_STORAGE maps and exercise task
+  exit and map deletion. Socket storage remains conditional on networking.
+
+Temporary out-of-tree configs are used for build validation. No defconfig
+changes are part of this patch. On this 4.19 tree BPF_JIT is inside the NET
+Kconfig menu, so NET=n exercises the interpreter/non-JIT path as well.
+The tracing denylist omits rcu_read_unlock_strict, absent from this tree,
+and includes preempt_count_add/sub only under their definition conditions.
+The denylist applies to kernel BTF IDs, not unrelated module/BPF IDs.

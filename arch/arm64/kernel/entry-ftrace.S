@@ -10,9 +10,157 @@
  */
 
 #include <linux/linkage.h>
+#include <asm/asm-offsets.h>
 #include <asm/assembler.h>
 #include <asm/ftrace.h>
 #include <asm/insn.h>
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
+/*
+ * Due to -fpatchable-function-entry=2, the compiler has placed two NOPs before
+ * the regular function prologue. For an enabled callsite, ftrace_init_nop() and
+ * ftrace_make_call() have patched those NOPs to:
+ *
+ * 	MOV	X9, LR
+ * 	BL	<entry>
+ *
+ * ... where <entry> is either ftrace_caller or ftrace_regs_caller.
+ *
+ * Each instrumented function follows the AAPCS, so here x0-x8 and x18-x30 are
+ * live (x18 holds the Shadow Call Stack pointer), and x9-x17 are safe to
+ * clobber.
+ *
+ * We save the callsite's context into a pt_regs before invoking any ftrace
+ * callbacks. So that we can get a sensible backtrace, we create a stack record
+ * for the callsite and the ftrace entry assembly. This is not sufficient for
+ * reliable stacktrace: until we create the callsite stack record, its caller
+ * is missing from the LR and existing chain of frame records.
+ */
+	.macro  ftrace_regs_entry, allregs=0
+	/* Make room for pt_regs, plus a callee frame */
+	sub	sp, sp, #(S_FRAME_SIZE + 16)
+
+	/* Save function arguments (and x9 for simplicity) */
+	stp	x0, x1, [sp, #S_X0]
+	stp	x2, x3, [sp, #S_X2]
+	stp	x4, x5, [sp, #S_X4]
+	stp	x6, x7, [sp, #S_X6]
+	stp	x8, x9, [sp, #S_X8]
+
+	/* Optionally save the callee-saved registers, always save the FP */
+	.if \allregs == 1
+	stp	x10, x11, [sp, #S_X10]
+	stp	x12, x13, [sp, #S_X12]
+	stp	x14, x15, [sp, #S_X14]
+	stp	x16, x17, [sp, #S_X16]
+	stp	x18, x19, [sp, #S_X18]
+	stp	x20, x21, [sp, #S_X20]
+	stp	x22, x23, [sp, #S_X22]
+	stp	x24, x25, [sp, #S_X24]
+	stp	x26, x27, [sp, #S_X26]
+	stp	x28, x29, [sp, #S_X28]
+	.else
+	str	x29, [sp, #(S_X28 + 8)]
+	.endif
+
+	/* Save the callsite's SP and LR */
+	add	x10, sp, #(S_FRAME_SIZE + 16)
+	stp	x9, x10, [sp, #S_LR]
+
+	/* A nonzero x16 requests the direct trampoline on return. */
+	str	xzr, [sp, #S_X16]
+	str	xzr, [sp, #S_PSTATE]
+
+	/* Save the PC after the ftrace callsite */
+	str	x30, [sp, #S_PC]
+
+	/* Create a frame record for the callsite above pt_regs */
+	stp	x29, x9, [sp, #S_FRAME_SIZE]
+	add	x29, sp, #S_FRAME_SIZE
+
+	/* Create our frame record within pt_regs. */
+	stp	x29, x30, [sp, #S_STACKFRAME]
+	add	x29, sp, #S_STACKFRAME
+	.endm
+
+ENTRY(ftrace_regs_caller)
+#ifdef BTI_C
+	BTI_C
+#endif
+	ftrace_regs_entry	1
+	b	ftrace_common
+ENDPROC(ftrace_regs_caller)
+
+ENTRY(ftrace_caller)
+#ifdef BTI_C
+	BTI_C
+#endif
+	ftrace_regs_entry	0
+	b	ftrace_common
+ENDPROC(ftrace_caller)
+
+ENTRY(ftrace_common)
+	sub	x0, x30, #AARCH64_INSN_SIZE	// ip (callsite's BL insn)
+	mov	x1, x9				// parent_ip (callsite's LR)
+	ldr_l	x2, function_trace_op		// op
+	mov	x3, sp				// regs
+
+GLOBAL(ftrace_call)
+	bl	ftrace_stub
+
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+GLOBAL(ftrace_graph_call) // ftrace_graph_caller();
+	nop				// If enabled, this will be replaced
+					// "b ftrace_graph_caller"
+#endif
+
+/*
+ * At the callsite x0-x8 and x19-x30 were live. Any C code will have preserved
+ * x19-x29 per the AAPCS, and we created frame records upon entry, so we need
+ * to restore x0-x8, x29, and x30.
+ */
+ftrace_common_return:
+	/* Restore function arguments */
+	ldp	x0, x1, [sp]
+	ldp	x2, x3, [sp, #S_X2]
+	ldp	x4, x5, [sp, #S_X4]
+	ldp	x6, x7, [sp, #S_X6]
+	ldr	x8, [sp, #S_X8]
+
+	/* Restore the callsite's FP, LR, PC */
+	ldr	x29, [sp, #(S_X28 + 8)]
+	ldr	x30, [sp, #S_LR]
+	ldr	x9, [sp, #S_PC]
+
+	/* The direct trampoline receives x9=original LR, x30=resume PC. */
+	ldr	x16, [sp, #S_X16]
+	cbz	x16, 1f
+	mov	x10, x9
+	mov	x9, x30
+	mov	x30, x10
+1:
+
+	/* Restore the callsite's SP */
+	add	sp, sp, #S_FRAME_SIZE + 16
+
+	cbnz	x16, 2f
+	ret	x9
+2:
+	br	x16
+ENDPROC(ftrace_common)
+
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+ENTRY(ftrace_graph_caller)
+	ldr	x1, [sp, #S_PC]
+	sub	x1, x1, #AARCH64_INSN_SIZE
+	add	x0, sp, #S_LR
+	ldr	x2, [sp, #S_FRAME_SIZE]	   	// parent fp (callsite's FP)
+	bl	prepare_ftrace_return
+	b	ftrace_common_return
+ENDPROC(ftrace_graph_caller)
+#endif
+
+#else /* CONFIG_DYNAMIC_FTRACE_WITH_REGS */
 
 /*
  * Gcc with -pg will put the following code in the beginning of each function:
@@ -163,9 +311,33 @@ ftrace_graph_call:			// ftrace_graph_caller();
 ENDPROC(ftrace_caller)
 #endif /* CONFIG_DYNAMIC_FTRACE */
 
+
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+/*
+ * void ftrace_graph_caller(void)
+ *
+ * Called from _mcount() or ftrace_caller() when function_graph tracer is
+ * selected.
+ * This function w/ prepare_ftrace_return() fakes link register's value on
+ * the call stack in order to intercept instrumented function's return path
+ * and run return_to_handler() later on its exit.
+ */
+ENTRY(ftrace_graph_caller)
+	mcount_get_lr_addr	  x0	//     pointer to function's saved lr
+	mcount_get_pc		  x1	//     function's pc
+	mcount_get_parent_fp	  x2	//     parent's fp
+	bl	prepare_ftrace_return	// prepare_ftrace_return(&lr, pc, fp)
+
+	mcount_exit
+ENDPROC(ftrace_graph_caller)
+
+#endif /* CONFIG_FUNCTION_GRAPH_TRACER */
+#endif /* CONFIG_DYNAMIC_FTRACE_WITH_REGS */
+
 ENTRY(ftrace_stub)
 	ret
 ENDPROC(ftrace_stub)
+
 
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 	/* save return value regs*/
@@ -185,24 +357,6 @@ ENDPROC(ftrace_stub)
 	ldp x6, x7, [sp, #48]
 	add sp, sp, #64
 	.endm
-
-/*
- * void ftrace_graph_caller(void)
- *
- * Called from _mcount() or ftrace_caller() when function_graph tracer is
- * selected.
- * This function w/ prepare_ftrace_return() fakes link register's value on
- * the call stack in order to intercept instrumented function's return path
- * and run return_to_handler() later on its exit.
- */
-ENTRY(ftrace_graph_caller)
-	mcount_get_lr_addr	  x0	//     pointer to function's saved lr
-	mcount_get_pc		  x1	//     function's pc
-	mcount_get_parent_fp	  x2	//     parent's fp
-	bl	prepare_ftrace_return	// prepare_ftrace_return(&lr, pc, fp)
-
-	mcount_exit
-ENDPROC(ftrace_graph_caller)
 
 /*
  * void return_to_handler(void)

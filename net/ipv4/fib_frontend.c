@@ -43,6 +43,7 @@
 #include <net/sock.h>
 #include <net/arp.h>
 #include <net/ip_fib.h>
+#include <net/nexthop_objects.h>
 #include <net/rtnetlink.h>
 #include <net/xfrm.h>
 #include <net/l3mdev.h>
@@ -192,7 +193,7 @@ int fib_unmerge(struct net *net)
 	return 0;
 }
 
-static void fib_flush(struct net *net)
+void fib_flush(struct net *net)
 {
 	int flushed = 0;
 	unsigned int h;
@@ -234,7 +235,7 @@ static inline unsigned int __inet_dev_addr_type(struct net *net,
 	if (table) {
 		ret = RTN_UNICAST;
 		if (!fib_table_lookup(table, &fl4, &res, FIB_LOOKUP_NOREF)) {
-			if (!dev || dev == res.fi->fib_dev)
+			if (!dev || dev == FIB_RES_DEV(res))
 				ret = res.type;
 		}
 	}
@@ -367,13 +368,13 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 	dev_match = false;
 
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
-	for (ret = 0; ret < res.fi->fib_nhs; ret++) {
-		struct fib_nh *nh = &res.fi->fib_nh[ret];
+	for (ret = 0; ret < fib_info_num_path(res.fi); ret++) {
+		struct fib_nh_common *nh = fib_info_nhc(res.fi, ret);
 
-		if (nh->nh_dev == dev) {
+		if (nh->nhc_dev == dev) {
 			dev_match = true;
 			break;
-		} else if (l3mdev_master_ifindex_rcu(nh->nh_dev) == dev->ifindex) {
+		} else if (l3mdev_master_ifindex_rcu(nh->nhc_dev) == dev->ifindex) {
 			dev_match = true;
 			break;
 		}
@@ -383,7 +384,7 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 		dev_match = true;
 #endif
 	if (dev_match) {
-		ret = FIB_RES_NH(res).fib_nh_scope >= RT_SCOPE_HOST;
+		ret = FIB_RES_NHC(res)->nhc_scope >= RT_SCOPE_HOST;
 		return ret;
 	}
 	if (no_addr)
@@ -395,7 +396,7 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 	ret = 0;
 	if (fib_lookup(net, &fl4, &res, FIB_LOOKUP_IGNORE_LINKSTATE) == 0) {
 		if (res.type == RTN_UNICAST)
-			ret = FIB_RES_NH(res).fib_nh_scope >= RT_SCOPE_HOST;
+			ret = FIB_RES_NHC(res)->nhc_scope >= RT_SCOPE_HOST;
 	}
 	return ret;
 
@@ -645,6 +646,7 @@ const struct nla_policy rtm_ipv4_policy[RTA_MAX + 1] = {
 	[RTA_IIF]		= { .type = NLA_U32 },
 	[RTA_OIF]		= { .type = NLA_U32 },
 	[RTA_GATEWAY]		= { .type = NLA_U32 },
+	[RTA_VIA]		= { .len = sizeof(struct rtvia) },
 	[RTA_PRIORITY]		= { .type = NLA_U32 },
 	[RTA_PREFSRC]		= { .type = NLA_U32 },
 	[RTA_METRICS]		= { .type = NLA_NESTED },
@@ -652,6 +654,7 @@ const struct nla_policy rtm_ipv4_policy[RTA_MAX + 1] = {
 	[RTA_FLOW]		= { .type = NLA_U32 },
 	[RTA_ENCAP_TYPE]	= { .type = NLA_U16 },
 	[RTA_ENCAP]		= { .type = NLA_NESTED },
+	[RTA_NH_ID]		= { .type = NLA_U32 },
 	[RTA_UID]		= { .type = NLA_U32 },
 	[RTA_MARK]		= { .type = NLA_U32 },
 	[RTA_TABLE]		= { .type = NLA_U32 },
@@ -660,10 +663,55 @@ const struct nla_policy rtm_ipv4_policy[RTA_MAX + 1] = {
 	[RTA_DPORT]		= { .type = NLA_U16 },
 };
 
+int fib_gw_from_via(struct fib_config *cfg, struct nlattr *nla,
+		    struct netlink_ext_ack *extack)
+{
+	struct rtvia *via;
+	int alen;
+
+	if (nla_len(nla) < offsetof(struct rtvia, rtvia_addr)) {
+		NL_SET_ERR_MSG(extack, "Invalid attribute length for RTA_VIA");
+		return -EINVAL;
+	}
+
+	via = nla_data(nla);
+	alen = nla_len(nla) - offsetof(struct rtvia, rtvia_addr);
+
+	switch (via->rtvia_family) {
+	case AF_INET:
+		if (alen != sizeof(__be32)) {
+			NL_SET_ERR_MSG(extack, "Invalid IPv4 address in RTA_VIA");
+			return -EINVAL;
+		}
+		cfg->fc_gw_family = AF_INET;
+		memcpy(&cfg->fc_gw, via->rtvia_addr, sizeof(cfg->fc_gw));
+		break;
+	case AF_INET6:
+#if IS_ENABLED(CONFIG_IPV6)
+		if (alen != sizeof(struct in6_addr)) {
+			NL_SET_ERR_MSG(extack, "Invalid IPv6 address in RTA_VIA");
+			return -EINVAL;
+		}
+		cfg->fc_gw_family = AF_INET6;
+		memcpy(&cfg->fc_gw6, via->rtvia_addr, sizeof(cfg->fc_gw6));
+#else
+		NL_SET_ERR_MSG(extack, "IPv6 support not enabled in kernel");
+		return -EINVAL;
+#endif
+		break;
+	default:
+		NL_SET_ERR_MSG(extack, "Unsupported address family in RTA_VIA");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 			     struct nlmsghdr *nlh, struct fib_config *cfg,
 			     struct netlink_ext_ack *extack)
 {
+	bool has_gw = false, has_via = false;
 	struct nlattr *attr;
 	int err, remaining;
 	struct rtmsg *rtm;
@@ -703,13 +751,24 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 		case RTA_OIF:
 			cfg->fc_oif = nla_get_u32(attr);
 			break;
+		case RTA_NH_ID:
+			cfg->fc_nh_id = nla_get_u32(attr);
+			if (!cfg->fc_nh_id) {
+				NL_SET_ERR_MSG(extack, "Invalid nexthop id");
+				return -EINVAL;
+			}
+			break;
 		case RTA_GATEWAY:
+			has_gw = true;
+			cfg->fc_gw_family = AF_INET;
 			cfg->fc_gw = nla_get_be32(attr);
 			break;
 		case RTA_VIA:
-			NL_SET_ERR_MSG(extack, "IPv4 does not support RTA_VIA attribute");
-			err = -EINVAL;
-			goto errout;
+			has_via = true;
+			err = fib_gw_from_via(cfg, attr, extack);
+			if (err)
+				goto errout;
+			break;
 		case RTA_PRIORITY:
 			cfg->fc_priority = nla_get_u32(attr);
 			break;
@@ -746,6 +805,17 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 				goto errout;
 			break;
 		}
+	}
+
+	if (cfg->fc_nh_id && (has_gw || has_via || cfg->fc_oif || cfg->fc_mp ||
+			     cfg->fc_encap || cfg->fc_encap_type || cfg->fc_flow)) {
+		NL_SET_ERR_MSG(extack, "RTA_NH_ID cannot be combined with inline nexthop attributes");
+		return -EINVAL;
+	}
+
+	if (has_gw && has_via) {
+		NL_SET_ERR_MSG(extack, "RTA_GATEWAY and RTA_VIA are mutually exclusive");
+		return -EINVAL;
 	}
 
 	return 0;
@@ -1388,7 +1458,7 @@ static int __net_init fib_net_init(struct net *net)
 	int error;
 
 #ifdef CONFIG_IP_ROUTE_CLASSID
-	net->ipv4.fib_num_tclassid_users = 0;
+	atomic_set(&net->ipv4.fib_num_tclassid_users, 0);
 #endif
 	error = ip_fib_net_init(net);
 	if (error < 0)

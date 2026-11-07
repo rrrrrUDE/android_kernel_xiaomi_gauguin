@@ -83,6 +83,8 @@ enum {
 	 * percpu_ref_reinit() before used.  Implies INIT_ATOMIC.
 	 */
 	PERCPU_REF_INIT_DEAD	= 1 << 1,
+	/* Accepted by newer users; this 4.19 implementation supports reinit. */
+	PERCPU_REF_ALLOW_REINIT	= 1 << 2,
 };
 
 struct percpu_ref {
@@ -108,6 +110,7 @@ void percpu_ref_switch_to_atomic_sync(struct percpu_ref *ref);
 void percpu_ref_switch_to_percpu(struct percpu_ref *ref);
 void percpu_ref_kill_and_confirm(struct percpu_ref *ref,
 				 percpu_ref_func_t *confirm_kill);
+void percpu_ref_resurrect(struct percpu_ref *ref);
 void percpu_ref_reinit(struct percpu_ref *ref);
 
 /**
@@ -259,6 +262,26 @@ static inline bool percpu_ref_tryget_live(struct percpu_ref *ref)
 
 	rcu_read_unlock_sched();
 
+	return ret;
+}
+
+static inline bool percpu_ref_tryget_many(struct percpu_ref *ref,
+					 unsigned long nr)
+{
+	unsigned long __percpu *percpu_count;
+	unsigned long percpu_ptr;
+	bool ret = false;
+
+	rcu_read_lock_sched();
+	if (__ref_is_percpu(ref, &percpu_count)) {
+		this_cpu_add(*percpu_count, nr);
+		ret = true;
+	} else {
+		percpu_ptr = READ_ONCE(ref->percpu_count_ptr);
+		if (!(percpu_ptr & __PERCPU_REF_DEAD))
+			ret = atomic_long_add_unless(&ref->count, nr, 0);
+	}
+	rcu_read_unlock_sched();
 	return ret;
 }
 

@@ -11,8 +11,7 @@
 #include <linux/spinlock.h>
 #include <linux/bpf.h>
 #include <linux/bpf_local_storage.h>
-#include <net/sock.h>
-#include <uapi/linux/sock_diag.h>
+#include <linux/filter.h>
 #include <uapi/linux/btf.h>
 #include <linux/bpf_lsm.h>
 #include <linux/btf_ids.h>

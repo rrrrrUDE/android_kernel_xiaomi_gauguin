@@ -12,6 +12,7 @@
 
 struct pid;
 struct cred;
+struct socket;
 
 #define __sockaddr_check_size(size)	\
 	BUILD_BUG_ON(((size) > sizeof(struct __kernel_sockaddr_storage)))
@@ -373,10 +374,16 @@ extern int __sys_sendto(int fd, void __user *buff, size_t len,
 			int addr_len);
 extern int __sys_accept4(int fd, struct sockaddr __user *upeer_sockaddr,
 			 int __user *upeer_addrlen, int flags);
+extern struct file *do_accept(struct file *file, unsigned int file_flags,
+			      struct sockaddr __user *upeer_sockaddr,
+			      int __user *upeer_addrlen, int flags);
 extern int __sys_socket(int family, int type, int protocol);
 extern int __sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen);
 extern int __sys_connect(int fd, struct sockaddr __user *uservaddr,
 			 int addrlen);
+extern int __sys_connect_file(struct file *file,
+			      struct sockaddr_storage *address,
+			      int addrlen, int file_flags);
 extern int __sys_listen(int fd, int backlog);
 extern int __sys_getsockname(int fd, struct sockaddr __user *usockaddr,
 			     int __user *usockaddr_len);
@@ -385,4 +392,18 @@ extern int __sys_getpeername(int fd, struct sockaddr __user *usockaddr,
 extern int __sys_socketpair(int family, int type, int protocol,
 			    int __user *usockvec);
 extern int __sys_shutdown(int fd, int how);
+extern int __sys_shutdown_sock(struct socket *sock, int how);
+extern long __sys_sendmsg_sock(struct socket *sock, struct msghdr *msg,
+			       unsigned int flags);
+extern int sendmsg_copy_msghdr(struct msghdr *msg,
+			       struct user_msghdr __user *umsg, unsigned flags,
+			       struct iovec **iov);
+extern int __copy_msghdr_from_user(struct msghdr *kmsg,
+				   struct user_msghdr __user *umsg,
+				   struct sockaddr __user **save_addr,
+				   struct iovec __user **uiov, size_t *nsegs);
+extern long __sys_recvmsg_sock(struct socket *sock, struct msghdr *msg,
+			       struct user_msghdr __user *umsg,
+			       struct sockaddr __user *uaddr,
+			       unsigned int flags);
 #endif /* _LINUX_SOCKET_H */

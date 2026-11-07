@@ -14,6 +14,10 @@ kbuild-file := $(srctree)/arch/$(SRCARCH)/include/$(src)/Kbuild
 
 include scripts/Kbuild.include
 
+# Generated wrappers belong to this output tree.  Relative targets can be
+# satisfied through VPATH by stale wrappers in the source tree during O= builds.
+override obj := $(abspath $(obj))
+
 # Create output directory if not already present
 _dummy := $(shell [ -d $(obj) ] || mkdir -p $(obj))
 

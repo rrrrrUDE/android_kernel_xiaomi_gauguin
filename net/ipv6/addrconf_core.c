@@ -162,19 +162,35 @@ eafnosupport_fib6_multipath_select(const struct net *net, struct fib6_info *f6i,
 	return f6i;
 }
 
+static void eafnosupport_fib6_select_path(const struct net *net,
+		struct fib6_result *res, struct flowi6 *fl6, int oif,
+		const struct sk_buff *skb, int strict)
+{
+}
+
 static u32
-eafnosupport_ip6_mtu_from_fib6(struct fib6_info *f6i, struct in6_addr *daddr,
+eafnosupport_ip6_mtu_from_fib6(struct fib6_info *f6i, struct fib6_nh *nh,
+		      struct in6_addr *daddr,
 			       struct in6_addr *saddr)
 {
 	return 0;
 }
 
+static int eafnosupport_fib6_nh_init(struct net *net, struct fib6_nh *nh,
+				    struct fib6_config *cfg, gfp_t gfp_flags,
+				    struct netlink_ext_ack *extack)
+{
+	return -EAFNOSUPPORT;
+}
+
 const struct ipv6_stub *ipv6_stub __read_mostly = &(struct ipv6_stub) {
+	.fib6_nh_init = eafnosupport_fib6_nh_init,
 	.ipv6_dst_lookup_flow = eafnosupport_ipv6_dst_lookup_flow,
 	.fib6_get_table    = eafnosupport_fib6_get_table,
 	.fib6_table_lookup = eafnosupport_fib6_table_lookup,
 	.fib6_lookup       = eafnosupport_fib6_lookup,
 	.fib6_multipath_select = eafnosupport_fib6_multipath_select,
+	.fib6_select_path = eafnosupport_fib6_select_path,
 	.ip6_mtu_from_fib6 = eafnosupport_ip6_mtu_from_fib6,
 };
 EXPORT_SYMBOL_GPL(ipv6_stub);

@@ -184,8 +184,13 @@ static int fib6_rule_action_alt(struct fib_rule *rule, struct flowi *flp,
 	oif = (int *)arg->lookup_data;
 	f6i = fib6_table_lookup(net, table, *oif, flp6, flags);
 	if (f6i != net->ipv6.fib6_null_entry) {
+		struct fib6_result res = { .f6i = f6i };
+
+		fib6_select_path(net, &res, flp6, flp6->flowi6_oif, NULL, flags);
+		if (res.f6i == net->ipv6.fib6_null_entry)
+			return -EAGAIN;
 		err = fib6_rule_saddr(net, rule, flags, flp6,
-				      fib6_info_nh_dev(f6i));
+				      res.nh->fib_nh_dev);
 
 		if (likely(!err))
 			arg->result = f6i;

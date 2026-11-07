@@ -217,6 +217,7 @@ endif
 endif
 
 ifdef CONFIG_FTRACE_MCOUNT_RECORD
+ifndef CONFIG_FTRACE_MCOUNT_USE_PATCHABLE_FUNCTION_ENTRY
 ifndef CC_USING_RECORD_MCOUNT
 # compiler will not generate __mcount_loc use recordmcount or recordmcount.pl
 ifdef BUILD_C_RECORDMCOUNT
@@ -260,6 +261,7 @@ cmd_record_mcount =						\
 	fi;
 endif # CONFIG_LTO_CLANG
 endif # CC_USING_RECORD_MCOUNT
+endif # CONFIG_FTRACE_MCOUNT_USE_PATCHABLE_FUNCTION_ENTRY
 endif # CONFIG_FTRACE_MCOUNT_RECORD
 
 ifdef CONFIG_STACK_VALIDATION

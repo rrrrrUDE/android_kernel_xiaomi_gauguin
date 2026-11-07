@@ -84,7 +84,7 @@ void *bpf_internal_load_pointer_neg_helper(const struct sk_buff *skb, int k, uns
 
 struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flags)
 {
-	gfp_t gfp_flags = GFP_KERNEL | __GFP_ZERO | gfp_extra_flags;
+	gfp_t gfp_flags = GFP_KERNEL_ACCOUNT | __GFP_ZERO | gfp_extra_flags;
 	struct bpf_prog_aux *aux;
 	struct bpf_prog *fp;
 
@@ -93,7 +93,7 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	if (fp == NULL)
 		return NULL;
 
-	aux = kzalloc(sizeof(*aux), GFP_KERNEL | gfp_extra_flags);
+	aux = kzalloc(sizeof(*aux), GFP_KERNEL_ACCOUNT | gfp_extra_flags);
 	if (aux == NULL) {
 		vfree(fp);
 		return NULL;
@@ -113,7 +113,7 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 
 struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags)
 {
-	gfp_t gfp_flags = GFP_KERNEL | __GFP_ZERO | gfp_extra_flags;
+	gfp_t gfp_flags = GFP_KERNEL_ACCOUNT | __GFP_ZERO | gfp_extra_flags;
 	struct bpf_prog *prog;
 	int cpu;
 
@@ -145,7 +145,7 @@ int bpf_prog_alloc_jited_linfo(struct bpf_prog *prog)
 
 	prog->aux->jited_linfo = kcalloc(prog->aux->nr_linfo,
 					 sizeof(*prog->aux->jited_linfo),
-					 GFP_KERNEL | __GFP_NOWARN);
+					 GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
 	if (!prog->aux->jited_linfo)
 		return -ENOMEM;
 
@@ -226,25 +226,17 @@ void bpf_prog_free_linfo(struct bpf_prog *prog)
 struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
 				  gfp_t gfp_extra_flags)
 {
-	gfp_t gfp_flags = GFP_KERNEL | __GFP_ZERO | gfp_extra_flags;
+	gfp_t gfp_flags = GFP_KERNEL_ACCOUNT | __GFP_ZERO | gfp_extra_flags;
 	struct bpf_prog *fp;
-	u32 pages, delta;
-	int ret;
+	u32 pages;
 
 	size = round_up(size, PAGE_SIZE);
 	pages = size / PAGE_SIZE;
 	if (pages <= fp_old->pages)
 		return fp_old;
 
-	delta = pages - fp_old->pages;
-	ret = __bpf_prog_charge(fp_old->aux->user, delta);
-	if (ret)
-		return NULL;
-
 	fp = __vmalloc(size, gfp_flags);
-	if (fp == NULL) {
-		__bpf_prog_uncharge(fp_old->aux->user, delta);
-	} else {
+	if (fp != NULL) {
 		memcpy(fp, fp_old, fp_old->pages * PAGE_SIZE);
 		fp->pages = pages;
 		fp->aux->prog = fp;
@@ -266,6 +258,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->dst_mutex);
 		free_percpu(fp->aux->stats);
 		kfree(fp->aux->poke_tab);
+		kfree(fp->aux->kfunc_tab);
 		kfree(fp->aux);
 	}
 	vfree(fp);
@@ -397,6 +390,13 @@ static int bpf_adj_branches(struct bpf_prog *prog, u32 pos, s32 end_old,
 		if (probe_pass && i == pos) {
 			i = end_new;
 			insn = prog->insnsi + end_old;
+		}
+		if (bpf_pseudo_func(insn)) {
+			ret = bpf_adj_delta_to_imm(insn, pos, end_old,
+						   end_new, i, probe_pass);
+			if (ret)
+				return ret;
+			continue;
 		}
 		code = insn->code;
 		if ((BPF_CLASS(code) != BPF_JMP &&
@@ -1336,8 +1336,8 @@ EXPORT_SYMBOL_GPL(__bpf_call_base);
 	INSN_3(STX, MEM,  H),			\
 	INSN_3(STX, MEM,  W),			\
 	INSN_3(STX, MEM,  DW),			\
-	INSN_3(STX, XADD, W),			\
-	INSN_3(STX, XADD, DW),			\
+	INSN_3(STX, ATOMIC, W),			\
+	INSN_3(STX, ATOMIC, DW),			\
 	/*   Immediate based. */		\
 	INSN_3(ST, MEM, B),			\
 	INSN_3(ST, MEM, H),			\
@@ -1679,13 +1679,52 @@ out:
 	LDST(DW, u64)
 #undef LDST
 
-	STX_XADD_W: /* lock xadd *(u32 *)(dst_reg + off16) += src_reg */
-		atomic_add((u32) SRC, (atomic_t *)(unsigned long)
-			   (DST + insn->off));
-		CONT;
-	STX_XADD_DW: /* lock xadd *(u64 *)(dst_reg + off16) += src_reg */
-		atomic64_add((u64) SRC, (atomic64_t *)(unsigned long)
-			     (DST + insn->off));
+
+#define ATOMIC_ALU_OP(BOP, KOP)\
+		case BOP:\
+			if (BPF_SIZE(insn->code) == BPF_W)\
+				atomic_##KOP((u32) SRC, (atomic_t *)(unsigned long)\
+					     (DST + insn->off));\
+			else\
+				atomic64_##KOP((u64) SRC, (atomic64_t *)(unsigned long)\
+					       (DST + insn->off));\
+			break;\
+		case BOP | BPF_FETCH:\
+			if (BPF_SIZE(insn->code) == BPF_W)\
+				SRC = (u32) atomic_fetch_##KOP((u32) SRC,\
+					(atomic_t *)(unsigned long)(DST + insn->off));\
+			else\
+				SRC = (u64) atomic64_fetch_##KOP((u64) SRC,\
+					(atomic64_t *)(unsigned long)(DST + insn->off));\
+			break;
+
+	STX_ATOMIC_DW:
+	STX_ATOMIC_W:
+		switch (IMM) {
+		ATOMIC_ALU_OP(BPF_ADD, add)
+		ATOMIC_ALU_OP(BPF_AND, and)
+		ATOMIC_ALU_OP(BPF_OR, or)
+		ATOMIC_ALU_OP(BPF_XOR, xor)
+#undef ATOMIC_ALU_OP
+		case BPF_XCHG:
+			if (BPF_SIZE(insn->code) == BPF_W)
+				SRC = (u32)atomic_xchg((atomic_t *)(unsigned long)(DST + insn->off),
+							(u32)SRC);
+			else
+				SRC = (u64)atomic64_xchg((atomic64_t *)(unsigned long)(DST + insn->off),
+							  (u64)SRC);
+			break;
+		case BPF_CMPXCHG:
+			if (BPF_SIZE(insn->code) == BPF_W)
+				BPF_R0 = (u32)atomic_cmpxchg((atomic_t *)(unsigned long)(DST + insn->off),
+								  (u32)BPF_R0, (u32)SRC);
+			else
+				BPF_R0 = (u64)atomic64_cmpxchg((atomic64_t *)(unsigned long)(DST + insn->off),
+								    (u64)BPF_R0, (u64)SRC);
+			break;
+		default:
+			goto default_label;
+		}
 		CONT;
 
 	default_label:
@@ -1854,6 +1893,8 @@ static void bpf_prog_select_func(struct bpf_prog *fp)
  */
 struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
 {
+	bool has_kfunc_call = bpf_prog_has_kfunc_call(fp);
+
 	/* In case of BPF to BPF calls, verifier did all the prep
 	 * work with regards to JITing, etc.
 	 */
@@ -1876,6 +1917,10 @@ struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
 		fp = bpf_int_jit_compile(fp);
 		if (!fp->jited) {
 			bpf_prog_free_jited_linfo(fp);
+			if (has_kfunc_call) {
+				*err = -ENOTSUPP;
+				return fp;
+			}
 #ifdef CONFIG_BPF_JIT_ALWAYS_ON
 			*err = -ENOTSUPP;
 			return fp;
@@ -2085,6 +2130,7 @@ int bpf_prog_array_update_at(struct bpf_prog_array *array, int index,
 int bpf_prog_array_copy(struct bpf_prog_array *old_array,
 			struct bpf_prog *exclude_prog,
 			struct bpf_prog *include_prog,
+			u64 bpf_cookie,
 			struct bpf_prog_array **new_array)
 {
 	int new_prog_cnt, carry_prog_cnt = 0;
@@ -2135,12 +2181,15 @@ int bpf_prog_array_copy(struct bpf_prog_array *old_array,
 		for (; existing->prog; existing++)
 			if (existing->prog != exclude_prog &&
 			    existing->prog != &dummy_bpf_prog.prog) {
-				array->items[new_prog_idx++].prog =
-					existing->prog;
+				array->items[new_prog_idx] = *existing;
+				new_prog_idx++;
 			}
 	}
-	if (include_prog)
-		array->items[new_prog_idx++].prog = include_prog;
+	if (include_prog) {
+		array->items[new_prog_idx].prog = include_prog;
+		array->items[new_prog_idx].bpf_cookie = bpf_cookie;
+		new_prog_idx++;
+	}
 	array->items[new_prog_idx].prog = NULL;
 	*new_array = array;
 	return 0;
@@ -2207,6 +2256,7 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 		 * released along with it.
 		 */
 		aux->func[i]->aux->poke_tab = NULL;
+		aux->func[i]->aux->kfunc_tab = NULL;
 		bpf_jit_free(aux->func[i]);
 	}
 	if (aux->func_cnt) {
@@ -2350,6 +2400,11 @@ bool __weak bpf_helper_changes_pkt_data(void *func)
  * Otherwise, return FALSE.
  */
 bool __weak bpf_jit_needs_zext(void)
+{
+	return false;
+}
+
+bool __weak bpf_jit_supports_kfunc_call(void)
 {
 	return false;
 }

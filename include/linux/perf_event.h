@@ -698,6 +698,7 @@ struct perf_event {
 #ifdef CONFIG_BPF_SYSCALL
 	perf_overflow_handler_t		orig_overflow_handler;
 	struct bpf_prog			*prog;
+	u64				bpf_cookie;
 #endif
 
 #ifdef CONFIG_EVENT_TRACING
@@ -898,6 +899,9 @@ extern void perf_event_exit_task(struct task_struct *child);
 extern void perf_event_free_task(struct task_struct *task);
 extern void perf_event_delayed_put(struct task_struct *task);
 extern struct file *perf_event_get(unsigned int fd);
+extern int perf_event_set_bpf_prog(struct perf_event *event,
+				   struct bpf_prog *prog, u64 bpf_cookie);
+extern void perf_event_free_bpf_prog(struct perf_event *event);
 extern const struct perf_event *perf_get_event(struct file *file);
 extern const struct perf_event_attr *perf_event_attrs(struct perf_event *event);
 extern void perf_event_print_debug(void);

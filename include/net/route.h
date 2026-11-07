@@ -383,4 +383,6 @@ static inline struct neighbour *ip_neigh_for_gw(struct rtable *rt,
 	return neigh;
 }
 
+void fnhe_update_pmtu(struct fib_nh_exception *fnhe, u32 new, u32 orig);
+
 #endif	/* _ROUTE_H */

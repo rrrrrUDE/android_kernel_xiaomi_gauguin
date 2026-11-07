@@ -179,6 +179,8 @@ vmlinux_link()
 gen_btf()
 {
 	local pahole_ver
+	local pahole_opts=""
+	local opt
 
 	if ! [ -x "$(command -v ${PAHOLE})" ]; then
 		info "BTF" "${1}: pahole (${PAHOLE}) is not available"
@@ -191,9 +193,21 @@ gen_btf()
 		return 1
 	fi
 
+	# This kernel supports BTF kinds through DATASEC (15). Newer pahole
+	# versions can emit kinds which this kernel's BTF loader cannot parse.
+	for opt in --skip_encoding_btf_enum64 --skip_encoding_btf_decl_tag \
+		   --skip_encoding_btf_type_tag; do
+		if ${PAHOLE} --help | grep -q -- "${opt}"; then
+			pahole_opts="${pahole_opts} ${opt}"
+		fi
+	done
+
 	info "BTF" ${2}
 	vmlinux_link ${1}
-	LLVM_OBJCOPY=${OBJCOPY} ${PAHOLE} -J ${1}
+	LLVM_OBJCOPY=${OBJCOPY} ${PAHOLE} ${pahole_opts} -J ${1}
+	# Keep per-CPU VAR/DATASEC records, but correct stale offsets emitted by
+	# some pahole/LLVM combinations before the kernel validates vmlinux BTF.
+	python3 "${srctree}/scripts/fix-percpu-btf.py" "${1}" "${READELF}" || return 1
 
 	# Create ${2} which contains just .BTF section but no symbols. Add
 	# SHF_ALLOC because .BTF will be part of the vmlinux image. --strip-all

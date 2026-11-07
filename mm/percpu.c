@@ -80,6 +80,8 @@
 #include <linux/workqueue.h>
 #include <linux/kmemleak.h>
 #include <linux/sched.h>
+#include <linux/memcontrol.h>
+#include <linux/hashtable.h>
 
 #include <asm/cacheflush.h>
 #include <asm/sections.h>
@@ -1349,7 +1351,7 @@ static struct pcpu_chunk *pcpu_chunk_addr_search(void *addr)
  * RETURNS:
  * Percpu pointer to the allocated area on success, NULL on failure.
  */
-static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+static void __percpu *pcpu_alloc_unaccounted(size_t size, size_t align, bool reserved,
 				 gfp_t gfp)
 {
 	/* whitelisted flags that can be passed to the backing allocators */
@@ -1525,6 +1527,91 @@ fail:
 	}
 	return NULL;
 }
+
+#ifdef CONFIG_MEMCG_KMEM
+struct pcpu_memcg_record {
+	struct hlist_node node;
+	void __percpu *ptr;
+	struct mem_cgroup *memcg;
+	unsigned int nr_pages;
+};
+
+static DEFINE_HASHTABLE(pcpu_memcg_records, 8);
+static DEFINE_SPINLOCK(pcpu_memcg_lock);
+
+static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+				gfp_t gfp)
+{
+	struct pcpu_memcg_record *record;
+	struct mem_cgroup *memcg;
+	void __percpu *ptr;
+	unsigned long flags;
+	u64 bytes;
+	unsigned int pages;
+
+	if (!(gfp & __GFP_ACCOUNT) || !memcg_kmem_enabled())
+		return pcpu_alloc_unaccounted(size, align, reserved, gfp);
+	/* Preserve the native allocator's minimum-alignment convention. */
+	if (align < PCPU_MIN_ALLOC_SIZE)
+		align = PCPU_MIN_ALLOC_SIZE;
+	/* Validate before rounding/multiplying, including malicious map sizes. */
+	if (!size || size > PCPU_MIN_UNIT_SIZE || align > PAGE_SIZE ||
+	    !is_power_of_2(align))
+		return NULL;
+	bytes = (u64)ALIGN(size, PCPU_MIN_ALLOC_SIZE) * num_possible_cpus();
+	pages = DIV_ROUND_UP_ULL(bytes, PAGE_SIZE);
+	memcg = memcg_kmem_charge_percpu(gfp, pages);
+	if (IS_ERR(memcg))
+		return NULL;
+	if (!memcg)
+		return pcpu_alloc_unaccounted(size, align, reserved, gfp);
+	/* Metadata is private to the charge and must not recursively account. */
+	record = kmalloc(sizeof(*record), gfp & ~__GFP_ACCOUNT);
+	if (!record)
+		goto uncharge;
+	ptr = pcpu_alloc_unaccounted(size, align, reserved, gfp);
+	if (!ptr) {
+		kfree(record);
+		goto uncharge;
+	}
+	record->ptr = ptr;
+	record->memcg = memcg;
+	record->nr_pages = pages;
+	spin_lock_irqsave(&pcpu_memcg_lock, flags);
+	hash_add(pcpu_memcg_records, &record->node, (unsigned long)ptr);
+	spin_unlock_irqrestore(&pcpu_memcg_lock, flags);
+	return ptr;
+uncharge:
+	memcg_kmem_uncharge_percpu(memcg, pages);
+	return NULL;
+}
+
+static void pcpu_memcg_free(void __percpu *ptr)
+{
+	struct pcpu_memcg_record *record;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pcpu_memcg_lock, flags);
+	hash_for_each_possible(pcpu_memcg_records, record, node, (unsigned long)ptr) {
+		if (record->ptr != ptr)
+			continue;
+		hash_del(&record->node);
+		spin_unlock_irqrestore(&pcpu_memcg_lock, flags);
+		memcg_kmem_uncharge_percpu(record->memcg, record->nr_pages);
+		kfree(record);
+		return;
+	}
+	spin_unlock_irqrestore(&pcpu_memcg_lock, flags);
+}
+#else
+static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+				gfp_t gfp)
+{
+	return pcpu_alloc_unaccounted(size, align, reserved, gfp);
+}
+
+static void pcpu_memcg_free(void __percpu *ptr) { }
+#endif
 
 /**
  * __alloc_percpu_gfp - allocate dynamic percpu area
@@ -1726,6 +1813,7 @@ void free_percpu(void __percpu *ptr)
 	if (!ptr)
 		return;
 
+	pcpu_memcg_free(ptr);
 	kmemleak_free_percpu(ptr);
 
 	addr = __pcpu_ptr_to_addr(ptr);

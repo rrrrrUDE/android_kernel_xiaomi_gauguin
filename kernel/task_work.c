@@ -25,7 +25,8 @@ static struct callback_head work_exited; /* all we need is ->next == NULL */
  * 0 if succeeds or -ESRCH.
  */
 int
-task_work_add(struct task_struct *task, struct callback_head *work, bool notify)
+task_work_add(struct task_struct *task, struct callback_head *work,
+	      enum task_work_notify_mode notify)
 {
 	struct callback_head *head;
 
@@ -36,8 +37,19 @@ task_work_add(struct task_struct *task, struct callback_head *work, bool notify)
 		work->next = head;
 	} while (cmpxchg(&task->task_works, head, work) != head);
 
-	if (notify)
+	switch (notify) {
+	case TWA_NONE:
+		break;
+	case TWA_RESUME:
 		set_notify_resume(task);
+		break;
+	case TWA_SIGNAL:
+		set_notify_signal(task);
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		break;
+	}
 	return 0;
 }
 
@@ -53,7 +65,8 @@ task_work_add(struct task_struct *task, struct callback_head *work, bool notify)
  * The found work or NULL if not found.
  */
 struct callback_head *
-task_work_cancel(struct task_struct *task, task_work_func_t func)
+task_work_cancel_match(struct task_struct *task,
+		       bool (*match)(struct callback_head *, void *), void *data)
 {
 	struct callback_head **pprev = &task->task_works;
 	struct callback_head *work;
@@ -69,7 +82,7 @@ task_work_cancel(struct task_struct *task, task_work_func_t func)
 	 */
 	raw_spin_lock_irqsave(&task->pi_lock, flags);
 	while ((work = READ_ONCE(*pprev))) {
-		if (work->func != func)
+		if (!match(work, data))
 			pprev = &work->next;
 		else if (cmpxchg(pprev, work, work->next) == work)
 			break;
@@ -77,6 +90,17 @@ task_work_cancel(struct task_struct *task, task_work_func_t func)
 	raw_spin_unlock_irqrestore(&task->pi_lock, flags);
 
 	return work;
+}
+
+static bool task_work_func_match(struct callback_head *work, void *data)
+{
+	return work->func == data;
+}
+
+struct callback_head *
+task_work_cancel(struct task_struct *task, task_work_func_t func)
+{
+	return task_work_cancel_match(task, task_work_func_match, func);
 }
 
 /**

@@ -33,8 +33,8 @@ struct btf_type {
 	/* "info" bits arrangement
 	 * bits  0-15: vlen (e.g. # of struct's members)
 	 * bits 16-23: unused
-	 * bits 24-27: kind (e.g. int, ptr, array...etc)
-	 * bits 28-30: unused
+	 * bits 24-28: kind (e.g. int, ptr, array...etc)
+	 * bits 29-30: unused
 	 * bit     31: kind_flag, currently used by
 	 *             struct, union and fwd
 	 */
@@ -52,7 +52,7 @@ struct btf_type {
 	};
 };
 
-#define BTF_INFO_KIND(info)	(((info) >> 24) & 0x0f)
+#define BTF_INFO_KIND(info)	(((info) >> 24) & 0x1f)
 #define BTF_INFO_VLEN(info)	((info) & 0xffff)
 #define BTF_INFO_KFLAG(info)	((info) >> 31)
 
@@ -72,7 +72,8 @@ struct btf_type {
 #define BTF_KIND_FUNC_PROTO	13	/* Function Proto	*/
 #define BTF_KIND_VAR		14	/* Variable	*/
 #define BTF_KIND_DATASEC	15	/* Section	*/
-#define BTF_KIND_MAX		BTF_KIND_DATASEC
+#define BTF_KIND_FLOAT		16	/* Floating point	*/
+#define BTF_KIND_MAX		BTF_KIND_FLOAT
 #define NR_BTF_KINDS		(BTF_KIND_MAX + 1)
 
 /* For some specific BTF_KIND, "struct btf_type" is immediately
@@ -143,6 +144,7 @@ struct btf_param {
 enum {
 	BTF_VAR_STATIC = 0,
 	BTF_VAR_GLOBAL_ALLOCATED,
+	BTF_VAR_GLOBAL_EXTERN = 2,
 };
 
 enum btf_func_linkage {

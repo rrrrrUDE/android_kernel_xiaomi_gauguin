@@ -941,7 +941,7 @@ unsigned int nd_region_acquire_lane(struct nd_region *nd_region)
 {
 	unsigned int cpu, lane;
 
-	migrate_disable();
+	preempt_disable();
 	cpu = smp_processor_id();
 	if (nd_region->num_lanes < nr_cpu_ids) {
 		struct nd_percpu_lane *ndl_lock, *ndl_count;
@@ -969,7 +969,7 @@ void nd_region_release_lane(struct nd_region *nd_region, unsigned int lane)
 		if (--ndl_count->count == 0)
 			spin_unlock(&ndl_lock->lock);
 	}
-	migrate_enable();
+	preempt_enable();
 }
 EXPORT_SYMBOL(nd_region_release_lane);
 

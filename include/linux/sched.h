@@ -36,11 +36,14 @@
 struct audit_context;
 struct backing_dev_info;
 struct bio_list;
+struct bpf_local_storage;
+struct bpf_run_ctx;
 struct blk_plug;
 struct cfs_rq;
 struct fs_struct;
 struct futex_pi_state;
 struct io_context;
+struct io_uring_task;
 struct mempolicy;
 struct nameidata;
 struct nsproxy;
@@ -840,6 +843,11 @@ struct task_struct {
 	 */
 	randomized_struct_fields_start
 
+#ifdef CONFIG_BPF_SYSCALL
+	struct bpf_local_storage __rcu	*bpf_storage;
+	struct bpf_run_ctx		*bpf_ctx;
+#endif
+
 	void				*stack;
 	refcount_t			usage;
 	/* Per task flags (PF_*), defined further below: */
@@ -924,6 +932,9 @@ struct task_struct {
 	unsigned int			policy;
 	int				nr_cpus_allowed;
 	cpumask_t			cpus_allowed;
+	const struct cpumask		*cpus_ptr;
+	unsigned int			migration_disabled;
+	struct set_affinity_pending	*migration_pending;
 	cpumask_t			cpus_requested;
 
 #ifdef CONFIG_PREEMPT_RCU
@@ -1070,6 +1081,12 @@ struct task_struct {
 
 	/* CLONE_CHILD_CLEARTID: */
 	int __user			*clear_child_tid;
+
+	/* io_uring task context and worker state */
+#ifdef CONFIG_IO_URING
+	struct io_uring_task		*io_uring;
+#endif
+	void				*pf_io_worker;
 
 	u64				utime;
 	u64				stime;
@@ -1711,7 +1728,8 @@ extern struct pid *cad_pid;
  */
 #define PF_IDLE			0x00000002	/* I am an IDLE thread */
 #define PF_EXITING		0x00000004	/* Getting shut down */
-#define PF_VCPU			0x00000010	/* I'm a virtual CPU */
+#define PF_VCPU			0x00000001	/* I'm a virtual CPU */
+#define PF_IO_WORKER		0x00000010	/* Task is an io_uring worker */
 #define PF_WQ_WORKER		0x00000020	/* I'm a workqueue worker */
 #define PF_FORKNOEXEC		0x00000040	/* Forked but didn't exec */
 #define PF_MCE_PROCESS		0x00000080      /* Process policy on mce errors */

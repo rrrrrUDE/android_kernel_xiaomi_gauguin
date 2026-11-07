@@ -62,6 +62,7 @@
 #include <linux/oom.h>
 #include <linux/compat.h>
 #include <linux/vmalloc.h>
+#include <linux/io_uring.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
@@ -1275,6 +1276,9 @@ int flush_old_exec(struct linux_binprm * bprm)
 	retval = de_thread(current);
 	if (retval)
 		goto out;
+
+	/* Cancel any io_uring activity across execve. */
+	io_uring_task_cancel();
 
 	/*
 	 * Must be called _before_ exec_mmap() as bprm->mm is

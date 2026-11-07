@@ -2683,6 +2683,10 @@ relock:
 			do_coredump(&ksig->info);
 		}
 
+		/* io-wq workers must run io_worker_exit() before do_exit(). */
+		if (current->flags & PF_IO_WORKER)
+			goto out;
+
 		/*
 		 * Death signals, no core dump.
 		 */
@@ -2691,6 +2695,7 @@ relock:
 	}
 	spin_unlock_irq(&sighand->siglock);
 
+out:
 	ksig->sig = signr;
 	return ksig->sig > 0;
 }
@@ -2878,6 +2883,41 @@ void __set_current_blocked(const sigset_t *newset)
 	__set_task_blocked(tsk, newset);
 	spin_unlock_irq(&tsk->sighand->siglock);
 }
+
+int set_user_sigmask(const sigset_t __user *umask, size_t sigsetsize)
+{
+	sigset_t kmask;
+
+	if (!umask)
+		return 0;
+	if (sigsetsize != sizeof(sigset_t))
+		return -EINVAL;
+	if (copy_from_user(&kmask, umask, sizeof(kmask)))
+		return -EFAULT;
+	set_restore_sigmask();
+	current->saved_sigmask = current->blocked;
+	set_current_blocked(&kmask);
+	return 0;
+}
+
+#ifdef CONFIG_COMPAT
+int set_compat_user_sigmask(const compat_sigset_t __user *umask,
+			    size_t sigsetsize)
+{
+	sigset_t kmask;
+
+	if (!umask)
+		return 0;
+	if (sigsetsize != sizeof(compat_sigset_t))
+		return -EINVAL;
+	if (get_compat_sigset(&kmask, umask))
+		return -EFAULT;
+	set_restore_sigmask();
+	current->saved_sigmask = current->blocked;
+	set_current_blocked(&kmask);
+	return 0;
+}
+#endif
 
 /*
  * This is also useful for kernel threads that want to temporarily

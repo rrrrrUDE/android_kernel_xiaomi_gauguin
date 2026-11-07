@@ -503,7 +503,7 @@ static int mlx5e_alloc_rq(struct mlx5e_channel *c,
 		bpf_prog_inc(params->xdp_prog);
 	rq->xdp_prog = params->xdp_prog;
 
-	err = xdp_rxq_info_reg(&rq->xdp_rxq, rq->netdev, rq->ix);
+	err = xdp_rxq_info_reg(&rq->xdp_rxq, rq->netdev, rq->ix, 0);
 	if (err < 0)
 		goto err_rq_wq_destroy;
 

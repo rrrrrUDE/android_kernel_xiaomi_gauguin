@@ -7,6 +7,7 @@
 #include <linux/rbtree_latch.h>
 #include <linux/perf_event.h>
 #include <linux/btf.h>
+#include <linux/module.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/rcupdate_wait.h>
 #include <trace/hooks/memory.h>
@@ -98,6 +99,10 @@ static int unregister_fentry(struct bpf_trampoline *tr, void *old_addr)
 		ret = unregister_ftrace_direct((long)ip, (long)old_addr);
 	else
 		ret = bpf_arch_text_poke(ip, BPF_MOD_CALL, old_addr, NULL);
+	if (!ret) {
+		module_put(tr->mod);
+		tr->mod = NULL;
+	}
 	return ret;
 }
 
@@ -117,22 +122,34 @@ static int modify_fentry(struct bpf_trampoline *tr, void *old_addr, void *new_ad
 static int register_fentry(struct bpf_trampoline *tr, void *new_addr)
 {
 	void *ip = tr->func.addr;
+	struct module *mod;
 	unsigned long faddr;
 	int ret;
 
 	faddr = ftrace_location((unsigned long)ip);
 	if (faddr)
 		tr->func.ftrace_managed = true;
+	preempt_disable();
+	mod = __module_text_address((unsigned long)ip);
+	if (mod && !try_module_get(mod)) {
+		preempt_enable();
+		return -ENOENT;
+	}
+	preempt_enable();
 
 	if (tr->func.ftrace_managed)
 		ret = register_ftrace_direct((long)ip, (long)new_addr);
 	else
 		ret = bpf_arch_text_poke(ip, BPF_MOD_CALL, NULL, new_addr);
+	if (ret)
+		module_put(mod);
+	else
+		tr->mod = mod;
 	return ret;
 }
 
 static struct bpf_tramp_progs *
-bpf_trampoline_get_progs(const struct bpf_trampoline *tr, int *total)
+bpf_trampoline_get_progs(const struct bpf_trampoline *tr, int *total, bool *ip_arg)
 {
 	const struct bpf_prog_aux *aux;
 	struct bpf_tramp_progs *tprogs;
@@ -149,8 +166,10 @@ bpf_trampoline_get_progs(const struct bpf_trampoline *tr, int *total)
 		*total += tr->progs_cnt[kind];
 		progs = tprogs[kind].progs;
 
-		hlist_for_each_entry(aux, &tr->progs_hlist[kind], tramp_hlist)
+		hlist_for_each_entry(aux, &tr->progs_hlist[kind], tramp_hlist) {
+			*ip_arg |= aux->prog->call_get_func_ip;
 			*progs++ = aux->prog;
+		}
 	}
 	return tprogs;
 }
@@ -289,19 +308,37 @@ out:
 	return ERR_PTR(err);
 }
 
+/* The image was never published as an entry point. Only the ksym's RCU
+ * readers need to finish before its storage can be released.
+ */
+static void bpf_tramp_image_free_unused(struct bpf_tramp_image *im)
+{
+	bpf_image_ksym_del(&im->ksym);
+	/* bpf_ksym_del() removes an RCU list entry. */
+	synchronize_rcu();
+	trace_android_vh_set_memory_nx((unsigned long)im->image, 1);
+	bpf_jit_free_exec(im->image);
+	bpf_jit_uncharge_modmem(1);
+	percpu_ref_exit(&im->pcref);
+	kfree(im);
+}
+
 static int bpf_trampoline_update(struct bpf_trampoline *tr)
 {
 	struct bpf_tramp_image *im;
 	struct bpf_tramp_progs *tprogs;
 	u32 flags = BPF_TRAMP_F_RESTORE_REGS;
+	bool ip_arg = false;
 	int err, total;
 
-	tprogs = bpf_trampoline_get_progs(tr, &total);
+	tprogs = bpf_trampoline_get_progs(tr, &total, &ip_arg);
 	if (IS_ERR(tprogs))
 		return PTR_ERR(tprogs);
 
 	if (total == 0) {
 		err = unregister_fentry(tr, tr->cur_image->image);
+		if (err)
+			goto out;
 		bpf_tramp_image_put(tr->cur_image);
 		tr->cur_image = NULL;
 		tr->selector = 0;
@@ -317,12 +354,14 @@ static int bpf_trampoline_update(struct bpf_trampoline *tr)
 	if (tprogs[BPF_TRAMP_FEXIT].nr_progs ||
 	    tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs)
 		flags = BPF_TRAMP_F_CALL_ORIG | BPF_TRAMP_F_SKIP_FRAME;
+	if (ip_arg)
+		flags |= BPF_TRAMP_F_IP_ARG;
 
 	err = arch_prepare_bpf_trampoline(im, im->image, im->image + PAGE_SIZE,
 					  &tr->func.model, flags, tprogs,
 					  tr->func.addr);
 	if (err < 0)
-		goto out;
+		goto out_free_im;
 
 	WARN_ON(tr->cur_image && tr->selector == 0);
 	WARN_ON(!tr->cur_image && tr->selector);
@@ -333,11 +372,14 @@ static int bpf_trampoline_update(struct bpf_trampoline *tr)
 		/* first time registering */
 		err = register_fentry(tr, im->image);
 	if (err)
-		goto out;
+		goto out_free_im;
 	if (tr->cur_image)
 		bpf_tramp_image_put(tr->cur_image);
 	tr->cur_image = im;
 	tr->selector++;
+	goto out;
+out_free_im:
+	bpf_tramp_image_free_unused(im);
 out:
 	kfree(tprogs);
 	return err;
@@ -517,11 +559,13 @@ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
 	     * Hence check that 'start' is not zero.
 	     */
 	    start) {
+		preempt_disable();
 		stats = this_cpu_ptr(prog->aux->stats);
 		u64_stats_update_begin(&stats->syncp);
 		stats->cnt++;
 		stats->nsecs += sched_clock() - start;
 		u64_stats_update_end(&stats->syncp);
+		preempt_enable();
 	}
 	migrate_enable();
 	rcu_read_unlock();
@@ -530,11 +574,13 @@ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
 void notrace __bpf_prog_enter_sleepable(void)
 {
 	rcu_read_lock_trace();
+	migrate_disable();
 	might_fault();
 }
 
 void notrace __bpf_prog_exit_sleepable(void)
 {
+	migrate_enable();
 	rcu_read_unlock_trace();
 }
 

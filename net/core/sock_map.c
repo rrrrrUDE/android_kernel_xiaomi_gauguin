@@ -11,6 +11,7 @@
 #include <linux/list.h>
 #include <linux/jhash.h>
 #include <linux/sock_diag.h>
+#include <net/tcp.h>
 
 struct bpf_stab {
 	struct bpf_map map;
@@ -18,6 +19,8 @@ struct bpf_stab {
 	struct sk_psock_progs progs;
 	raw_spinlock_t lock;
 };
+
+static struct sk_psock_progs *sock_map_progs(struct bpf_map *map);
 
 #define SOCK_CREATE_FLAG_MASK				\
 	(BPF_F_NUMA_NODE | BPF_F_RDONLY | BPF_F_WRONLY)
@@ -37,7 +40,7 @@ static struct bpf_map *sock_map_alloc(union bpf_attr *attr)
 	    attr->map_flags & ~SOCK_CREATE_FLAG_MASK)
 		return ERR_PTR(-EINVAL);
 
-	stab = kzalloc(sizeof(*stab), GFP_USER);
+	stab = kzalloc(sizeof(*stab), GFP_USER | __GFP_ACCOUNT);
 	if (!stab)
 		return ERR_PTR(-ENOMEM);
 
@@ -144,24 +147,29 @@ static void sock_map_del_link(struct sock *sk,
 			      struct sk_psock *psock, void *link_raw)
 {
 	struct sk_psock_link *link, *tmp;
-	bool strp_stop = false;
+	bool strp_stop = false, verdict_stop = false;
 
 	spin_lock_bh(&psock->link_lock);
 	list_for_each_entry_safe(link, tmp, &psock->link, list) {
 		if (link->link_raw == link_raw) {
-			struct bpf_map *map = link->map;
-			struct bpf_stab *stab = container_of(map, struct bpf_stab,
-							     map);
-			if (psock->parser.enabled && stab->progs.skb_parser)
+			struct sk_psock_progs *progs = sock_map_progs(link->map);
+
+			if (psock->parser.enabled && progs->skb_parser)
 				strp_stop = true;
+			if (psock->parser.verdict_enabled &&
+			    (progs->skb_verdict || progs->skb_verdict_raw))
+				verdict_stop = true;
 			list_del(&link->list);
 			sk_psock_free_link(link);
 		}
 	}
 	spin_unlock_bh(&psock->link_lock);
-	if (strp_stop) {
+	if (strp_stop || verdict_stop) {
 		write_lock_bh(&sk->sk_callback_lock);
-		sk_psock_stop_strp(sk, psock);
+		if (strp_stop)
+			sk_psock_stop_strp(sk, psock);
+		if (verdict_stop)
+			sk_psock_stop_verdict(sk, psock);
 		write_unlock_bh(&sk->sk_callback_lock);
 	}
 }
@@ -225,21 +233,37 @@ static int sock_map_link(struct bpf_map *map, struct sk_psock_progs *progs,
 			 struct sock *sk)
 {
 	struct bpf_prog *msg_parser, *skb_parser, *skb_verdict;
+	struct bpf_prog *skb_verdict_raw;
 	struct sk_psock *psock;
-	bool skb_progs;
+	bool skb_progs, raw_active, stream_active;
 	int ret;
 
 	skb_verdict = READ_ONCE(progs->skb_verdict);
+	stream_active = !!skb_verdict;
 	skb_parser = READ_ONCE(progs->skb_parser);
+	skb_verdict_raw = READ_ONCE(progs->skb_verdict_raw);
+	if (skb_verdict && skb_verdict_raw)
+		return -EBUSY;
+	raw_active = !!skb_verdict_raw;
+	if (skb_verdict_raw) {
+		skb_verdict_raw = bpf_prog_inc_not_zero(skb_verdict_raw);
+		if (IS_ERR(skb_verdict_raw))
+			return PTR_ERR(skb_verdict_raw);
+	}
 	skb_progs = skb_parser && skb_verdict;
-	if (skb_progs) {
+	if (skb_verdict) {
 		skb_verdict = bpf_prog_inc_not_zero(skb_verdict);
-		if (IS_ERR(skb_verdict))
-			return PTR_ERR(skb_verdict);
+		if (IS_ERR(skb_verdict)) {
+			ret = PTR_ERR(skb_verdict);
+			goto out_raw;
+		}
+	}
+	if (skb_progs) {
 		skb_parser = bpf_prog_inc_not_zero(skb_parser);
 		if (IS_ERR(skb_parser)) {
-			bpf_prog_put(skb_verdict);
-			return PTR_ERR(skb_parser);
+			ret = PTR_ERR(skb_parser);
+			skb_parser = NULL;
+			goto out;
 		}
 	}
 
@@ -253,13 +277,24 @@ static int sock_map_link(struct bpf_map *map, struct sk_psock_progs *progs,
 	}
 
 	psock = sock_map_psock_get_checked(sk);
+	if (IS_ERR(psock)) {
+		ret = PTR_ERR(psock);
+		goto out_progs;
+	}
 	if (psock) {
 		if (!sk_has_psock(sk)) {
+			sk_psock_put(sk, psock);
 			ret = -EBUSY;
 			goto out_progs;
 		}
 		if ((msg_parser && READ_ONCE(psock->progs.msg_parser)) ||
-		    (skb_progs  && READ_ONCE(psock->progs.skb_parser))) {
+		    (skb_progs && READ_ONCE(psock->progs.skb_parser)) ||
+		    (skb_verdict &&
+		     (READ_ONCE(psock->progs.skb_verdict) ||
+		      READ_ONCE(psock->progs.skb_verdict_raw))) ||
+		    (skb_verdict_raw &&
+		     (READ_ONCE(psock->progs.skb_verdict_raw) ||
+		      READ_ONCE(psock->progs.skb_verdict)))) {
 			sk_psock_put(sk, psock);
 			ret = -EBUSY;
 			goto out_progs;
@@ -272,12 +307,17 @@ static int sock_map_link(struct bpf_map *map, struct sk_psock_progs *progs,
 		}
 	}
 
-	if (msg_parser)
+	if (msg_parser) {
 		psock_set_prog(&psock->progs.msg_parser, msg_parser);
-
+		msg_parser = NULL;
+	}
 	ret = sock_map_init_proto(sk);
 	if (ret < 0)
 		goto out_drop;
+	if (skb_verdict_raw) {
+		psock_set_prog(&psock->progs.skb_verdict_raw, skb_verdict_raw);
+		skb_verdict_raw = NULL;
+	}
 
 	write_lock_bh(&sk->sk_callback_lock);
 	if (skb_progs && !psock->parser.enabled) {
@@ -288,7 +328,15 @@ static int sock_map_link(struct bpf_map *map, struct sk_psock_progs *progs,
 		}
 		psock_set_prog(&psock->progs.skb_verdict, skb_verdict);
 		psock_set_prog(&psock->progs.skb_parser, skb_parser);
+		skb_verdict = NULL;
+		skb_parser = NULL;
 		sk_psock_start_strp(sk, psock);
+	} else if (stream_active && !psock->parser.verdict_enabled) {
+		psock_set_prog(&psock->progs.skb_verdict, skb_verdict);
+		skb_verdict = NULL;
+		sk_psock_start_verdict(sk, psock);
+	} else if (raw_active && !psock->parser.verdict_enabled) {
+		sk_psock_start_verdict(sk, psock);
 	}
 	write_unlock_bh(&sk->sk_callback_lock);
 	return 0;
@@ -298,10 +346,18 @@ out_progs:
 	if (msg_parser)
 		bpf_prog_put(msg_parser);
 out:
-	if (skb_progs) {
+	if (stream_active && skb_verdict) {
 		bpf_prog_put(skb_verdict);
+	}
+	if (skb_progs && skb_parser) {
 		bpf_prog_put(skb_parser);
 	}
+	if (skb_verdict_raw)
+		bpf_prog_put(skb_verdict_raw);
+	return ret;
+out_raw:
+	if (skb_verdict_raw)
+		bpf_prog_put(skb_verdict_raw);
 	return ret;
 }
 
@@ -821,7 +877,7 @@ static struct bpf_htab_elem *sock_hash_alloc_elem(struct bpf_htab *htab,
 		}
 	}
 
-	new = kmalloc_node(htab->elem_size, GFP_ATOMIC | __GFP_NOWARN,
+	new = bpf_map_kmalloc_node(&htab->map, htab->elem_size, GFP_ATOMIC | __GFP_NOWARN,
 			   htab->map.numa_node);
 	if (!new) {
 		atomic_dec(&htab->count);
@@ -962,7 +1018,7 @@ static struct bpf_map *sock_hash_alloc(union bpf_attr *attr)
 	if (attr->key_size > MAX_BPF_STACK)
 		return ERR_PTR(-E2BIG);
 
-	htab = kzalloc(sizeof(*htab), GFP_USER);
+	htab = kzalloc(sizeof(*htab), GFP_USER | __GFP_ACCOUNT);
 	if (!htab)
 		return ERR_PTR(-ENOMEM);
 
@@ -1184,7 +1240,14 @@ int sock_map_prog_update(struct bpf_map *map, struct bpf_prog *prog,
 		pprog = &progs->skb_parser;
 		break;
 	case BPF_SK_SKB_STREAM_VERDICT:
+		if (progs->skb_verdict_raw)
+			return -EBUSY;
 		pprog = &progs->skb_verdict;
+		break;
+	case BPF_SK_SKB_VERDICT:
+		if (progs->skb_verdict)
+			return -EBUSY;
+		pprog = &progs->skb_verdict_raw;
 		break;
 	default:
 		return -EOPNOTSUPP;

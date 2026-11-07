@@ -156,6 +156,20 @@ endif
 
 $(modules): %.ko: %$(modpost-ext).o %.mod.o FORCE
 	+$(call if_changed,ld_ko_o)
+ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+	$(Q)if [ -f $(objtree)/vmlinux ]; then \
+		pahole_opts=""; \
+		for opt in --skip_encoding_btf_enum64 \
+			   --skip_encoding_btf_decl_tag \
+			   --skip_encoding_btf_type_tag; do \
+			if $(PAHOLE) --help | grep -q -- "$$opt"; then \
+				pahole_opts="$$pahole_opts $$opt"; \
+			fi; \
+		done; \
+		LLVM_OBJCOPY="$(OBJCOPY)" $(PAHOLE) $$pahole_opts -J \
+			--btf_base $(objtree)/vmlinux $@; \
+	fi
+endif
 
 targets += $(modules)
 

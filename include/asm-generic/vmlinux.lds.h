@@ -115,6 +115,7 @@
 #define MCOUNT_REC()	. = ALIGN(8);				\
 			__start_mcount_loc = .;			\
 			KEEP(*(__mcount_loc))			\
+			KEEP(*(__patchable_function_entries)) \
 			__stop_mcount_loc = .;
 #else
 #define MCOUNT_REC()

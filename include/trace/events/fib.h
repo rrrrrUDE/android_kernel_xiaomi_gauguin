@@ -69,7 +69,8 @@ TRACE_EVENT(fib_table_lookup,
 			*p32 = nh->nh_saddr;
 
 			p32 = (__be32 *) __entry->gw;
-			*p32 = nh->fib_nh_gw4;
+			*p32 = nh->fib_nh_gw_family == AF_INET ?
+			nh->fib_nh_gw4 : 0;
 
 			dev = nh->fib_nh_dev;
 			__assign_str(name, dev ? dev->name : "-");

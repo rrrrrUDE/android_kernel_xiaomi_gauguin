@@ -5,6 +5,7 @@
  * License as published by the Free Software Foundation.
  */
 #include <linux/bpf.h>
+#include <linux/btf_ids.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/etherdevice.h>
@@ -221,6 +222,34 @@ __diag_pop();
 
 ALLOW_ERROR_INJECTION(bpf_modify_return_test, ERRNO);
 
+/* Exercise scalar and BTF pointer arguments and return values. */
+u64 noinline __used bpf_kfunc_call_test1(struct sock *sk, u32 a, u64 b,
+					 u32 c, u64 d)
+{
+	return a + b + c + d;
+}
+
+int noinline __used bpf_kfunc_call_test2(struct sock *sk, u32 a, u32 b)
+{
+	return a + b;
+}
+
+struct sock *noinline __used bpf_kfunc_call_test3(struct sock *sk)
+{
+	return sk;
+}
+
+BTF_SET_START(test_kfunc_ids)
+BTF_ID(func, bpf_kfunc_call_test1)
+BTF_ID(func, bpf_kfunc_call_test2)
+BTF_ID(func, bpf_kfunc_call_test3)
+BTF_SET_END(test_kfunc_ids)
+
+bool bpf_prog_test_check_kfunc_call(u32 kfunc_id)
+{
+	return btf_id_set_contains(&test_kfunc_ids, kfunc_id);
+}
+
 static void *bpf_test_init(const union bpf_attr *kattr, u32 size,
 			   u32 headroom, u32 tailroom)
 {
@@ -386,7 +415,8 @@ static void *bpf_ctx_init(const union bpf_attr *kattr, u32 max_size)
 		return ERR_PTR(-ENOMEM);
 
 	if (data_in) {
-		err = bpf_check_uarg_tail_zero(data_in, max_size, size);
+		err = bpf_check_uarg_tail_zero(USER_BPFPTR(data_in), max_size,
+					   size);
 		if (err) {
 			kfree(data);
 			return ERR_PTR(err);
@@ -840,7 +870,7 @@ int bpf_prog_test_run_sk_lookup(struct bpf_prog *prog, const union bpf_attr *kat
 	if (!range_is_zero(user_ctx, offsetofend(typeof(*user_ctx), local_port), sizeof(*user_ctx)))
 		goto out;
 
-	if (user_ctx->local_port > U16_MAX || user_ctx->remote_port > U16_MAX) {
+	if (user_ctx->local_port > U16_MAX) {
 		ret = -ERANGE;
 		goto out;
 	}
@@ -848,7 +878,7 @@ int bpf_prog_test_run_sk_lookup(struct bpf_prog *prog, const union bpf_attr *kat
 	ctx.family = (u16)user_ctx->family;
 	ctx.protocol = (u16)user_ctx->protocol;
 	ctx.dport = (u16)user_ctx->local_port;
-	ctx.sport = (__force __be16)user_ctx->remote_port;
+	ctx.sport = user_ctx->remote_port;
 
 	switch (ctx.family) {
 	case AF_INET:

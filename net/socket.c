@@ -1837,6 +1837,70 @@ out:
 	return err;
 }
 
+struct file *do_accept(struct file *file, unsigned int file_flags,
+		       struct sockaddr __user *upeer_sockaddr,
+		       int __user *upeer_addrlen, int flags)
+{
+	struct socket *sock, *newsock;
+	struct file *newfile;
+	struct sockaddr_storage address;
+	int err, len;
+
+	sock = sock_from_file(file, &err);
+	if (!sock)
+		return ERR_PTR(err);
+	newsock = sock_alloc();
+	if (!newsock)
+		return ERR_PTR(-ENFILE);
+	newsock->type = sock->type;
+	newsock->ops = sock->ops;
+	__module_get(newsock->ops->owner);
+	newfile = sock_alloc_file(newsock, flags,
+				  sock->sk->sk_prot_creator->name);
+	if (IS_ERR(newfile))
+		return newfile;
+	err = security_socket_accept(sock, newsock);
+	if (err)
+		goto out;
+	err = sock->ops->accept(sock, newsock,
+			       sock->file->f_flags | file_flags, false);
+	if (err < 0)
+		goto out;
+	if (upeer_sockaddr) {
+		len = newsock->ops->getname(newsock,
+					   (struct sockaddr *)&address, 2);
+		if (len < 0) {
+			err = -ECONNABORTED;
+			goto out;
+		}
+		err = move_addr_to_user(&address, len, upeer_sockaddr,
+					upeer_addrlen);
+		if (err < 0)
+			goto out;
+	}
+	return newfile;
+out:
+	fput(newfile);
+	return ERR_PTR(err);
+}
+
+int __sys_connect_file(struct file *file, struct sockaddr_storage *address,
+		       int addrlen, int file_flags)
+{
+	struct socket *sock;
+	int err;
+
+	sock = sock_from_file(file, &err);
+	if (!sock)
+		return err;
+	err = security_socket_connect(sock, (struct sockaddr *)address,
+				      addrlen);
+	if (!err)
+		err = sock->ops->connect(sock, (struct sockaddr *)address,
+					addrlen, sock->file->f_flags | file_flags);
+	return err;
+}
+
 SYSCALL_DEFINE3(connect, int, fd, struct sockaddr __user *, uservaddr,
 		int, addrlen)
 {
@@ -2152,6 +2216,16 @@ SYSCALL_DEFINE5(getsockopt, int, fd, int, level, int, optname,
  *	Shutdown a socket.
  */
 
+int __sys_shutdown_sock(struct socket *sock, int how)
+{
+	int err;
+
+	err = security_socket_shutdown(sock, how);
+	if (!err)
+		err = sock->ops->shutdown(sock, how);
+	return err;
+}
+
 int __sys_shutdown(int fd, int how)
 {
 	int err, fput_needed;
@@ -2160,9 +2234,7 @@ int __sys_shutdown(int fd, int how)
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (sock != NULL) {
 		sockev_notify(SOCKEV_SHUTDOWN, sock);
-		err = security_socket_shutdown(sock, how);
-		if (!err)
-			err = sock->ops->shutdown(sock, how);
+		err = __sys_shutdown_sock(sock, how);
 		fput_light(sock->file, fput_needed);
 	}
 	return err;
@@ -2331,6 +2403,147 @@ out_freeiov:
 	kfree(iov);
 	return err;
 }
+
+int sendmsg_copy_msghdr(struct msghdr *msg,
+			struct user_msghdr __user *umsg, unsigned flags,
+			struct iovec **iov)
+{
+	if (flags & MSG_CMSG_COMPAT)
+		return get_compat_msghdr(msg,
+			(struct compat_msghdr __user *)umsg, NULL, iov);
+	return copy_msghdr_from_user(msg, umsg, NULL, iov);
+}
+EXPORT_SYMBOL(sendmsg_copy_msghdr);
+
+long __sys_sendmsg_sock(struct socket *sock, struct msghdr *msg,
+			unsigned int flags)
+{
+	unsigned char ctl[sizeof(struct cmsghdr) + 20]
+			__aligned(sizeof(__kernel_size_t));
+	unsigned char *ctl_buf = ctl;
+	int ctl_len;
+	int err = -ENOBUFS;
+
+	if (msg->msg_controllen > INT_MAX)
+		return err;
+	ctl_len = msg->msg_controllen;
+	if ((flags & MSG_CMSG_COMPAT) && ctl_len) {
+		err = cmsghdr_from_user_compat_to_kern(msg, sock->sk, ctl,
+						      sizeof(ctl));
+		if (err)
+			goto out;
+		ctl_buf = msg->msg_control;
+		ctl_len = msg->msg_controllen;
+	} else if (ctl_len) {
+		if (ctl_len > sizeof(ctl)) {
+			ctl_buf = sock_kmalloc(sock->sk, ctl_len, GFP_KERNEL);
+			if (!ctl_buf)
+				goto out;
+		}
+		err = -EFAULT;
+		if (copy_from_user(ctl_buf,
+				   (void __user __force *)msg->msg_control,
+				   ctl_len))
+			goto out_free;
+		msg->msg_control = ctl_buf;
+	}
+	msg->msg_flags = flags;
+	if (sock->file->f_flags & O_NONBLOCK)
+		msg->msg_flags |= MSG_DONTWAIT;
+	err = __sock_sendmsg(sock, msg);
+out_free:
+	if (ctl_buf != ctl)
+		sock_kfree_s(sock->sk, ctl_buf, ctl_len);
+out:
+	return err;
+}
+EXPORT_SYMBOL(__sys_sendmsg_sock);
+
+int __copy_msghdr_from_user(struct msghdr *kmsg,
+			    struct user_msghdr __user *umsg,
+			    struct sockaddr __user **save_addr,
+			    struct iovec __user **uiov, size_t *nsegs)
+{
+	struct user_msghdr msg;
+	int err;
+
+	if (copy_from_user(&msg, umsg, sizeof(msg)))
+		return -EFAULT;
+	kmsg->msg_control = msg.msg_control;
+	kmsg->msg_controllen = msg.msg_controllen;
+	kmsg->msg_flags = msg.msg_flags;
+	kmsg->msg_namelen = msg.msg_name ? msg.msg_namelen : 0;
+	if (kmsg->msg_namelen < 0)
+		return -EINVAL;
+	if (kmsg->msg_namelen > sizeof(struct sockaddr_storage))
+		kmsg->msg_namelen = sizeof(struct sockaddr_storage);
+	if (save_addr)
+		*save_addr = msg.msg_name;
+	if (msg.msg_name && kmsg->msg_namelen) {
+		if (!save_addr) {
+			err = move_addr_to_kernel(msg.msg_name, kmsg->msg_namelen,
+						  kmsg->msg_name);
+			if (err < 0)
+				return err;
+		}
+	} else {
+		kmsg->msg_name = NULL;
+		kmsg->msg_namelen = 0;
+	}
+	if (msg.msg_iovlen > UIO_MAXIOV)
+		return -EMSGSIZE;
+	kmsg->msg_iocb = NULL;
+	*uiov = msg.msg_iov;
+	*nsegs = msg.msg_iovlen;
+	return 0;
+}
+EXPORT_SYMBOL(__copy_msghdr_from_user);
+
+long __sys_recvmsg_sock(struct socket *sock, struct msghdr *msg,
+			struct user_msghdr __user *umsg,
+			struct sockaddr __user *uaddr, unsigned int flags)
+{
+	struct sockaddr_storage addr;
+	unsigned long cmsg_ptr = (unsigned long)msg->msg_control;
+	int err, len;
+	int __user *uaddr_len;
+	struct compat_msghdr __user *compat_msg =
+		(struct compat_msghdr __user *)umsg;
+
+	msg->msg_name = &addr;
+	msg->msg_flags = flags & (MSG_CMSG_CLOEXEC | MSG_CMSG_COMPAT);
+	msg->msg_namelen = 0;
+	if (sock->file->f_flags & O_NONBLOCK)
+		flags |= MSG_DONTWAIT;
+	err = sock_recvmsg(sock, msg, flags);
+	if (err < 0)
+		return err;
+	len = err;
+	if (uaddr) {
+		uaddr_len = (flags & MSG_CMSG_COMPAT) ?
+			(int __user *)&compat_msg->msg_namelen :
+			&umsg->msg_namelen;
+		err = move_addr_to_user(&addr, msg->msg_namelen, uaddr,
+					uaddr_len);
+		if (err < 0)
+			return err;
+	}
+	err = (flags & MSG_CMSG_COMPAT) ?
+		__put_user((msg->msg_flags & ~MSG_CMSG_COMPAT),
+			   &compat_msg->msg_flags) :
+		__put_user((msg->msg_flags & ~MSG_CMSG_COMPAT),
+			   &umsg->msg_flags);
+	if (err)
+		return err;
+	if (flags & MSG_CMSG_COMPAT)
+		err = __put_user((unsigned long)msg->msg_control - cmsg_ptr,
+				 &compat_msg->msg_controllen);
+	else
+		err = __put_user((unsigned long)msg->msg_control - cmsg_ptr,
+				 &umsg->msg_controllen);
+	return err ? err : len;
+}
+EXPORT_SYMBOL(__sys_recvmsg_sock);
 
 /*
  *	BSD sendmsg interface

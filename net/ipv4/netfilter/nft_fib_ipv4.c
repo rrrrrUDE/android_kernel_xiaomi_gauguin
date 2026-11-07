@@ -4,6 +4,7 @@
  * published by the Free Software Foundation.
  */
 
+#include <net/nexthop_objects.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
@@ -153,11 +154,11 @@ void nft_fib4_eval(const struct nft_expr *expr, struct nft_regs *regs,
        }
 
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
-	for (i = 0; i < res.fi->fib_nhs; i++) {
-		struct fib_nh *nh = &res.fi->fib_nh[i];
+	for (i = 0; i < fib_info_num_path(res.fi); i++) {
+		struct fib_nh_common *nh = fib_info_nhc(res.fi, i);
 
-		if (nh->nh_dev == oif) {
-			found = nh->nh_dev;
+		if (nh->nhc_dev == oif) {
+			found = nh->nhc_dev;
 			goto ok;
 		}
 	}

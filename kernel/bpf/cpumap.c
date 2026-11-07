@@ -17,6 +17,7 @@
  * basically allows for 10G wirespeed pre-filtering via bpf.
  */
 #include <linux/bpf.h>
+#include <linux/sched/mm.h>
 #include <linux/filter.h>
 #include <linux/ptr_ring.h>
 #include <net/xdp.h>
@@ -97,7 +98,7 @@ static struct bpf_map *cpu_map_alloc(union bpf_attr *attr)
 	    attr->map_flags & ~BPF_F_NUMA_NODE)
 		return ERR_PTR(-EINVAL);
 
-	cmap = kzalloc(sizeof(*cmap), GFP_USER);
+	cmap = kzalloc(sizeof(*cmap), GFP_USER | __GFP_ACCOUNT);
 	if (!cmap)
 		return ERR_PTR(-ENOMEM);
 
@@ -112,7 +113,7 @@ static struct bpf_map *cpu_map_alloc(union bpf_attr *attr)
 	/* make sure page count doesn't overflow */
 	cost = (u64) cmap->map.max_entries * sizeof(struct bpf_cpu_map_entry *);
 
-	/* Notice returns -EPERM on if map size is larger than memlock limit */
+	/* Keep an allocation-size estimate for fdinfo. */
 	ret = bpf_map_charge_init(&cmap->map.memory, cost);
 	if (ret) {
 		err = ret;
@@ -198,6 +199,19 @@ static struct sk_buff *cpu_map_build_skb(struct xdp_frame *xdpf,
 	return skb;
 }
 
+/* Queue entries are aligned pointers; bit zero distinguishes generic SKBs
+ * from native XDP frames, as in the 5.15 cpumap queue protocol.
+ */
+static bool cpu_map_is_skb(const void *ptr)
+{
+	return (unsigned long)ptr & 1;
+}
+
+static struct sk_buff *cpu_map_skb(void *ptr)
+{
+	return (void *)((unsigned long)ptr & ~1UL);
+}
+
 static void __cpu_map_ring_cleanup(struct ptr_ring *ring)
 {
 	/* The tear-down procedure should have made sure that queue is
@@ -205,11 +219,15 @@ static void __cpu_map_ring_cleanup(struct ptr_ring *ring)
 	 * invoked cpu_map_kthread_stop(). Catch any broken behaviour
 	 * gracefully and warn once.
 	 */
-	struct xdp_frame *xdpf;
+	void *ptr;
 
-	while ((xdpf = ptr_ring_consume(ring)))
-		if (WARN_ON_ONCE(xdpf))
-			xdp_return_frame(xdpf);
+	while ((ptr = ptr_ring_consume(ring))) {
+		WARN_ON_ONCE(1);
+		if (cpu_map_is_skb(ptr))
+			kfree_skb(cpu_map_skb(ptr));
+		else
+			xdp_return_frame(ptr);
+	}
 }
 
 static void put_cpu_map_entry(struct bpf_cpu_map_entry *rcpu)
@@ -294,6 +312,46 @@ static int cpu_map_bpf_prog_run_xdp(struct bpf_cpu_map_entry *rcpu,
 	return nframes;
 }
 
+/* The receiving thread is pinned to the destination CPU.  Process SKBs
+ * with BH disabled so generic XDP redirect helpers can use per-CPU state.
+ */
+static void cpu_map_run_skb(struct bpf_cpu_map_entry *rcpu,
+			    struct sk_buff *skb,
+			    struct xdp_cpumap_stats *stats)
+{
+	struct xdp_buff xdp;
+	u32 act = XDP_PASS;
+
+	local_bh_disable();
+	if (rcpu->prog)
+		act = bpf_prog_run_generic_xdp(skb, &xdp, rcpu->prog);
+	switch (act) {
+	case XDP_PASS:
+		stats->pass++;
+		netif_receive_skb_core(skb);
+		break;
+	case XDP_REDIRECT:
+		if (xdp_do_generic_redirect(skb->dev, skb, &xdp, rcpu->prog)) {
+			kfree_skb(skb);
+			stats->drop++;
+		} else {
+			stats->redirect++;
+		}
+		break;
+	default:
+		bpf_warn_invalid_xdp_action(act);
+		fallthrough;
+	case XDP_ABORTED:
+		trace_xdp_exception(skb->dev, rcpu->prog, act);
+		fallthrough;
+	case XDP_DROP:
+		kfree_skb(skb);
+		stats->drop++;
+		break;
+	}
+	local_bh_enable();
+}
+
 #define CPUMAP_BATCH 8
 
 static int cpu_map_kthread_run(void *data)
@@ -314,7 +372,7 @@ static int cpu_map_kthread_run(void *data)
 		unsigned int drops = 0, sched = 0;
 		void *frames[CPUMAP_BATCH];
 		void *skbs[CPUMAP_BATCH];
-		int i, n, m, nframes;
+		int i, n, m, nframes, xdp_n;
 
 		/* Release CPU reschedule checks */
 		if (__ptr_ring_empty(rcpu->queue)) {
@@ -339,9 +397,16 @@ static int cpu_map_kthread_run(void *data)
 		 */
 		n = __ptr_ring_consume_batched(rcpu->queue, frames,
 					       CPUMAP_BATCH);
-		for (i = 0; i < n; i++) {
+		for (i = 0, xdp_n = 0; i < n; i++) {
 			void *f = frames[i];
-			struct page *page = virt_to_page(f);
+			struct page *page;
+
+			if (cpu_map_is_skb(f)) {
+				cpu_map_run_skb(rcpu, cpu_map_skb(f), &stats);
+				continue;
+			}
+			frames[xdp_n++] = f;
+			page = virt_to_page(f);
 
 			/* Bring struct page memory area to curr CPU. Read by
 			 * build_skb_around via page_is_pfmemalloc(), and when
@@ -351,7 +416,7 @@ static int cpu_map_kthread_run(void *data)
 		}
 
 		/* Support running another XDP prog on this CPU */
-		nframes = cpu_map_bpf_prog_run_xdp(rcpu, frames, n, &stats);
+		nframes = cpu_map_bpf_prog_run_xdp(rcpu, frames, xdp_n, &stats);
 		if (nframes) {
 			m = kmem_cache_alloc_bulk(skbuff_head_cache, gfp, nframes, skbs);
 			if (unlikely(m == 0)) {
@@ -415,7 +480,8 @@ static int __cpu_map_load_bpf_program(struct bpf_cpu_map_entry *rcpu, int fd)
 }
 
 static struct bpf_cpu_map_entry *
-__cpu_map_entry_alloc(struct bpf_cpumap_val *value, u32 cpu, int map_id)
+__cpu_map_entry_alloc(struct bpf_map *map, struct bpf_cpumap_val *value,
+		      u32 cpu, int map_id)
 {
 	int numa, err, i, fd = value->bpf_prog.fd;
 	gfp_t gfp = GFP_KERNEL | __GFP_NOWARN;
@@ -425,12 +491,12 @@ __cpu_map_entry_alloc(struct bpf_cpumap_val *value, u32 cpu, int map_id)
 	/* Have map->numa_node, but choose node of redirect target CPU */
 	numa = cpu_to_node(cpu);
 
-	rcpu = kzalloc_node(sizeof(*rcpu), gfp, numa);
+	rcpu = bpf_map_kmalloc_node(map, sizeof(*rcpu), gfp | __GFP_ZERO, numa);
 	if (!rcpu)
 		return NULL;
 
 	/* Alloc percpu bulkq */
-	rcpu->bulkq = __alloc_percpu_gfp(sizeof(*rcpu->bulkq),
+	rcpu->bulkq = bpf_map_alloc_percpu(map, sizeof(*rcpu->bulkq),
 					 sizeof(void *), gfp);
 	if (!rcpu->bulkq)
 		goto free_rcu;
@@ -441,11 +507,22 @@ __cpu_map_entry_alloc(struct bpf_cpumap_val *value, u32 cpu, int map_id)
 	}
 
 	/* Alloc queue */
-	rcpu->queue = kzalloc_node(sizeof(*rcpu->queue), gfp, numa);
+	rcpu->queue = bpf_map_kmalloc_node(map, sizeof(*rcpu->queue),
+					 gfp | __GFP_ZERO, numa);
 	if (!rcpu->queue)
 		goto free_bulkq;
 
-	err = ptr_ring_init(rcpu->queue, value->qsize, gfp);
+	{
+		struct mem_cgroup *old = set_active_memcg(
+#ifdef CONFIG_MEMCG_KMEM
+			map->memcg
+#else
+			NULL
+#endif
+		);
+		err = ptr_ring_init(rcpu->queue, value->qsize, gfp | __GFP_ACCOUNT);
+		set_active_memcg(old);
+	}
 	if (err)
 		goto free_queue;
 
@@ -574,7 +651,7 @@ static int cpu_map_update_elem(struct bpf_map *map, void *key, void *value,
 		rcpu = NULL; /* Same as deleting */
 	} else {
 		/* Updating qsize cause re-allocation of bpf_cpu_map_entry */
-		rcpu = __cpu_map_entry_alloc(&cpumap_value, key_cpu, map->id);
+		rcpu = __cpu_map_entry_alloc(map, &cpumap_value, key_cpu, map->id);
 		if (!rcpu)
 			return -ENOMEM;
 		rcpu->cmap = cmap;
@@ -744,6 +821,22 @@ int cpu_map_enqueue(struct bpf_cpu_map_entry *rcpu, struct xdp_buff *xdp,
 
 	bq_enqueue(rcpu, xdpf);
 	return 0;
+}
+
+int cpu_map_generic_redirect(struct bpf_cpu_map_entry *rcpu,
+			     struct sk_buff *skb)
+{
+	int ret;
+
+	/* Generic XDP leaves data at the MAC header for redirect. */
+	__skb_pull(skb, skb->mac_len);
+	skb->xdp_redirected = 1;
+	ret = ptr_ring_produce(rcpu->queue,
+			       (void *)((unsigned long)skb | 1UL));
+	if (!ret)
+		wake_up_process(rcpu->kthread);
+	trace_xdp_cpumap_enqueue(rcpu->map_id, !ret, !!ret, rcpu->cpu);
+	return ret;
 }
 
 void __cpu_map_flush(void)

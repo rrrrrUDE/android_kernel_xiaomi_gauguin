@@ -939,6 +939,7 @@ DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
  * acquire operations must be ordered by ascending &runqueue.
  */
 struct rq {
+	unsigned int nr_pinned;
 	/* runqueue lock: */
 	raw_spinlock_t		lock;
 
@@ -1866,7 +1867,7 @@ struct sched_class {
 	void (*task_woken)(struct rq *this_rq, struct task_struct *task);
 
 	void (*set_cpus_allowed)(struct task_struct *p,
-				 const struct cpumask *newmask);
+				 const struct cpumask *newmask, u32 flags);
 
 	void (*rq_online)(struct rq *rq);
 	void (*rq_offline)(struct rq *rq);
@@ -1932,13 +1933,21 @@ extern const struct sched_class fair_sched_class;
 extern const struct sched_class idle_sched_class;
 
 
+static inline bool is_migration_disabled(struct task_struct *p)
+{
+	return READ_ONCE(p->migration_disabled);
+}
+
 #ifdef CONFIG_SMP
 
 extern void update_group_capacity(struct sched_domain *sd, int cpu);
 
 extern void trigger_load_balance(struct rq *rq);
 
-extern void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask);
+#define SCA_CHECK 1
+#define SCA_MIGRATE_DISABLE 2
+#define SCA_MIGRATE_ENABLE 4
+extern void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
 
 bool __cpu_overutilized(int cpu, int delta);
 bool cpu_overutilized(int cpu);

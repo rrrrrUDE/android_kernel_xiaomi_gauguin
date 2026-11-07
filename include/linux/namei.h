@@ -47,6 +47,14 @@ enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT, LAST_BIND};
 #define LOOKUP_EMPTY		0x4000
 #define LOOKUP_DOWN		0x8000
 
+/* openat2 resolution flags (path-walk scoping is not yet backported). */
+#define LOOKUP_NO_SYMLINKS	0x010000
+#define LOOKUP_NO_MAGICLINKS	0x020000
+#define LOOKUP_NO_XDEV		0x040000
+#define LOOKUP_BENEATH		0x080000
+#define LOOKUP_IN_ROOT		0x100000
+#define LOOKUP_CACHED		0x200000
+
 extern int path_pts(struct path *path);
 
 extern int user_path_at_empty(int, const char __user *, unsigned, struct path *, int *empty);

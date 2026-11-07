@@ -6,10 +6,9 @@
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/bpf.h>
+#include <linux/filter.h>
 #include <linux/btf_ids.h>
 #include <linux/bpf_local_storage.h>
-#include <net/sock.h>
-#include <uapi/linux/sock_diag.h>
 #include <uapi/linux/btf.h>
 
 #define BPF_LOCAL_STORAGE_CREATE_FLAG_MASK (BPF_F_NO_PREALLOC | BPF_F_CLONE)
@@ -77,7 +76,7 @@ bpf_selem_alloc(struct bpf_local_storage_map *smap, void *owner,
 	if (charge_mem && mem_charge(smap, owner, smap->elem_size))
 		return NULL;
 
-	selem = kzalloc(smap->elem_size, GFP_ATOMIC | __GFP_NOWARN);
+	selem = bpf_map_kzalloc(&smap->map, smap->elem_size, GFP_ATOMIC | __GFP_NOWARN);
 	if (selem) {
 		if (value)
 			copy_map_value(&smap->map, SDATA(selem)->data, value);
@@ -274,7 +273,7 @@ int bpf_local_storage_alloc(void *owner,
 	if (err)
 		return err;
 
-	storage = kzalloc(sizeof(*storage), GFP_ATOMIC | __GFP_NOWARN);
+	storage = bpf_map_kzalloc(&smap->map, sizeof(*storage), GFP_ATOMIC | __GFP_NOWARN);
 	if (!storage) {
 		err = -ENOMEM;
 		goto uncharge;
@@ -556,7 +555,7 @@ struct bpf_local_storage_map *bpf_local_storage_map_alloc(union bpf_attr *attr)
 	u64 cost;
 	int ret;
 
-	smap = kzalloc(sizeof(*smap), GFP_USER | __GFP_NOWARN);
+	smap = kzalloc(sizeof(*smap), GFP_USER | __GFP_NOWARN | __GFP_ACCOUNT);
 	if (!smap)
 		return ERR_PTR(-ENOMEM);
 	bpf_map_init_from_attr(&smap->map, attr);
@@ -574,7 +573,7 @@ struct bpf_local_storage_map *bpf_local_storage_map_alloc(union bpf_attr *attr)
 	}
 
 	smap->buckets = kvcalloc(sizeof(*smap->buckets), nbuckets,
-				 GFP_USER | __GFP_NOWARN);
+				 GFP_USER | __GFP_NOWARN | __GFP_ACCOUNT);
 	if (!smap->buckets) {
 		bpf_map_charge_finish(&smap->map.memory);
 		kfree(smap);

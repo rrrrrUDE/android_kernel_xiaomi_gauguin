@@ -28,6 +28,12 @@ enum iter_type {
 	ITER_PIPE = 8,
 };
 
+struct iov_iter_state {
+	size_t iov_offset;
+	size_t count;
+	unsigned long nr_segs;
+};
+
 struct iov_iter {
 	int type;
 	size_t iov_offset;
@@ -50,6 +56,14 @@ struct iov_iter {
 static inline enum iter_type iov_iter_type(const struct iov_iter *i)
 {
 	return i->type & ~(READ | WRITE);
+}
+
+static inline void iov_iter_save_state(struct iov_iter *iter,
+				       struct iov_iter_state *state)
+{
+	state->iov_offset = iter->iov_offset;
+	state->count = iter->count;
+	state->nr_segs = iter->nr_segs;
 }
 
 static inline bool iter_is_iovec(const struct iov_iter *i)
@@ -225,6 +239,7 @@ ssize_t iov_iter_get_pages(struct iov_iter *i, struct page **pages,
 ssize_t iov_iter_get_pages_alloc(struct iov_iter *i, struct page ***pages,
 			size_t maxsize, size_t *start);
 int iov_iter_npages(const struct iov_iter *i, int maxpages);
+void iov_iter_restore(struct iov_iter *i, struct iov_iter_state *state);
 
 const void *dup_iter(struct iov_iter *new, struct iov_iter *old, gfp_t flags);
 
@@ -266,6 +281,9 @@ bool csum_and_copy_from_iter_full(void *addr, size_t bytes, __wsum *csum, struct
 int import_iovec(int type, const struct iovec __user * uvector,
 		 unsigned nr_segs, unsigned fast_segs,
 		 struct iovec **iov, struct iov_iter *i);
+ssize_t __import_iovec(int type, const struct iovec __user *uvec,
+		 unsigned nr_segs, unsigned fast_segs, struct iovec **iov,
+		 struct iov_iter *i, bool compat);
 
 #ifdef CONFIG_COMPAT
 struct compat_iovec;

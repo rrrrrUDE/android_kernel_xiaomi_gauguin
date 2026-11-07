@@ -567,6 +567,11 @@ int get_unused_fd_flags(unsigned flags)
 }
 EXPORT_SYMBOL(get_unused_fd_flags);
 
+int __get_unused_fd_flags(unsigned flags, unsigned long nofile)
+{
+	return __alloc_fd(current->files, 0, nofile, flags);
+}
+
 static void __put_unused_fd(struct files_struct *files, unsigned int fd)
 {
 	struct fdtable *fdt = files_fdtable(files);
@@ -662,6 +667,23 @@ out_unlock:
 	return -EBADF;
 }
 EXPORT_SYMBOL(__close_fd); /* for ksys_close() */
+
+int __close_fd_get_file(unsigned int fd, struct file **res)
+{
+	struct files_struct *files = current->files;
+	struct fdtable *fdt = files_fdtable(files);
+	struct file *file;
+
+	if (fd >= fdt->max_fds || !(file = fdt->fd[fd])) {
+		*res = NULL;
+		return -ENOENT;
+	}
+	rcu_assign_pointer(fdt->fd[fd], NULL);
+	__put_unused_fd(files, fd);
+	get_file(file);
+	*res = file;
+	return 0;
+}
 
 void do_close_on_exec(struct files_struct *files)
 {

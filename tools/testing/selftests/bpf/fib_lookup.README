@@ -1,0 +1,55 @@
+BPF FIB lookup on 4.19
+======================
+
+Reference: local android-5.15-mainline (including its FIB helper extensions).
+
+The helper supports DIRECT, OUTPUT, SKIP_NEIGH, TBID and SRC for XDP and TC.
+The existing 64-byte UAPI layout is preserved: mtu_result aliases tot_len,
+and tbid aliases the VLAN output fields. TBID is consumed only with DIRECT,
+as in the reference tree. SKIP_NEIGH leaves smac/dmac untouched. IPv6 source
+selection uses the route preferred source or the IPv6 module stub, using the
+original destination for address selection even when a gateway is returned.
+MTU is returned on size failure and on successful lookups with an MTU check;
+TC with zero input length reports the egress device MTU after its skb check.
+Flow keys are zero initialized before policy or direct-table lookup.
+
+Routing-core boundary:
+IPv4 RTA_VIA routes with IPv6 gateways now use a family-tagged gateway in
+fib_nh. Top-level and ECMP route creation/deletion and netlink dumps preserve
+the address family; IPv6 validates gateways through a module-safe stub using
+its existing gateway rules. The IPv4 route cache and BPF helper retain the
+IPv6 gateway and resolve its IPv6 neighbour. Native 4.19 ECMP remains in use.
+
+Independent nexthop objects and nexthop groups are NOT included. The native
+routing core still lacks RTA_NH_ID bindings, RTM_*NEXTHOP object lifecycle,
+resilient groups and shared-object replacement/deletion notifications. Do not
+report this patch as complete 5.15 nexthop object/group support.
+
+Host regression:
+  python3 tools/testing/selftests/bpf/test_fib_lookup.py
+  python3 tools/testing/selftests/bpf/test_fib_via.py
+
+The test executes production helper functions with route/neighbour stubs.
+It checks both families, all 32 flag combinations, policy/direct selection,
+missing tables/neighbours, route errors, source-address failure/preference,
+MTU handling, invalid arguments and ABI size/offsets. It does not validate
+live routing, ECMP hashing, neighbour concurrency, module unload or packets.
+
+Device validation still required:
+Use XDP and TC programs in isolated network namespaces with IPv4/IPv6 veth
+routes. Check direct and policy routes, explicit tables and VRFs, missing
+neighbours with/without SKIP_NEIGH, route preferred sources and missing IPv6
+sources, reject routes, route/gateway changes, ECMP and packet-size/MTU
+boundaries (including TC GSO and zero tot_len). Inspect all output fields.
+Repeat with IPv6 built-in, modular and disabled as appropriate. No defconfig
+or boot command-line changes are included.
+
+Additional RTA_VIA device checks:
+Create IPv4 routes via IPv6 link-local and global gateways using top-level
+RTA_VIA and mixed IPv4/IPv6 ECMP members. Verify add/replace/get/dump/delete,
+reject conflicting RTA_GATEWAY/RTA_VIA and malformed lengths, reject local,
+multicast and unreachable IPv6 gateways, and check ONLINK and VRF behavior.
+Send IPv4 traffic through the IPv6 neighbour, exercise neighbour expiry,
+PMTU, route cloning, link changes and device unregister. Verify XDP and TC
+return AF_INET6 and the IPv6 gateway (including SKIP_NEIGH) while SRC still
+returns an IPv4 source address. Host stubs do not establish these results.

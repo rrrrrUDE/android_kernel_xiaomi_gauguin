@@ -32,6 +32,45 @@
 #include <linux/uaccess.h>
 #include <net/compat.h>
 
+int __get_compat_msghdr(struct msghdr *kmsg,
+			struct compat_msghdr __user *umsg,
+			struct sockaddr __user **save_addr,
+			compat_uptr_t *ptr, compat_size_t *len)
+{
+	struct compat_msghdr msg;
+	int err;
+
+	if (copy_from_user(&msg, umsg, sizeof(msg)))
+		return -EFAULT;
+	kmsg->msg_flags = msg.msg_flags;
+	kmsg->msg_namelen = msg.msg_name ? msg.msg_namelen : 0;
+	if (kmsg->msg_namelen < 0)
+		return -EINVAL;
+	if (kmsg->msg_namelen > sizeof(struct sockaddr_storage))
+		kmsg->msg_namelen = sizeof(struct sockaddr_storage);
+	kmsg->msg_control = compat_ptr(msg.msg_control);
+	kmsg->msg_controllen = msg.msg_controllen;
+	if (save_addr)
+		*save_addr = compat_ptr(msg.msg_name);
+	if (msg.msg_name && kmsg->msg_namelen) {
+		if (!save_addr) {
+			err = move_addr_to_kernel(compat_ptr(msg.msg_name),
+						  kmsg->msg_namelen, kmsg->msg_name);
+			if (err < 0)
+				return err;
+		}
+	} else {
+		kmsg->msg_name = NULL;
+		kmsg->msg_namelen = 0;
+	}
+	if (msg.msg_iovlen > UIO_MAXIOV)
+		return -EMSGSIZE;
+	kmsg->msg_iocb = NULL;
+	*ptr = msg.msg_iov;
+	*len = msg.msg_iovlen;
+	return 0;
+}
+
 int get_compat_msghdr(struct msghdr *kmsg,
 		      struct compat_msghdr __user *umsg,
 		      struct sockaddr __user **save_addr,

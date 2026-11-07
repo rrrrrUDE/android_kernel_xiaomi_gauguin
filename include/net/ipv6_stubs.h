@@ -12,11 +12,25 @@
 
 /* structs from net/ip6_fib.h */
 struct fib6_info;
+struct fib6_result;
+struct fib6_nh;
+struct fib6_config;
+struct netlink_ext_ack;
+struct nl_info;
 
 /* A stub used by vxlan module. This is ugly, ideally these
  * symbols should be built into the core kernel.
  */
 struct ipv6_stub {
+	int (*ip6_del_rt)(struct net *net, struct fib6_info *f6i);
+	void (*fib6_update_sernum)(struct net *net, struct fib6_info *f6i);
+	void (*fib6_rt_update)(struct net *net, struct fib6_info *f6i,
+			       struct nl_info *info);
+	int (*fib6_nh_init)(struct net *net, struct fib6_nh *nh,
+			    struct fib6_config *cfg, gfp_t gfp_flags,
+			    struct netlink_ext_ack *extack);
+	void (*fib6_nh_release)(struct fib6_nh *nh);
+	void (*fib6_nh_release_dsts)(struct fib6_nh *nh);
 	int (*ipv6_sock_mc_join)(struct sock *sk, int ifindex,
 				 const struct in6_addr *addr);
 	int (*ipv6_sock_mc_drop)(struct sock *sk, int ifindex,
@@ -38,7 +52,11 @@ struct ipv6_stub {
 						   struct flowi6 *fl6, int oif,
 						   const struct sk_buff *skb,
 						   int strict);
-	u32 (*ip6_mtu_from_fib6)(struct fib6_info *f6i, struct in6_addr *daddr,
+	void (*fib6_select_path)(const struct net *net, struct fib6_result *res,
+				 struct flowi6 *fl6, int oif,
+				 const struct sk_buff *skb, int strict);
+	u32 (*ip6_mtu_from_fib6)(struct fib6_info *f6i, struct fib6_nh *nh,
+				 struct in6_addr *daddr,
 				 struct in6_addr *saddr);
 
 	void (*udpv6_encap_enable)(void);
@@ -49,8 +67,15 @@ struct ipv6_stub {
 };
 extern const struct ipv6_stub *ipv6_stub __read_mostly;
 
+struct fib_nh;
+
 /* A stub used by bpf helpers. Similarly ugly as ipv6_stub */
 struct ipv6_bpf_stub {
+	int (*fib4_check_nh_v6)(struct net *net, struct fib_nh *nh, u32 table,
+				struct netlink_ext_ack *extack);
+	int (*ipv6_dev_get_saddr)(struct net *net, const struct net_device *dev,
+				  const struct in6_addr *daddr, unsigned int prefs,
+				  struct in6_addr *saddr);
 	int (*inet6_bind)(struct sock *sk, struct sockaddr *uaddr, int addr_len,
 			  u32 flags);
 	struct sock *(*udp6_lib_lookup)(struct net *net,

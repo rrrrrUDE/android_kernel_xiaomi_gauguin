@@ -990,6 +990,10 @@ set_rcvbuf:
 		}
 		break;
 
+	case SO_DETACH_REUSEPORT_BPF:
+		ret = reuseport_detach_prog(sk);
+		break;
+
 	case SO_DETACH_FILTER:
 		ret = sk_detach_filter(sk);
 		break;
@@ -1048,6 +1052,12 @@ set_rcvbuf:
 			else
 				WRITE_ONCE(sk->sk_ll_usec, val);
 		}
+		break;
+	case SO_PREFER_BUSY_POLL:
+		if (valbool && !capable(CAP_NET_ADMIN))
+			ret = -EPERM;
+		else
+			WRITE_ONCE(sk->sk_prefer_busy_poll, valbool);
 		break;
 #endif
 
@@ -1410,6 +1420,9 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	case SO_BUSY_POLL:
 		v.val = READ_ONCE(sk->sk_ll_usec);
+		break;
+	case SO_PREFER_BUSY_POLL:
+		v.val = READ_ONCE(sk->sk_prefer_busy_poll);
 		break;
 #endif
 

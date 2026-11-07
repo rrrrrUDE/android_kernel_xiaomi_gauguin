@@ -380,6 +380,24 @@ static void *section_objs(const struct load_info *info,
 	return (void *)info->sechdrs[sec].sh_addr;
 }
 
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+static void *btf_section(const struct load_info *info, unsigned int *size)
+{
+	unsigned int i;
+
+	for (i = 1; i < info->hdr->e_shnum; i++) {
+		Elf_Shdr *shdr = &info->sechdrs[i];
+
+		if (strcmp(info->secstrings + shdr->sh_name, ".BTF"))
+			continue;
+		*size = shdr->sh_size;
+		return (char *)info->hdr + shdr->sh_offset;
+	}
+	*size = 0;
+	return NULL;
+}
+#endif
+
 /* Provided by the linker */
 extern const struct kernel_symbol __start___ksymtab[];
 extern const struct kernel_symbol __stop___ksymtab[];
@@ -3188,6 +3206,9 @@ static int find_module_sections(struct module *mod, struct load_info *info)
 					   sizeof(*mod->bpf_raw_events),
 					   &mod->num_bpf_raw_events);
 #endif
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+	mod->btf_data = btf_section(info, &mod->btf_data_size);
+#endif
 #ifdef CONFIG_JUMP_LABEL
 	mod->jump_entries = section_objs(info, "__jump_table",
 					sizeof(*mod->jump_entries),
@@ -3208,7 +3229,7 @@ static int find_module_sections(struct module *mod, struct load_info *info)
 #endif
 #ifdef CONFIG_FTRACE_MCOUNT_RECORD
 	/* sechdrs[0].sh_size is always zero */
-	mod->ftrace_callsites = section_objs(info, "__mcount_loc",
+	mod->ftrace_callsites = section_objs(info, FTRACE_CALLSITE_SECTION,
 					     sizeof(*mod->ftrace_callsites),
 					     &mod->num_ftrace_callsites);
 #endif
@@ -3890,6 +3911,9 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	/* Get rid of temporary copy. */
 	free_copy(info);
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+	mod->btf_data = NULL;
+#endif
 
 	/* Done! */
 	trace_module_load(mod);

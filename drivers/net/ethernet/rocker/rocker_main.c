@@ -2202,6 +2202,19 @@ static int rocker_router_fib_event(struct notifier_block *nb,
 	if (info->family != AF_INET)
 		return NOTIFY_DONE;
 
+	/* The legacy offload implementation requires inline nexthops. */
+	if (event == FIB_EVENT_ENTRY_ADD || event == FIB_EVENT_ENTRY_DEL) {
+		struct fib_entry_notifier_info *fen = ptr;
+
+		if (fen->fi->nh) {
+			if (event == FIB_EVENT_ENTRY_DEL)
+				return NOTIFY_DONE;
+			NL_SET_ERR_MSG_MOD(info->extack,
+					   "Shared nexthop offload is not supported");
+			return notifier_from_errno(-EOPNOTSUPP);
+		}
+	}
+
 	fib_work = kzalloc(sizeof(*fib_work), GFP_ATOMIC);
 	if (WARN_ON(!fib_work))
 		return NOTIFY_BAD;

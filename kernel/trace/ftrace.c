@@ -1396,6 +1396,42 @@ ftrace_hash_rec_enable_modify(struct ftrace_ops *ops, int filter_hash);
 static int ftrace_hash_ipmodify_update(struct ftrace_ops *ops,
 				       struct ftrace_hash *new_hash);
 
+static struct ftrace_hash *dup_hash(struct ftrace_hash *src, int size)
+{
+	struct ftrace_func_entry *entry;
+	struct ftrace_hash *new_hash;
+	struct hlist_head *hhd;
+	struct hlist_node *tn;
+	int bits = 0;
+	int i;
+
+	/*
+	 * Use around half the size (max bit of it), but
+	 * a minimum of 2 is fine (as size of 0 or 1 both give 1 for bits).
+	 */
+	bits = fls(size / 2);
+
+	/* Don't allocate too much */
+	if (bits > FTRACE_HASH_MAX_BITS)
+		bits = FTRACE_HASH_MAX_BITS;
+
+	new_hash = alloc_ftrace_hash(bits);
+	if (!new_hash)
+		return NULL;
+
+	new_hash->flags = src->flags;
+
+	size = 1 << src->size_bits;
+	for (i = 0; i < size; i++) {
+		hhd = &src->buckets[i];
+		hlist_for_each_entry_safe(entry, tn, hhd, hlist) {
+			remove_hash_entry(src, entry);
+			__add_hash_entry(new_hash, entry);
+		}
+	}
+	return new_hash;
+}
+
 static struct ftrace_hash *
 __ftrace_hash_move(struct ftrace_hash *src)
 {
@@ -2689,7 +2725,7 @@ ftrace_code_disable(struct module *mod, struct dyn_ftrace *rec)
 	if (unlikely(ftrace_disabled))
 		return 0;
 
-	ret = ftrace_make_nop(mod, rec, MCOUNT_ADDR);
+	ret = ftrace_init_nop(mod, rec);
 	if (ret) {
 		ftrace_bug_type = FTRACE_BUG_INIT;
 		ftrace_bug(ret, rec);
@@ -5111,8 +5147,6 @@ int register_ftrace_direct(unsigned long ip, unsigned long addr)
 	__add_hash_entry(direct_functions, entry);
 
 	ret = ftrace_set_filter_ip(&direct_ops, ip, 0, 0);
-	if (ret)
-		remove_hash_entry(direct_functions, entry);
 
 	if (!ret && !(direct_ops.flags & FTRACE_OPS_FL_ENABLED)) {
 		ret = register_ftrace_function(&direct_ops);
@@ -5121,6 +5155,7 @@ int register_ftrace_direct(unsigned long ip, unsigned long addr)
 	}
 
 	if (ret) {
+		remove_hash_entry(direct_functions, entry);
 		kfree(entry);
 		if (!direct->count) {
 			list_del_rcu(&direct->next);
@@ -5131,8 +5166,7 @@ int register_ftrace_direct(unsigned long ip, unsigned long addr)
 			free_hash = NULL;
 		}
 	} else {
-		if (!direct->count)
-			direct->count++;
+		direct->count++;
 	}
  out_unlock:
 	mutex_unlock(&direct_mutex);
@@ -5190,12 +5224,17 @@ int unregister_ftrace_direct(unsigned long ip, unsigned long addr)
 	if (!entry)
 		goto out_unlock;
 
+	ret = -EINVAL;
+	if (entry->direct != addr)
+		goto out_unlock;
+
 	if (direct_functions->count == 1)
 		unregister_ftrace_function(&direct_ops);
 
 	ret = ftrace_set_filter_ip(&direct_ops, ip, 1, 0);
 
-	WARN_ON(ret);
+	if (WARN_ON(ret))
+		goto out_unlock;
 
 	remove_hash_entry(direct_functions, entry);
 
@@ -5210,6 +5249,8 @@ int unregister_ftrace_direct(unsigned long ip, unsigned long addr)
 			kfree(direct);
 		}
 	}
+	synchronize_rcu_tasks();
+	kfree(entry);
  out_unlock:
 	mutex_unlock(&direct_mutex);
 
@@ -5307,6 +5348,8 @@ int __weak ftrace_modify_direct_caller(struct ftrace_func_entry *entry,
 int modify_ftrace_direct(unsigned long ip,
 			 unsigned long old_addr, unsigned long new_addr)
 {
+	struct ftrace_direct_func *old_direct, *new_direct;
+	bool allocated = false;
 	struct ftrace_func_entry *entry;
 	struct dyn_ftrace *rec;
 	int ret = -ENODEV;
@@ -5327,6 +5370,22 @@ int modify_ftrace_direct(unsigned long ip,
 	if (entry->direct != old_addr)
 		goto out_unlock;
 
+	old_direct = ftrace_find_direct_func(old_addr);
+	if (WARN_ON(!old_direct))
+		goto out_unlock;
+	new_direct = ftrace_find_direct_func(new_addr);
+	if (!new_direct) {
+		new_direct = kmalloc(sizeof(*new_direct), GFP_KERNEL);
+		if (!new_direct) {
+			ret = -ENOMEM;
+			goto out_unlock;
+		}
+		new_direct->addr = new_addr;
+		new_direct->count = 0;
+		list_add_rcu(&new_direct->next, &ftrace_direct_funcs);
+		allocated = true;
+	}
+
 	/*
 	 * If there's no other ftrace callback on the rec->ip location,
 	 * then it can be changed directly by the architecture.
@@ -5338,6 +5397,19 @@ int modify_ftrace_direct(unsigned long ip,
 	} else {
 		entry->direct = new_addr;
 		ret = 0;
+	}
+
+	if (!ret) {
+		new_direct->count++;
+		if (!--old_direct->count) {
+			list_del_rcu(&old_direct->next);
+			synchronize_rcu_tasks();
+			kfree(old_direct);
+		}
+	} else if (allocated) {
+		list_del_rcu(&new_direct->next);
+		synchronize_rcu_tasks();
+		kfree(new_direct);
 	}
 
  out_unlock:

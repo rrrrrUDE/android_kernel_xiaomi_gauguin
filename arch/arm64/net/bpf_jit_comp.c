@@ -18,8 +18,13 @@
 
 #define pr_fmt(fmt) "bpf_jit: " fmt
 
+#include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/extable.h>
 #include <linux/filter.h>
+#include <linux/ftrace.h>
+#include <linux/cpu.h>
+#include <linux/memory.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 
@@ -70,6 +75,7 @@ struct jit_ctx {
 	int *offset;
 	__le32 *image;
 	u32 stack_size;
+	int exentry_idx;
 };
 
 static inline void emit(const u32 insn, struct jit_ctx *ctx)
@@ -134,6 +140,280 @@ static inline void emit_a64_mov_i64(const int reg, const u64 val,
 	}
 }
 
+/* Direct ftrace and the JIT patch site both pass the original LR in x9.
+ * x30 points past the patched BL. No target frame has been allocated yet.
+ */
+#define TRAMP_STACK_SIZE 224
+#define TRAMP_REGS_OFF 144
+/* Reserve outgoing stack arguments before the BPF context. */
+#define TRAMP_CTX_OFF 32
+
+static void tramp_call(struct jit_ctx *ctx, unsigned long func)
+{
+	emit_a64_mov_i64(A64_R(10), func, ctx);
+	emit(A64_BLR(A64_R(10)), ctx);
+}
+
+static void tramp_store(struct jit_ctx *ctx, int reg, unsigned int off)
+{
+	emit_a64_mov_i(1, A64_R(10), off, ctx);
+	emit(A64_STR64(reg, A64_SP, A64_R(10)), ctx);
+}
+
+static void tramp_load(struct jit_ctx *ctx, int reg, unsigned int off)
+{
+	emit_a64_mov_i(1, A64_R(10), off, ctx);
+	emit(A64_LDR64(reg, A64_SP, A64_R(10)), ctx);
+}
+
+static void tramp_invoke(struct jit_ctx *ctx, struct bpf_prog *prog,
+			 unsigned int ctx_off, unsigned int ret_off,
+			 bool save_ret)
+{
+	bool sleepable = prog->aux->sleepable;
+
+	tramp_call(ctx, sleepable ? (unsigned long)__bpf_prog_enter_sleepable :
+		   (unsigned long)__bpf_prog_enter);
+	if (!sleepable)
+		emit(A64_MOV(1, A64_R(20), A64_R(0)), ctx);
+	emit(A64_ADD_I(1, A64_R(0), A64_SP, ctx_off), ctx);
+	if (!prog->jited)
+		emit_a64_mov_i64(A64_R(1), (unsigned long)prog->insnsi, ctx);
+	tramp_call(ctx, (unsigned long)prog->bpf_func);
+	if (save_ret)
+		tramp_store(ctx, A64_R(0), ret_off);
+	if (!sleepable) {
+		emit_a64_mov_i64(A64_R(0), (unsigned long)prog, ctx);
+		emit(A64_MOV(1, A64_R(1), A64_R(20)), ctx);
+	}
+	tramp_call(ctx, sleepable ? (unsigned long)__bpf_prog_exit_sleepable :
+		   (unsigned long)__bpf_prog_exit);
+}
+
+static int build_trampoline(struct jit_ctx *ctx, struct bpf_tramp_image *im,
+			    const struct btf_func_model *m, u32 flags,
+			    struct bpf_tramp_progs *tprogs, void *orig_call,
+			    unsigned long resume)
+{
+	bool call_orig = flags & BPF_TRAMP_F_CALL_ORIG;
+	bool ip_arg = flags & BPF_TRAMP_F_IP_ARG;
+	unsigned int ctx_off = TRAMP_CTX_OFF + (ip_arg ? 8 : 0);
+	unsigned int ret_off = ctx_off + m->nr_args * 8;
+	int branches[BPF_MAX_TRAMP_PROGS], i, j, do_fexit;
+
+	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);
+	emit(A64_MOV(1, A64_FP, A64_SP), ctx);
+	emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), ctx);
+	emit(A64_PUSH(A64_R(9), A64_ZR, A64_SP), ctx);
+	emit(A64_SUB_I(1, A64_SP, A64_SP, TRAMP_STACK_SIZE), ctx);
+	/* Keep the original ABI registers separate from the BPF context. */
+	for (i = 0; i < 9; i++)
+		tramp_store(ctx, i, TRAMP_REGS_OFF + i * 8);
+	for (i = 0; i < m->nr_args; i++) {
+		int reg = i;
+
+		if (i >= 8) {
+			/* Incoming stack arguments start above the saved FP/LR. */
+			emit(A64_ADD_I(1, A64_R(11), A64_FP,
+				       16 + (i - 8) * 8), ctx);
+			emit(A64_LDR64(A64_R(11), A64_R(11), A64_ZR), ctx);
+			tramp_store(ctx, A64_R(11), (i - 8) * 8);
+			reg = A64_R(11);
+		}
+		if (m->arg_size[i] < 8) {
+			emit(A64_UBFM(1, A64_R(11), reg, 0,
+				      m->arg_size[i] * 8 - 1), ctx);
+			reg = A64_R(11);
+		}
+		tramp_store(ctx, reg, ctx_off + i * 8);
+	}
+	if (ip_arg) {
+		emit_a64_mov_i64(A64_R(11), (unsigned long)orig_call, ctx);
+		tramp_store(ctx, A64_R(11), ctx_off - 8);
+	}
+	if (call_orig) {
+		emit_a64_mov_i64(A64_R(0), (unsigned long)im, ctx);
+		tramp_call(ctx, (unsigned long)__bpf_tramp_enter);
+		tramp_store(ctx, A64_ZR, ret_off);
+	}
+	for (i = 0; i < tprogs[BPF_TRAMP_FENTRY].nr_progs; i++)
+		tramp_invoke(ctx, tprogs[BPF_TRAMP_FENTRY].progs[i],
+			     ctx_off, ret_off, false);
+	for (i = 0; i < tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs; i++) {
+		tramp_invoke(ctx, tprogs[BPF_TRAMP_MODIFY_RETURN].progs[i],
+			     ctx_off, ret_off, true);
+		tramp_load(ctx, A64_R(11), ret_off);
+		branches[i] = ctx->idx;
+		emit(A64_CBNZ(1, A64_R(11), 0), ctx);
+	}
+	if (call_orig) {
+		for (i = 0; i < 9; i++)
+			tramp_load(ctx, i, TRAMP_REGS_OFF + i * 8);
+		/* Skip the entry patch site, avoiding recursive tracing. */
+		tramp_call(ctx, resume);
+		tramp_store(ctx, A64_R(0), ret_off);
+		if (ctx->image)
+			im->ip_after_call = ctx->image + ctx->idx;
+		emit(aarch64_insn_gen_nop(), ctx);
+	}
+	do_fexit = ctx->idx;
+	if (ctx->image)
+		for (i = 0; i < tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs; i++) {
+			j = branches[i];
+			ctx->image[j] = cpu_to_le32(A64_CBNZ(1, A64_R(11), do_fexit - j));
+		}
+	for (i = 0; i < tprogs[BPF_TRAMP_FEXIT].nr_progs; i++)
+		tramp_invoke(ctx, tprogs[BPF_TRAMP_FEXIT].progs[i],
+			     ctx_off, ret_off, false);
+	if (call_orig) {
+		if (ctx->image)
+			im->ip_epilogue = ctx->image + ctx->idx;
+		emit_a64_mov_i64(A64_R(0), (unsigned long)im, ctx);
+		tramp_call(ctx, (unsigned long)__bpf_tramp_exit);
+		tramp_load(ctx, A64_R(0), ret_off);
+	} else {
+		for (i = 0; i < 9; i++)
+			tramp_load(ctx, i, TRAMP_REGS_OFF + i * 8);
+	}
+	emit(A64_ADD_I(1, A64_SP, A64_SP, TRAMP_STACK_SIZE), ctx);
+	emit(A64_POP(A64_R(9), A64_ZR, A64_SP), ctx);
+	emit(A64_POP(A64_R(19), A64_R(20), A64_SP), ctx);
+	emit(A64_POP(A64_FP, A64_LR, A64_SP), ctx);
+	if (call_orig) {
+		emit(A64_MOV(1, A64_LR, A64_R(9)), ctx);
+		emit(A64_RET(A64_LR), ctx);
+	} else {
+		emit(A64_MOV(1, A64_R(10), A64_LR), ctx);
+		emit(A64_MOV(1, A64_LR, A64_R(9)), ctx);
+		emit(A64_RET(A64_R(10)), ctx);
+	}
+	return ctx->idx * sizeof(u32);
+}
+
+static int prepare_trampoline(struct bpf_tramp_image *im, void *image,
+			      void *image_end, const struct btf_func_model *m,
+			      u32 flags, struct bpf_tramp_progs *tprogs,
+			      void *orig_call)
+{
+	struct jit_ctx ctx = {};
+	unsigned long patch, resume;
+	u32 insn;
+	int i, j, size;
+	bool call_orig = flags & BPF_TRAMP_F_CALL_ORIG;
+
+	if (m->nr_args >= MAX_BPF_FUNC_ARGS || m->ret_size > 8 || !orig_call ||
+	    (flags & ~(BPF_TRAMP_F_RESTORE_REGS | BPF_TRAMP_F_CALL_ORIG |
+		       BPF_TRAMP_F_SKIP_FRAME | BPF_TRAMP_F_IP_ARG)) ||
+	    (call_orig ? !(flags & BPF_TRAMP_F_SKIP_FRAME) ||
+			 (flags & BPF_TRAMP_F_RESTORE_REGS) :
+			 !(flags & BPF_TRAMP_F_RESTORE_REGS) ||
+			 (flags & BPF_TRAMP_F_SKIP_FRAME)))
+		return -ENOTSUPP;
+	for (i = 0; i < m->nr_args; i++)
+		if (m->arg_size[i] != 1 && m->arg_size[i] != 2 &&
+		    m->arg_size[i] != 4 && m->arg_size[i] != 8)
+			return -ENOTSUPP;
+	for (i = 0; i < BPF_TRAMP_MAX; i++) {
+		if (tprogs[i].nr_progs < 0 ||
+		    tprogs[i].nr_progs > BPF_MAX_TRAMP_PROGS)
+			return -E2BIG;
+		for (j = 0; j < tprogs[i].nr_progs; j++)
+			if (!tprogs[i].progs[j] || !tprogs[i].progs[j]->bpf_func)
+				return -EINVAL;
+	}
+	if (!call_orig && (tprogs[BPF_TRAMP_FEXIT].nr_progs ||
+			   tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs))
+		return -EINVAL;
+	patch = ftrace_location((unsigned long)orig_call);
+	if (patch && !IS_ENABLED(CONFIG_DYNAMIC_FTRACE_WITH_REGS))
+		return -ENOTSUPP;
+	if (!patch) {
+		/* Only JIT functions carrying our explicit entry ABI qualify. */
+		if (!is_bpf_text_address((unsigned long)orig_call) ||
+		    aarch64_insn_read(orig_call, &insn) ||
+		    insn != A64_MOV(1, A64_R(9), A64_LR))
+			return -ENOTSUPP;
+		patch = (unsigned long)orig_call + AARCH64_INSN_SIZE;
+	}
+	resume = patch + AARCH64_INSN_SIZE;
+	size = build_trampoline(&ctx, im, m, flags, tprogs, orig_call, resume);
+	if (size > (u8 *)image_end - (u8 *)image)
+		return -E2BIG;
+	ctx.idx = 0;
+	ctx.image = image;
+	build_trampoline(&ctx, im, m, flags, tprogs, orig_call, resume);
+	flush_icache_range((unsigned long)image, (unsigned long)image + size);
+	return size;
+}
+
+/* Struct_ops callbacks use a normal AAPCS entry. */
+int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
+				void *image_end, const struct btf_func_model *m,
+				u32 flags, struct bpf_tramp_progs *tprogs,
+				void *orig_call)
+{
+	struct bpf_prog *prog;
+	struct jit_ctx ctx = { .image = image };
+	int i;
+
+	if (im && orig_call)
+		return prepare_trampoline(im, image, image_end, m, flags,
+					     tprogs, orig_call);
+
+	if (im || orig_call ||
+	    (flags != 0 && flags != BPF_TRAMP_F_RET_FENTRY_RET) ||
+	    m->nr_args > 8 || m->ret_size > sizeof(u64) ||
+	    tprogs[BPF_TRAMP_FENTRY].nr_progs != 1 ||
+	    tprogs[BPF_TRAMP_FEXIT].nr_progs ||
+	    tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs)
+		return -ENOTSUPP;
+	for (i = 0; i < m->nr_args; i++)
+		if (m->arg_size[i] != 1 && m->arg_size[i] != 2 &&
+		    m->arg_size[i] != 4 && m->arg_size[i] != 8)
+			return -ENOTSUPP;
+	prog = tprogs[BPF_TRAMP_FENTRY].progs[0];
+	if (!prog || !prog->jited ||
+	    (u8 *)image_end - (u8 *)image < 320)
+		return -ENOTSUPP;
+
+	/* Keep x19 (program), x20 (start time), and x21 (result) across calls.
+	 * Context is eight 64-bit argument slots.  ARM64 passes these in x0-x7.
+	 */
+	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), &ctx);
+	emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), &ctx);
+	emit(A64_PUSH(A64_R(21), A64_R(22), A64_SP), &ctx);
+	emit(A64_SUB_I(1, A64_SP, A64_SP, 64), &ctx);
+	for (i = 0; i < m->nr_args; i++) {
+		if (m->arg_size[i] < sizeof(u64))
+			emit(A64_UBFM(1, i, i, 0,
+					   m->arg_size[i] * 8 - 1), &ctx);
+		emit(A64_MOVZ(1, A64_R(9), i * 8, 0), &ctx);
+		emit(A64_STR64(i, A64_SP, A64_R(9)), &ctx);
+	}
+
+	emit_a64_mov_i64(A64_R(19), (unsigned long)prog, &ctx);
+	emit_a64_mov_i64(A64_R(10), (unsigned long)__bpf_prog_enter, &ctx);
+	emit(A64_BLR(A64_R(10)), &ctx);
+	emit(A64_MOV(1, A64_R(20), A64_R(0)), &ctx);
+	emit(A64_MOV(1, A64_R(0), A64_SP), &ctx);
+	emit_a64_mov_i64(A64_R(10), (unsigned long)prog->bpf_func, &ctx);
+	emit(A64_BLR(A64_R(10)), &ctx);
+	emit(A64_MOV(1, A64_R(21), A64_R(0)), &ctx);
+	emit(A64_MOV(1, A64_R(0), A64_R(19)), &ctx);
+	emit(A64_MOV(1, A64_R(1), A64_R(20)), &ctx);
+	emit_a64_mov_i64(A64_R(10), (unsigned long)__bpf_prog_exit, &ctx);
+	emit(A64_BLR(A64_R(10)), &ctx);
+	emit(A64_MOV(1, A64_R(0), A64_R(21)), &ctx);
+	emit(A64_ADD_I(1, A64_SP, A64_SP, 64), &ctx);
+	emit(A64_POP(A64_R(21), A64_R(22), A64_SP), &ctx);
+	emit(A64_POP(A64_R(19), A64_R(20), A64_SP), &ctx);
+	emit(A64_POP(A64_FP, A64_LR, A64_SP), &ctx);
+	emit(A64_RET(A64_LR), &ctx);
+	flush_icache_range((unsigned long)image,
+			   (unsigned long)image + ctx.idx * sizeof(u32));
+	return ctx.idx * sizeof(u32);
+}
+
 /*
  * This is an unoptimized 64 immediate emission used for BPF to BPF call
  * addresses. It will always do a full 64 bit decomposition as otherwise
@@ -184,7 +464,7 @@ static inline int epilogue_offset(const struct jit_ctx *ctx)
 #define STACK_ALIGN(sz) (((sz) + 15) & ~15)
 
 /* Tail call offset to jump into */
-#define PROLOGUE_OFFSET 7
+#define PROLOGUE_OFFSET 12
 
 static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 {
@@ -206,7 +486,9 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	 *                        |FP/LR|
 	 * current A64_FP =>  -16:+-----+
 	 *                        | ... | callee saved registers
-	 * BPF fp register => -64:+-----+ <= (BPF_FP)
+	 *                    -64:+-----+
+	 *                        |counter + padding|
+	 * BPF fp register => -80:+-----+ <= (BPF_FP)
 	 *                        |     |
 	 *                        | ... | BPF prog stack
 	 *                        |     |
@@ -221,6 +503,10 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	 *
 	 */
 
+	/* Stable patch site shared by fentry/fexit and freplace. */
+	emit(A64_MOV(1, A64_R(9), A64_LR), ctx);
+	emit(aarch64_insn_gen_nop(), ctx);
+
 	/* Save FP and LR registers to stay align with ARM64 AAPCS */
 	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);
 	emit(A64_MOV(1, A64_FP, A64_SP), ctx);
@@ -230,12 +516,22 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	emit(A64_PUSH(r8, r9, A64_SP), ctx);
 	emit(A64_PUSH(fp, tcc, A64_SP), ctx);
 
-	/* Set up BPF prog stack base register */
+	/* A local fallback counter outlives every tail target that reuses this
+	 * frame. Ordinary subprograms and synchronous callbacks inherit x5.
+	 * Keep both entry variants the same size for tail-call entry offsets.
+	 */
+	emit(A64_PUSH(A64_ZR, A64_ZR, A64_SP), ctx);
 	emit(A64_MOV(1, fp, A64_SP), ctx);
+	emit(A64_MOV(1, tcc, A64_SP), ctx);
+	if (prog->is_func && prog->aux->func_idx) {
+		emit(A64_CBZ(1, A64_R(5), 2), ctx);
+		emit(A64_MOV(1, tcc, A64_R(5)), ctx);
+	} else {
+		emit(aarch64_insn_gen_nop(), ctx);
+		emit(aarch64_insn_gen_nop(), ctx);
+	}
 
 	if (!ebpf_from_cbpf) {
-		/* Initialize tail_call_cnt */
-		emit(A64_MOVZ(1, tcc, 0, 0), ctx);
 
 		cur_offset = ctx->idx - idx0;
 		if (cur_offset != PROLOGUE_OFFSET) {
@@ -252,7 +548,6 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	return 0;
 }
 
-static int out_offset = -1; /* initialized on the first pass of build_body() */
 static int emit_bpf_tail_call(struct jit_ctx *ctx)
 {
 	/* bpf_tail_call(void *prog_ctx, struct bpf_array *array, u64 index) */
@@ -262,10 +557,8 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
 	const u8 tmp = bpf2a64[TMP_REG_1];
 	const u8 prg = bpf2a64[TMP_REG_2];
 	const u8 tcc = bpf2a64[TCALL_CNT];
-	const int idx0 = ctx->idx;
-#define cur_offset (ctx->idx - idx0)
-#define jmp_offset (out_offset - (cur_offset))
 	size_t off;
+	int bounds_branch, count_branch, null_branch;
 
 	/* if (index >= array->map.max_entries)
 	 *     goto out;
@@ -275,16 +568,20 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
 	emit(A64_LDR32(tmp, r2, tmp), ctx);
 	emit(A64_MOV(0, r3, r3), ctx);
 	emit(A64_CMP(0, r3, tmp), ctx);
-	emit(A64_B_(A64_COND_CS, jmp_offset), ctx);
+	bounds_branch = ctx->idx;
+	emit(A64_B_(A64_COND_CS, 0), ctx);
 
 	/* if (tail_call_cnt > MAX_TAIL_CALL_CNT)
 	 *     goto out;
 	 * tail_call_cnt++;
 	 */
+	emit(A64_LDR64(A64_R(12), tcc, A64_ZR), ctx);
 	emit_a64_mov_i64(tmp, MAX_TAIL_CALL_CNT, ctx);
-	emit(A64_CMP(1, tcc, tmp), ctx);
-	emit(A64_B_(A64_COND_HI, jmp_offset), ctx);
-	emit(A64_ADD_I(1, tcc, tcc, 1), ctx);
+	emit(A64_CMP(1, A64_R(12), tmp), ctx);
+	count_branch = ctx->idx;
+	emit(A64_B_(A64_COND_HI, 0), ctx);
+	emit(A64_ADD_I(1, A64_R(12), A64_R(12), 1), ctx);
+	emit(A64_STR64(A64_R(12), tcc, A64_ZR), ctx);
 
 	/* prog = array->ptrs[index];
 	 * if (prog == NULL)
@@ -295,7 +592,8 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
 	emit(A64_ADD(1, tmp, r2, tmp), ctx);
 	emit(A64_LSL(1, prg, r3, 3), ctx);
 	emit(A64_LDR64(prg, tmp, prg), ctx);
-	emit(A64_CBZ(1, prg, jmp_offset), ctx);
+	null_branch = ctx->idx;
+	emit(A64_CBZ(1, prg, 0), ctx);
 
 	/* goto *(prog->bpf_func + prologue_offset); */
 	off = offsetof(struct bpf_prog, bpf_func);
@@ -305,17 +603,18 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
 	emit(A64_ADD_I(1, A64_SP, A64_SP, ctx->stack_size), ctx);
 	emit(A64_BR(tmp), ctx);
 
-	/* out: */
-	if (out_offset == -1)
-		out_offset = cur_offset;
-	if (cur_offset != out_offset) {
-		pr_err_once("tail_call out_offset = %d, expected %d!\n",
-			    cur_offset, out_offset);
-		return -1;
+	/* Patch exits using this emission's positions, with no global size
+	 * cache shared by concurrently compiled programs.
+	 */
+	if (ctx->image) {
+		ctx->image[bounds_branch] = cpu_to_le32(A64_B_(A64_COND_CS,
+			ctx->idx - bounds_branch));
+		ctx->image[count_branch] = cpu_to_le32(A64_B_(A64_COND_HI,
+			ctx->idx - count_branch));
+		ctx->image[null_branch] = cpu_to_le32(A64_CBZ(1, prg,
+			ctx->idx - null_branch));
 	}
 	return 0;
-#undef cur_offset
-#undef jmp_offset
 }
 
 static void build_epilogue(struct jit_ctx *ctx)
@@ -330,6 +629,8 @@ static void build_epilogue(struct jit_ctx *ctx)
 	/* We're done with BPF stack */
 	emit(A64_ADD_I(1, A64_SP, A64_SP, ctx->stack_size), ctx);
 
+	/* Discard the local counter before restoring callee-saved registers. */
+	emit(A64_ADD_I(1, A64_SP, A64_SP, 16), ctx);
 	/* Restore fs (x25) and x26 */
 	emit(A64_POP(fp, A64_R(26), A64_SP), ctx);
 
@@ -344,6 +645,67 @@ static void build_epilogue(struct jit_ctx *ctx)
 	emit(A64_MOV(1, A64_R(0), r0), ctx);
 
 	emit(A64_RET(A64_LR), ctx);
+}
+
+#define BPF_FIXUP_OFFSET_MASK	GENMASK(26, 0)
+#define BPF_FIXUP_REG_MASK	GENMASK(31, 27)
+
+int arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
+			      struct pt_regs *regs)
+{
+	off_t offset = FIELD_GET(BPF_FIXUP_OFFSET_MASK, ex->fixup);
+	int dst_reg = FIELD_GET(BPF_FIXUP_REG_MASK, ex->fixup);
+
+	regs->regs[dst_reg] = 0;
+	regs->pc = (unsigned long)&ex->fixup - offset;
+	return 1;
+}
+
+/* For accesses to BTF pointers, add an entry to the exception table */
+static int add_exception_handler(const struct bpf_insn *insn,
+				 struct jit_ctx *ctx,
+				 int dst_reg)
+{
+	off_t offset;
+	unsigned long pc;
+	struct exception_table_entry *ex;
+
+	if (!ctx->image)
+		/* First pass */
+		return 0;
+
+	if (BPF_MODE(insn->code) != BPF_PROBE_MEM)
+		return 0;
+
+	if (!ctx->prog->aux->extable ||
+	    WARN_ON_ONCE(ctx->exentry_idx >= ctx->prog->aux->num_exentries))
+		return -EINVAL;
+
+	ex = &ctx->prog->aux->extable[ctx->exentry_idx];
+	pc = (unsigned long)&ctx->image[ctx->idx - 1];
+
+	offset = pc - (long)&ex->insn;
+	if (WARN_ON_ONCE(offset >= 0 || offset < INT_MIN))
+		return -ERANGE;
+	ex->insn = offset;
+
+	/*
+	 * Since the extable follows the program, the fixup offset is always
+	 * negative and limited to BPF_JIT_REGION_SIZE. Store a positive value
+	 * to keep things simple, and put the destination register in the upper
+	 * bits. We don't need to worry about buildtime or runtime sort
+	 * modifying the upper bits because the table is already sorted, and
+	 * isn't part of the main exception table.
+	 */
+	offset = (long)&ex->fixup - (pc + AARCH64_INSN_SIZE);
+	if (!FIELD_FIT(BPF_FIXUP_OFFSET_MASK, offset))
+		return -ERANGE;
+
+	ex->fixup = FIELD_PREP(BPF_FIXUP_OFFSET_MASK, offset) |
+		    FIELD_PREP(BPF_FIXUP_REG_MASK, dst_reg);
+
+	ctx->exentry_idx++;
+	return 0;
 }
 
 /* JITs an eBPF instruction.
@@ -367,6 +729,7 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx)
 	const bool isdw = BPF_SIZE(code) == BPF_DW;
 	u8 jmp_cond, reg;
 	s32 jmp_offset;
+	int ret;
 
 #define check_imm(bits, imm) do {				\
 	if ((((imm) > 0) && ((imm) >> (bits))) ||		\
@@ -626,8 +989,16 @@ emit_cond_jmp:
 	case BPF_JMP | BPF_CALL:
 	{
 		const u8 r0 = bpf2a64[BPF_REG_0];
-		const u64 func = (u64)__bpf_call_base + imm;
+		u64 func = (u64)__bpf_call_base + imm;
 
+		if (insn->src_reg == BPF_PSEUDO_CALL) {
+			/* Sixth AAPCS argument is private to the JIT. */
+			emit(A64_MOV(1, A64_R(5), bpf2a64[TCALL_CNT]), ctx);
+		} else if (func == (u64)bpf_for_each_map_elem_proto.func) {
+			/* The public helper has only four arguments. */
+			emit(A64_MOV(1, A64_R(4), bpf2a64[TCALL_CNT]), ctx);
+			func = (u64)bpf_for_each_map_elem_tail_call;
+		}
 		if (ctx->prog->is_func)
 			emit_addr_mov_i64(tmp, func, ctx);
 		else
@@ -659,7 +1030,10 @@ emit_cond_jmp:
 		u64 imm64;
 
 		imm64 = (u64)insn1.imm << 32 | (u32)imm;
-		emit_a64_mov_i64(dst, imm64, ctx);
+		if (bpf_pseudo_func(insn))
+			emit_addr_mov_i64(dst, imm64, ctx);
+		else
+			emit_a64_mov_i64(dst, imm64, ctx);
 
 		return 1;
 	}
@@ -669,6 +1043,10 @@ emit_cond_jmp:
 	case BPF_LDX | BPF_MEM | BPF_H:
 	case BPF_LDX | BPF_MEM | BPF_B:
 	case BPF_LDX | BPF_MEM | BPF_DW:
+	case BPF_LDX | BPF_PROBE_MEM | BPF_W:
+	case BPF_LDX | BPF_PROBE_MEM | BPF_H:
+	case BPF_LDX | BPF_PROBE_MEM | BPF_B:
+	case BPF_LDX | BPF_PROBE_MEM | BPF_DW:
 		emit_a64_mov_i(1, tmp, off, ctx);
 		switch (BPF_SIZE(code)) {
 		case BPF_W:
@@ -684,6 +1062,9 @@ emit_cond_jmp:
 			emit(A64_LDR64(dst, src, tmp), ctx);
 			break;
 		}
+		ret = add_exception_handler(insn, ctx, dst);
+		if (ret)
+			return ret;
 		break;
 
 	/* speculation barrier */
@@ -745,10 +1126,15 @@ emit_cond_jmp:
 		}
 		break;
 
-	/* STX XADD: lock *(u32 *)(dst + off) += src */
-	case BPF_STX | BPF_XADD | BPF_W:
-	/* STX XADD: lock *(u64 *)(dst + off) += src */
-	case BPF_STX | BPF_XADD | BPF_DW:
+	case BPF_STX | BPF_ATOMIC | BPF_W:
+	case BPF_STX | BPF_ATOMIC | BPF_DW:
+		/* Android 5.15 arm64 JIT likewise implements only non-fetch ADD. */
+		if (insn->imm != BPF_ADD) {
+			pr_err_once("unknown atomic op code %02x\n", insn->imm);
+			return -EINVAL;
+		}
+
+		/* STX atomic add: lock *(u32/u64 *)(dst + off) += src */
 		if (!off) {
 			reg = dst;
 		} else {
@@ -835,7 +1221,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	bool tmp_blinded = false;
 	bool extra_pass = false;
 	struct jit_ctx ctx;
-	int image_size;
+	int image_size, prog_size, extable_size, body_size, i;
 	u8 *image_ptr;
 
 	if (!prog->jit_requested)
@@ -866,7 +1252,10 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		image_ptr = jit_data->image;
 		header = jit_data->header;
 		extra_pass = true;
-		image_size = sizeof(u32) * ctx.idx;
+		prog_size = sizeof(u32) * ctx.idx;
+		extable_size = prog->aux->num_exentries *
+			sizeof(struct exception_table_entry);
+		image_size = prog_size + extable_size;
 		goto skip_init_ctx;
 	}
 	memset(&ctx, 0, sizeof(ctx));
@@ -885,17 +1274,24 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		prog = orig_prog;
 		goto out_off;
 	}
+	body_size = ctx.idx;
 
 	if (build_prologue(&ctx, was_classic)) {
 		prog = orig_prog;
 		goto out_off;
 	}
+	/* Offsets were measured before the prologue in this 4.19 JIT. */
+	for (i = 0; i < prog->len; i++)
+		ctx.offset[i] += ctx.idx - body_size;
 
 	ctx.epilogue_offset = ctx.idx;
 	build_epilogue(&ctx);
 
 	/* Now we know the actual image size. */
-	image_size = sizeof(u32) * ctx.idx;
+	prog_size = sizeof(u32) * ctx.idx;
+	extable_size = prog->aux->num_exentries *
+		sizeof(struct exception_table_entry);
+	image_size = prog_size + extable_size;
 	header = bpf_jit_binary_alloc(image_size, &image_ptr,
 				      sizeof(u32), jit_fill_hole);
 	if (header == NULL) {
@@ -906,8 +1302,11 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	/* 2. Now, the actual pass. */
 
 	ctx.image = (__le32 *)image_ptr;
+	if (extable_size)
+		prog->aux->extable = (void *)image_ptr + prog_size;
 skip_init_ctx:
 	ctx.idx = 0;
+	ctx.exentry_idx = 0;
 
 	build_prologue(&ctx, was_classic);
 
@@ -928,7 +1327,7 @@ skip_init_ctx:
 
 	/* And we're done. */
 	if (bpf_jit_enable > 1)
-		bpf_jit_dump(prog->len, image_size, 2, ctx.image);
+		bpf_jit_dump(prog->len, prog_size, 2, ctx.image);
 
 	bpf_flush_icache(header, ctx.image + ctx.idx);
 
@@ -952,9 +1351,14 @@ skip_init_ctx:
 	}
 	prog->bpf_func = (void *)ctx.image;
 	prog->jited = 1;
-	prog->jited_len = image_size;
+	prog->jited_len = prog_size;
 
 	if (!prog->is_func || extra_pass) {
+		int i;
+
+		for (i = 0; i < prog->len; i++)
+			ctx.offset[i] *= AARCH64_INSN_SIZE;
+		bpf_prog_fill_jited_linfo(prog, ctx.offset);
 out_off:
 		kfree(ctx.offset);
 		kfree(jit_data);
@@ -965,6 +1369,12 @@ out:
 		bpf_jit_prog_release_other(prog, prog == orig_prog ?
 					   tmp : orig_prog);
 	return prog;
+}
+
+/* Kfunc calls use the same register ABI and BLR sequence as helper calls. */
+bool bpf_jit_supports_kfunc_call(void)
+{
+	return true;
 }
 
 void *bpf_jit_alloc_exec(unsigned long size)
@@ -978,4 +1388,63 @@ void *bpf_jit_alloc_exec(unsigned long size)
 void bpf_jit_free_exec(void *addr)
 {
 	return vfree(addr);
+}
+
+/* All runtime patches are one aligned B/BL/NOP instruction. Serialize the
+ * compare-and-replace and synchronize instruction fetch on every online CPU.
+ */
+int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type type,
+		       void *old_addr, void *new_addr)
+{
+	unsigned long pc = (unsigned long)ip;
+	u32 old_insn, new_insn, actual;
+	enum aarch64_insn_branch_type branch;
+	void *addrs[1];
+	int ret;
+
+	if ((pc & 3) || !is_bpf_text_address(pc))
+		return -EINVAL;
+	if (type != BPF_MOD_CALL && type != BPF_MOD_JUMP)
+		return -EINVAL;
+	branch = type == BPF_MOD_CALL ? AARCH64_INSN_BRANCH_LINK :
+				       AARCH64_INSN_BRANCH_NOLINK;
+	cpus_read_lock();
+	mutex_lock(&text_mutex);
+	ret = aarch64_insn_read((void *)pc, &actual);
+	if (ret)
+		goto out;
+	/* Function entry points retain MOV x9, LR; patch the following NOP.
+	 * Trampoline teardown points already point directly at their NOP.
+	 */
+	if (actual == A64_MOV(1, A64_R(9), A64_LR))
+		pc += AARCH64_INSN_SIZE;
+	if ((old_addr && (((long)old_addr - (long)pc) & 3)) ||
+	    (new_addr && (((long)new_addr - (long)pc) & 3))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if ((old_addr && ((long)old_addr - (long)pc < -(long)SZ_128M ||
+			 (long)old_addr - (long)pc >= (long)SZ_128M)) ||
+	    (new_addr && ((long)new_addr - (long)pc < -(long)SZ_128M ||
+			 (long)new_addr - (long)pc >= (long)SZ_128M))) {
+		ret = -ERANGE;
+		goto out;
+	}
+	old_insn = old_addr ? aarch64_insn_gen_branch_imm(pc,
+		(unsigned long)old_addr, branch) : aarch64_insn_gen_nop();
+	new_insn = new_addr ? aarch64_insn_gen_branch_imm(pc,
+		(unsigned long)new_addr, branch) : aarch64_insn_gen_nop();
+	ret = aarch64_insn_read((void *)pc, &actual);
+	if (ret)
+		goto out;
+	if (actual != old_insn) {
+		ret = -EBUSY;
+		goto out;
+	}
+	addrs[0] = (void *)pc;
+	ret = aarch64_insn_patch_text(addrs, &new_insn, 1);
+out:
+	mutex_unlock(&text_mutex);
+	cpus_read_unlock();
+	return ret;
 }

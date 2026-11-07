@@ -563,10 +563,8 @@ cp_statx(const struct kstat *stat, struct statx __user *buffer)
  * Note that fstat() can be emulated by setting dfd to the fd of interest,
  * supplying "" as the filename and setting AT_EMPTY_PATH in the flags.
  */
-SYSCALL_DEFINE5(statx,
-		int, dfd, const char __user *, filename, unsigned, flags,
-		unsigned int, mask,
-		struct statx __user *, buffer)
+int do_statx(int dfd, const char __user *filename, unsigned flags,
+		 unsigned int mask, struct statx __user *buffer)
 {
 	struct kstat stat;
 	int error;
@@ -575,12 +573,18 @@ SYSCALL_DEFINE5(statx,
 		return -EINVAL;
 	if ((flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE)
 		return -EINVAL;
-
 	error = vfs_statx(dfd, filename, flags, &stat, mask);
 	if (error)
 		return error;
-
 	return cp_statx(&stat, buffer);
+}
+
+SYSCALL_DEFINE5(statx,
+		int, dfd, const char __user *, filename, unsigned, flags,
+		unsigned int, mask,
+		struct statx __user *, buffer)
+{
+	return do_statx(dfd, filename, flags, mask, buffer);
 }
 
 #ifdef CONFIG_COMPAT

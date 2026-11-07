@@ -1,0 +1,51 @@
+Verifier type modifiers and SYSCALL helpers (4.19 backport)
+========================================================
+
+Reference: local android-5.15-mainline. No defconfig changes are required by
+this patch. Enable the usual BPF syscall/JIT/tracing options in menuconfig.
+The tracing helper set remains subject to CONFIG options, capabilities, GPL,
+helper .allowed callbacks and verifier map/program restrictions from 5.15.
+"Full helper support" does not mean bypassing these restrictions.
+
+Host regression checks (do not load the verifier or exercise SMP scheduling):
+
+  python3 tools/testing/selftests/bpf/test_helper_type_modifiers.py
+  python3 tools/testing/selftests/bpf/test_modifier_compatibility.py
+  python3 tools/testing/selftests/bpf/test_helper_memory_modifiers.py
+  python3 tools/testing/selftests/bpf/test_sleepable_migration.py
+  python3 tools/testing/selftests/bpf/test_callback_reference_scope.py
+  python3 tools/testing/selftests/bpf/test_arm64_callback_tail.py
+  python3 tools/testing/selftests/bpf/test_arm64_trampoline.py
+
+Device regression:
+
+Export this tree's UAPI with `make ARCH=arm64 headers_install
+INSTALL_HDR_PATH=/tmp/gauguin-uapi`, then build syscall_helpers_user.c using
+an Android ARM64 compiler and -I/tmp/gauguin-uapi/include. Run as root:
+
+  /data/local/tmp/syscall_helpers_user 10000
+
+It loads a BPF_PROG_TYPE_SYSCALL | BPF_F_SLEEPABLE program without libbpf,
+faults user pages with copy_from_user, compares CPU numbers across the helper,
+and exercises sys_bpf(MAP_CREATE) and sys_close. It creates and closes only
+its own temporary maps. Run under scheduler load and concurrent taskset
+changes for affinity stress. Repeat after the device has been idle and after
+several minutes of uptime. CPU hotplug/isolation stress must be tested on the
+actual Qualcomm kernel; the host migration test uses scheduler stubs.
+
+helper_readonly.c provides positive and negative BPF objects. The normal
+object passes read-only map data to strtol; -DBAD_WRITE attempts to use that
+data as get_current_comm output and must fail verifier load. Use a modern
+libbpf loader that sets the rodata map BPF_F_RDONLY_PROG and freezes it.
+Compiling either object does not prove the verifier result.
+
+Migration dependency:
+
+migrate_disable/enable now preserve CPU locality while allowing preemption
+and sleeping, including nested calls. Requested affinity (cpus_allowed) is
+separate from effective affinity (cpus_ptr). Concurrent affinity changes use
+the 5.15 pending-completion mechanism; scheduler placement, balancing and
+Qualcomm isolation honor pinned tasks. CPU deactivation drains nr_pinned
+before stop_machine, with a sleeping poll to avoid taking wakeup locks from
+instrumentation under rq->lock. Long-running sleepable BPF programs can
+therefore delay CPU offlining. They are not given a new runtime timeout.

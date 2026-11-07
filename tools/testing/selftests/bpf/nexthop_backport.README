@@ -1,0 +1,119 @@
+Nexthop object/group backport for Gauguin 4.19
+============================================
+
+The 5.15 object/group manager and IPv4/IPv6 RTA_NH_ID route binding are
+connected. IPv6 requests no longer return the temporary EOPNOTSUPP guard.
+Host regression and ARM64 build results are listed below; device runtime
+correctness has not been established.
+
+The object header is separate (include/net/nexthop_objects.h) so native 4.19
+rtnh parsing users do not acquire object/group dependencies implicitly.
+Dump cursors use cb->args with compile-time size checks. Dump request
+validation returns errors but 4.19 dump callbacks lack the extended ACK
+channel, so dump error text is unavailable; non-dump operations retain it.
+
+Implemented components:
+* 5.15 object/group manager: per-netns ID tree/device hash, references,
+  single nexthops, hash-threshold/resilient groups, buckets, upkeep,
+  replacement/delete, rollback and device/notifier handling. Init handles
+  per-netns and netdevice registration failures. nexthop_compat_mode is
+  exposed with an integer range of 0..1, default 1.
+* UAPI command/attribute/group IDs preserve the 5.15 numeric values.
+* fib_nh_common embedded at the start of IPv4 and IPv6 nexthops, with family,
+  gateway, device, flags, weight and IPv4 destination-cache state.
+* IPv6 per-CPU and exception cache ownership and the flushed flag moved
+  from fib6_info into its embedded fib6_nh. Exception flush can operate on
+  an entire nexthop or filter entries by their parent route. Existing native
+  route teardown still flushes the full embedded nexthop.
+* Common IPv4 cache/LWT teardown and IPv6 nexthop teardown extracted from
+  route destruction. Existing route teardown still occurs after RCU.
+* IPv4/IPv6 routing, BPF FIB, ND and trace consumers updated to the new fields.
+* Independent fib_nh_init/fib_nh_release, used by IPv4 single-path and ECMP
+  routes. Classid accounting is atomic across route/rule updates and RCU
+  release. Nexthop source-address selection accepts an explicit scope.
+* Independent fib6_nh_init, used by IPv6 route creation, with gateway,
+  device, ONLINK and LWT validation and the native loopback/reject behavior.
+  IPv6 per-CPU destination release uses xchg to detach each cached pointer.
+  Init/release/destination-release are available through ipv6_stub.
+* IPv4 lookup handles shared objects, rejects blackholes, and selects the
+  common nexthop. Multipath selection preserves the selected shared path.
+  IPv4 cache/PMTU/redirect/LWT consumers and BPF FIB use fib_result.nhc.
+  Shared IPv4 route creation now attaches the referenced object.
+* Common fib_lookup_good_nhc eligibility validation, used by native FIB
+  lookups, for dead/linkdown state and output interface constraints.
+* IPv6 FDB endpoint initialization and -EAFNOSUPPORT initialization fallback
+  before the IPv6 module is loaded.
+* IPv4 dependent-route replacement notification via an nh_updated marker
+  and FIB trie walk; IPv6 replacement notification and serial-number
+  invalidation are available through ipv6_stub.
+* Shared IPv4 MTU exception updates now take fnhe_lock per exception, under
+  RCU traversal, instead of updating exception fields without that lock.
+* Shared fib_nexthop_info/fib_add_nexthop serialization, used by native
+  IPv4 ECMP dumps, including gateway families, flags, weight, classid and LWT.
+  LWT serialization accepts caller-supplied encapsulation attribute IDs.
+* Public fib_check_nh(net, nh, table, scope, extack), independent of a
+  parent route configuration, and fib_nh_common_init with the native 4.19
+  LWT API. Existing IPv4 routes use the shared cache allocation path.
+
+IPv6 shared-route integration
+-----------------------------
+* ID validation, reference ownership, dependent-route linkage, delete matching,
+  replacement invalidation and compatibility-mode single/group netlink dumps.
+* Per-query fib6_result selection without changing shared FIB entries. Device,
+  gateway, flags and LWT cloning use the chosen member. Native sibling ECMP
+  remains separate from object groups.
+* Selected-member per-CPU cache and PMTU lookup. Cached routes from another
+  prefix are evicted, with balanced device/destination references. Exception
+  lookup and teardown filter parent FIB ownership.
+* All-member exception aging, preferred-source cleanup, redirect and MTU
+  device updates. Object manager owns shared-route link/delete notifications.
+* BPF IPv6 FIB lookup and IPv6 source policy use the selected member. Stub
+  dispatch keeps built-in networking independent of IPv6 module linkage.
+* Addrconf/RA native-route scans skip shared routes; tracing uses safe metadata
+  accessors. Exception insertion compares against the chosen member's MTU.
+
+Validation commands
+-------------------
+python3 tools/testing/selftests/bpf/test_fib_lookup.py
+python3 tools/testing/selftests/bpf/test_fib_via.py
+python3 tools/testing/selftests/bpf/test_nexthop_init.py
+python3 tools/testing/selftests/bpf/test_nexthop_ipv6_init.py
+python3 tools/testing/selftests/bpf/test_nexthop_dump.py
+python3 tools/testing/selftests/bpf/test_nexthop_mtu.py
+python3 tools/testing/selftests/bpf/test_nexthop_lookup.py
+python3 tools/testing/selftests/bpf/test_nexthop_groups.py
+python3 tools/testing/selftests/bpf/test_nexthop_lifetime.py
+python3 tools/testing/selftests/bpf/test_nexthop_ipv6_select.py
+python3 tools/testing/selftests/bpf/test_nexthop_ipv6_cache.py
+python3 tools/testing/selftests/bpf/test_nexthop_ipv6_redirect.py
+
+Tests extract production functions with host stubs. They cover ABI, FIB
+helper flags, chosen IPv4/IPv6 paths, MTU, init/release failure ownership,
+serialization, weighted/resilient selection, interface/link eligibility,
+FIB ownership and per-CPU prefix isolation. They do not simulate RCU races,
+timer concurrency or real netlink traffic.
+
+Outstanding validation and optional-driver limitations
+----------------------------------------------------
+Device tests are still required for add/get/dump/replace/delete, IPv4/IPv6
+traffic, resilient bucket changes, device removal and network namespace exit.
+Legacy rocker/mlxsw drivers use embedded nexthops and do not implement shared
+object/group hardware offload. Notifiers reject shared routes with EOPNOTSUPP
+before accessing inline storage. Gauguin does not enable these drivers. Do not
+claim full optional hardware-offload compatibility or device verification.
+A full vmlinux link has not been validated.
+
+This continuation does not change the Gauguin defconfig. Existing BPF-related
+configuration changes precede this work; FUSE_BPF remains disabled.
+
+Local validation (2026-11-07)
+-----------------------------
+All 12 host regression scripts passed. ARM64 Clang/LLD builds passed for
+net/ipv4/, net/ipv6/ and net/core/ with the resolved Gauguin configuration;
+affected route/policy objects were rebuilt after subsequent fixes.
+CONFIG_IPV6=n and CONFIG_IP_ROUTE_MULTIPATH=n builds passed for nexthop,
+BPF filter and addrconf_core. Rocker and mlxsw spectrum_router objects
+passed with NET_SWITCHDEV and PCI enabled in a temporary configuration.
+CONFIG_IPV6=m affected nexthop/filter/IPv6 route, policy, FIB and stub objects
+also built successfully; a repeat check completed without compiler errors.
+No repository defconfig edits were made in this continuation.

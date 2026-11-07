@@ -66,13 +66,15 @@ extern int filename_lookup(int dfd, struct filename *name, unsigned flags,
 extern int user_path_mountpoint_at(int, const char __user *, unsigned int, struct path *);
 long do_mknodat(int dfd, const char __user *filename, umode_t mode,
 		unsigned int dev);
-long do_mkdirat(int dfd, const char __user *pathname, umode_t mode);
-long do_rmdir(int dfd, const char __user *pathname);
+long do_mkdirat(int dfd, struct filename *name, umode_t mode);
+long do_rmdir(int dfd, struct filename *name);
 long do_unlinkat(int dfd, struct filename *name);
-long do_symlinkat(const char __user *oldname, int newdfd,
-		  const char __user *newname);
-int do_linkat(int olddfd, const char __user *oldname, int newdfd,
-	      const char __user *newname, int flags);
+long do_symlinkat(struct filename *oldname, int newdfd,
+		  struct filename *newname);
+int do_linkat(int olddfd, struct filename *oldname, int newdfd,
+	      struct filename *newname, int flags);
+int do_renameat2(int olddfd, struct filename *oldname, int newdfd,
+		 struct filename *newname, unsigned int flags);
 
 /*
  * namespace.c
@@ -118,6 +120,9 @@ struct open_flags {
 	int intent;
 	int lookup_flags;
 };
+struct open_how;
+extern struct open_how build_open_how(int flags, umode_t mode);
+extern int build_open_flags(const struct open_how *how, struct open_flags *op);
 extern struct file *do_filp_open(int dfd, struct filename *pathname,
 		const struct open_flags *op);
 extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,

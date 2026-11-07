@@ -17,6 +17,7 @@
 #define _NET_IP_FIB_H
 
 #include <net/flow.h>
+#include <net/l3mdev.h>
 #include <linux/seq_file.h>
 #include <linux/rcupdate.h>
 #include <net/fib_notifier.h>
@@ -34,8 +35,11 @@ struct fib_config {
 	u8			fc_type;
 	/* 3 bytes unused */
 	u32			fc_table;
+	u32			fc_nh_id;
 	__be32			fc_dst;
 	__be32			fc_gw;
+	u8			fc_gw_family;
+	struct in6_addr		fc_gw6;
 	int			fc_oif;
 	u32			fc_flags;
 	u32			fc_priority;
@@ -76,34 +80,60 @@ struct fnhe_hash_bucket {
 #define FNHE_HASH_SIZE		(1 << FNHE_HASH_SHIFT)
 #define FNHE_RECLAIM_DEPTH	5
 
+struct fib_nh_common {
+	struct net_device	*nhc_dev;
+	int			nhc_oif;
+	unsigned char		nhc_scope;
+	u8			nhc_family;
+	u8			nhc_gw_family;
+	unsigned int		nhc_flags;
+	struct lwtunnel_state	*nhc_lwtstate;
+
+	union {
+		__be32          ipv4;
+		struct in6_addr ipv6;
+	} nhc_gw;
+
+	int			nhc_weight;
+	atomic_t		nhc_upper_bound;
+
+	/* v4 specific, but allows fib6_nh with v4 routes */
+	struct rtable __rcu * __percpu *nhc_pcpu_rth_output;
+	struct rtable __rcu     *nhc_rth_input;
+	struct fnhe_hash_bucket	__rcu *nhc_exceptions;
+};
+
 struct fib_nh {
-	struct net_device	*fib_nh_dev;
+	struct fib_nh_common	nh_common;
 	struct hlist_node	nh_hash;
 	struct fib_info		*nh_parent;
-	unsigned int		fib_nh_flags;
-	unsigned char		fib_nh_scope;
-#ifdef CONFIG_IP_ROUTE_MULTIPATH
-	int			fib_nh_weight;
-	atomic_t		fib_nh_upper_bound;
-#endif
 #ifdef CONFIG_IP_ROUTE_CLASSID
 	__u32			nh_tclassid;
 #endif
-	int			fib_nh_oif;
-	__be32			fib_nh_gw4;
 	__be32			nh_saddr;
 	int			nh_saddr_genid;
-	struct rtable __rcu * __percpu *nh_pcpu_rth_output;
-	struct rtable __rcu	*nh_rth_input;
-	struct fnhe_hash_bucket	__rcu *nh_exceptions;
-	struct lwtunnel_state	*fib_nh_lws;
+#define fib_nh_family		nh_common.nhc_family
+#define fib_nh_dev		nh_common.nhc_dev
+#define fib_nh_oif		nh_common.nhc_oif
+#define fib_nh_flags		nh_common.nhc_flags
+#define fib_nh_lws		nh_common.nhc_lwtstate
+#define fib_nh_scope		nh_common.nhc_scope
+#define fib_nh_gw_family	nh_common.nhc_gw_family
+#define fib_nh_gw4		nh_common.nhc_gw.ipv4
+#define fib_nh_gw6		nh_common.nhc_gw.ipv6
+#define fib_nh_weight		nh_common.nhc_weight
+#define fib_nh_upper_bound	nh_common.nhc_upper_bound
 };
 
 /*
  * This structure contains data shared by many of routes.
  */
 
+struct nexthop;
+
 struct fib_info {
+	struct nexthop		*nh;
+	struct list_head	nh_list;
 	struct hlist_node	fib_hash;
 	struct hlist_node	fib_lhash;
 	struct net		*fib_net;
@@ -111,6 +141,7 @@ struct fib_info {
 	refcount_t		fib_clntref;
 	unsigned int		fib_flags;
 	unsigned char		fib_dead;
+	bool			nh_updated;
 	unsigned char		fib_protocol;
 	unsigned char		fib_scope;
 	unsigned char		fib_type;
@@ -135,6 +166,7 @@ struct fib_rule;
 
 struct fib_table;
 struct fib_result {
+	struct fib_nh_common *nhc;
 	__be32		prefix;
 	unsigned char	prefixlen;
 	unsigned char	nh_sel;
@@ -161,6 +193,8 @@ struct fib_result_nl {
 	int             err;
 };
 
+#define FIB_RES_NHC(res)	((res).nhc)
+
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 #define FIB_RES_NH(res)		((res).fi->fib_nh[(res).nh_sel])
 #else /* CONFIG_IP_ROUTE_MULTIPATH */
@@ -173,16 +207,20 @@ struct fib_result_nl {
 #define FIB_TABLE_HASHSZ 2
 #endif
 
+__be32 fib_info_update_nhc_saddr(struct net *net, struct fib_nh_common *nhc,
+				 unsigned char scope);
 __be32 fib_info_update_nh_saddr(struct net *net, struct fib_nh *nh);
 
 #define FIB_RES_SADDR(net, res)				\
-	((FIB_RES_NH(res).nh_saddr_genid ==		\
+	((res).fi->nh ? fib_info_update_nhc_saddr((net), (res).nhc, \
+						(res).fi->fib_scope) : \
+	 (FIB_RES_NH(res).nh_saddr_genid ==		\
 	  atomic_read(&(net)->ipv4.dev_addr_genid)) ?	\
 	 FIB_RES_NH(res).nh_saddr :			\
 	 fib_info_update_nh_saddr((net), &FIB_RES_NH(res)))
-#define FIB_RES_GW(res)			(FIB_RES_NH(res).fib_nh_gw4)
-#define FIB_RES_DEV(res)		(FIB_RES_NH(res).fib_nh_dev)
-#define FIB_RES_OIF(res)		(FIB_RES_NH(res).fib_nh_oif)
+#define FIB_RES_GW(res)			(FIB_RES_NHC(res)->nhc_gw.ipv4)
+#define FIB_RES_DEV(res)		(FIB_RES_NHC(res)->nhc_dev)
+#define FIB_RES_OIF(res)		(FIB_RES_NHC(res)->nhc_oif)
 
 #define FIB_RES_PREFSRC(net, res)	((res).fi->fib_prefsrc ? : \
 					 FIB_RES_SADDR(net, res))
@@ -378,7 +416,7 @@ int fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 #ifdef CONFIG_IP_ROUTE_CLASSID
 static inline int fib_num_tclassid_users(struct net *net)
 {
-	return net->ipv4.fib_num_tclassid_users;
+	return atomic_read(&net->ipv4.fib_num_tclassid_users);
 }
 #else
 static inline int fib_num_tclassid_users(struct net *net)
@@ -413,7 +451,8 @@ static inline void fib_combine_itag(u32 *itag, const struct fib_result *res)
 #ifdef CONFIG_IP_MULTIPLE_TABLES
 	u32 rtag;
 #endif
-	*itag = FIB_RES_NH(*res).nh_tclassid<<16;
+	*itag = res->nhc->nhc_family == AF_INET ?
+		container_of(res->nhc, struct fib_nh, nh_common)->nh_tclassid << 16 : 0;
 #ifdef CONFIG_IP_MULTIPLE_TABLES
 	rtag = res->tclassid;
 	if (*itag == 0)
@@ -450,5 +489,54 @@ static inline void fib_proc_exit(struct net *net)
 #endif
 
 u32 ip_mtu_from_fib_result(struct fib_result *res, __be32 daddr);
+
+int fib_gw_from_via(struct fib_config *cfg, struct nlattr *nla,
+		    struct netlink_ext_ack *extack);
+int fib_nh_put_gateway(struct sk_buff *skb, const struct fib_nh *nh);
+
+static inline bool fib_nh_gw_match(const struct fib_config *cfg,
+				 const struct fib_nh *nh)
+{
+	u8 family = cfg->fc_gw_family ? : (cfg->fc_gw ? AF_INET : 0);
+
+	if (!family)
+		return true;
+	if (family != nh->fib_nh_gw_family)
+		return false;
+	if (family == AF_INET6)
+		return !memcmp(&cfg->fc_gw6, &nh->fib_nh_gw6,
+			       sizeof(cfg->fc_gw6));
+	return cfg->fc_gw == nh->fib_nh_gw4;
+}
+
+static inline bool nhc_l3mdev_matches_dev(const struct fib_nh_common *nhc,
+					const struct net_device *dev)
+{
+	return nhc->nhc_dev &&
+	       (nhc->nhc_dev == dev ||
+		l3mdev_master_ifindex_rcu(nhc->nhc_dev) == dev->ifindex);
+}
+
+bool fib_lookup_good_nhc(const struct fib_nh_common *nhc, int fib_flags,
+			 const struct flowi4 *flp);
+void fib_flush(struct net *net);
+void fib_info_notify_update(struct net *net, struct nl_info *info);
+void fib_nhc_update_mtu(struct fib_nh_common *nhc, u32 new, u32 orig);
+
+int fib_check_nh(struct net *net, struct fib_nh *nh, u32 table, u8 scope,
+		 struct netlink_ext_ack *extack);
+/* Init requires zeroed storage; release requires all readers to be gone. */
+int fib_nexthop_info(struct sk_buff *skb, const struct fib_nh_common *nhc,
+		     u8 rt_family, unsigned char *flags, bool skip_oif);
+int fib_add_nexthop(struct sk_buff *skb, const struct fib_nh_common *nhc,
+		    int nh_weight, u8 rt_family, u32 nh_tclassid);
+void fib_nh_release(struct net *net, struct fib_nh *nh);
+int fib_nh_init(struct net *net, struct fib_nh *nh,
+		struct fib_config *cfg, int nh_weight,
+		struct netlink_ext_ack *extack);
+int fib_nh_common_init(struct net *net, struct fib_nh_common *nhc,
+		       struct nlattr *encap, u16 encap_type, void *cfg,
+		       gfp_t gfp_flags, struct netlink_ext_ack *extack);
+void fib_nh_common_release(struct fib_nh_common *nhc);
 
 #endif  /* _NET_FIB_H */
