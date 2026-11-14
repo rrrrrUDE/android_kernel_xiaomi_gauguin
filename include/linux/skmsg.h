@@ -103,6 +103,7 @@ struct sk_psock {
 	void (*saved_destroy)(struct sock *sk);
 	void (*saved_close)(struct sock *sk, long timeout);
 	void (*saved_write_space)(struct sock *sk);
+	int (*psock_update_sk_prot)(struct sock *, struct sk_psock *, bool);
 	struct proto			*sk_proto;
 	struct sk_psock_work_state	work_state;
 	struct work_struct		work;
@@ -291,7 +292,7 @@ static inline struct sk_psock *sk_psock(const struct sock *sk)
 
 static inline bool sk_has_psock(struct sock *sk)
 {
-	return sk_psock(sk) != NULL && sk->sk_prot->recvmsg == tcp_bpf_recvmsg;
+	return sk_psock(sk) != NULL && sk->sk_prot->close == sock_map_close;
 }
 
 static inline void sk_psock_queue_msg(struct sk_psock *psock,
@@ -376,8 +377,12 @@ static inline void sk_psock_update_proto(struct sock *sk,
 static inline void sk_psock_restore_proto(struct sock *sk,
 					  struct sk_psock *psock)
 {
-	if (psock->sk_proto) {
-		sk->sk_prot = psock->sk_proto;
+	if (psock->psock_update_sk_prot) {
+		psock->psock_update_sk_prot(sk, psock, true);
+		psock->sk_proto = NULL;
+	} else if (psock->sk_proto) {
+		sk->sk_write_space = psock->saved_write_space;
+		WRITE_ONCE(sk->sk_prot, psock->sk_proto);
 		psock->sk_proto = NULL;
 	}
 }

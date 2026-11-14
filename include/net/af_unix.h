@@ -95,4 +95,11 @@ void unix_sysctl_unregister(struct net *net);
 static inline int unix_sysctl_register(struct net *net) { return 0; }
 static inline void unix_sysctl_unregister(struct net *net) {}
 #endif
+
+struct sk_psock;
+int unix_dgram_bpf_update_proto(struct sock *, struct sk_psock *, bool);
+int unix_stream_bpf_update_proto(struct sock *, struct sk_psock *, bool);
+void unix_bpf_build_proto(void);
+int __unix_dgram_recvmsg(struct socket *, struct msghdr *, size_t, int);
+int __unix_stream_recvmsg(struct socket *, struct msghdr *, size_t, int);
 #endif

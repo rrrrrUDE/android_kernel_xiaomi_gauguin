@@ -2590,6 +2590,9 @@ void tcp4_proc_exit(void)
 #endif /* CONFIG_PROC_FS */
 
 struct proto tcp_prot = {
+#ifdef CONFIG_BPF_SYSCALL
+	.psock_update_sk_prot = tcp_bpf_update_proto,
+#endif
 	.name			= "TCP",
 	.owner			= THIS_MODULE,
 	.close			= tcp_close,

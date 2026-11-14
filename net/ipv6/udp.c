@@ -1641,6 +1641,9 @@ void udp6_proc_exit(struct net *net)
 /* ------------------------------------------------------------------------ */
 
 struct proto udpv6_prot = {
+#ifdef CONFIG_BPF_SYSCALL
+	.psock_update_sk_prot = udp_bpf_update_proto,
+#endif
 	.name			= "UDPv6",
 	.owner			= THIS_MODULE,
 	.close			= udp_lib_close,

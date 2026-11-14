@@ -526,4 +526,7 @@ static inline void udp_state_bpf(struct sock *sk)
 	udp_call_bpf(sk, BPF_SOCK_OPS_VOIP_CB, 0, NULL);
 }
 
+struct sk_psock;
+int udp_bpf_update_proto(struct sock *, struct sk_psock *, bool);
+int udp_read_sock(struct sock *, read_descriptor_t *, sk_read_actor_t);
 #endif	/* _UDP_H */

@@ -2,6 +2,7 @@
 /* Copyright (c) 2017 - 2018 Covalent IO, Inc. http://covalent.io */
 
 #include <linux/bpf.h>
+#include <linux/btf_ids.h>
 #include <linux/filter.h>
 #include <linux/errno.h>
 #include <linux/file.h>
@@ -12,6 +13,7 @@
 #include <linux/jhash.h>
 #include <linux/sock_diag.h>
 #include <net/tcp.h>
+#include <net/udp.h>
 
 struct bpf_stab {
 	struct bpf_map map;
@@ -186,27 +188,13 @@ static void sock_map_unref(struct sock *sk, void *link_raw)
 
 static int sock_map_init_proto(struct sock *sk)
 {
-	struct sk_psock *psock;
-	struct proto *prot;
+	struct sk_psock *psock = sk_psock(sk);
 
 	sock_owned_by_me(sk);
-
-	rcu_read_lock();
-	psock = sk_psock(sk);
-	if (unlikely(!psock)) {
-		rcu_read_unlock();
+	if (!psock || !psock->sk_proto->psock_update_sk_prot)
 		return -EINVAL;
-	}
-
-	prot = tcp_bpf_get_proto(sk, psock);
-	if (IS_ERR(prot)) {
-		rcu_read_unlock();
-		return PTR_ERR(prot);
-	}
-
-	sk_psock_update_proto(sk, psock, prot);
-	rcu_read_unlock();
-	return 0;
+	psock->psock_update_sk_prot = psock->sk_proto->psock_update_sk_prot;
+	return psock->psock_update_sk_prot(sk, psock, false);
 }
 
 static struct sk_psock *sock_map_psock_get_checked(struct sock *sk)
@@ -216,7 +204,7 @@ static struct sk_psock *sock_map_psock_get_checked(struct sock *sk)
 	rcu_read_lock();
 	psock = sk_psock(sk);
 	if (psock) {
-		if (sk->sk_prot->recvmsg != tcp_bpf_recvmsg) {
+		if (sk->sk_prot->close != sock_map_close) {
 			psock = ERR_PTR(-EBUSY);
 			goto out;
 		}
@@ -500,9 +488,16 @@ static int sock_map_get_next_key(struct bpf_map *map, void *key, void *next)
 	return 0;
 }
 
+static bool sk_is_tcp(const struct sock *sk)
+{
+	return sk->sk_type == SOCK_STREAM && sk->sk_protocol == IPPROTO_TCP &&
+	       (sk->sk_family == AF_INET || sk->sk_family == AF_INET6);
+}
+
 static bool sock_map_redirect_allowed(const struct sock *sk)
 {
-	return sk->sk_state != TCP_LISTEN;
+	return sk_is_tcp(sk) ? sk->sk_state != TCP_LISTEN :
+			       sk->sk_state == TCP_ESTABLISHED;
 }
 
 static int sock_map_update_common(struct bpf_map *map, u32 idx,
@@ -572,13 +567,13 @@ static bool sock_map_op_okay(const struct bpf_sock_ops_kern *ops)
 
 static bool sock_map_sk_is_suitable(const struct sock *sk)
 {
-	return sk->sk_type == SOCK_STREAM &&
-	       sk->sk_protocol == IPPROTO_TCP;
+	return !!sk->sk_prot->psock_update_sk_prot;
 }
 
 static bool sock_map_sk_state_allowed(const struct sock *sk)
 {
-	return (1 << sk->sk_state) & (TCPF_ESTABLISHED | TCPF_LISTEN);
+	return !sk_is_tcp(sk) ||
+	       ((1 << sk->sk_state) & (TCPF_ESTABLISHED | TCPF_LISTEN));
 }
 
 static int sock_hash_update_common(struct bpf_map *map, void *key,
@@ -713,6 +708,9 @@ BPF_CALL_4(bpf_msg_redirect_map, struct sk_msg *, msg,
 	if (unlikely(!sk || !sock_map_redirect_allowed(sk)))
 		return SK_DROP;
 
+	if (!(flags & BPF_F_INGRESS) && !sk_is_tcp(sk))
+		return SK_DROP;
+
 	msg->flags = flags;
 	msg->sk_redir = sk;
 	return SK_PASS;
@@ -726,6 +724,122 @@ const struct bpf_func_proto bpf_msg_redirect_map_proto = {
 	.arg2_type      = ARG_CONST_MAP_PTR,
 	.arg3_type      = ARG_ANYTHING,
 	.arg4_type      = ARG_ANYTHING,
+};
+
+struct sock_map_seq_info {
+	struct bpf_map *map;
+	struct sock *sk;
+	u32 index;
+};
+
+struct bpf_iter__sockmap {
+	__bpf_md_ptr(struct bpf_iter_meta *, meta);
+	__bpf_md_ptr(struct bpf_map *, map);
+	__bpf_md_ptr(void *, key);
+	__bpf_md_ptr(struct sock *, sk);
+};
+
+DEFINE_BPF_ITER_FUNC(sockmap, struct bpf_iter_meta *meta,
+		     struct bpf_map *map, void *key,
+		     struct sock *sk)
+
+static void *sock_map_seq_lookup_elem(struct sock_map_seq_info *info)
+{
+	if (unlikely(info->index >= info->map->max_entries))
+		return NULL;
+
+	info->sk = __sock_map_lookup_elem(info->map, info->index);
+
+	/* can't return sk directly, since that might be NULL */
+	return info;
+}
+
+static void *sock_map_seq_start(struct seq_file *seq, loff_t *pos)
+	__acquires(rcu)
+{
+	struct sock_map_seq_info *info = seq->private;
+
+	if (*pos == 0)
+		++*pos;
+
+	/* pairs with sock_map_seq_stop */
+	rcu_read_lock();
+	return sock_map_seq_lookup_elem(info);
+}
+
+static void *sock_map_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+	__must_hold(rcu)
+{
+	struct sock_map_seq_info *info = seq->private;
+
+	++*pos;
+	++info->index;
+
+	return sock_map_seq_lookup_elem(info);
+}
+
+static int sock_map_seq_show(struct seq_file *seq, void *v)
+	__must_hold(rcu)
+{
+	struct sock_map_seq_info *info = seq->private;
+	struct bpf_iter__sockmap ctx = {};
+	struct bpf_iter_meta meta;
+	struct bpf_prog *prog;
+
+	meta.seq = seq;
+	prog = bpf_iter_get_info(&meta, !v);
+	if (!prog)
+		return 0;
+
+	ctx.meta = &meta;
+	ctx.map = info->map;
+	if (v) {
+		ctx.key = &info->index;
+		ctx.sk = info->sk;
+	}
+
+	return bpf_iter_run_prog(prog, &ctx);
+}
+
+static void sock_map_seq_stop(struct seq_file *seq, void *v)
+	__releases(rcu)
+{
+	if (!v)
+		(void)sock_map_seq_show(seq, NULL);
+
+	/* pairs with sock_map_seq_start */
+	rcu_read_unlock();
+}
+
+static const struct seq_operations sock_map_seq_ops = {
+	.start	= sock_map_seq_start,
+	.next	= sock_map_seq_next,
+	.stop	= sock_map_seq_stop,
+	.show	= sock_map_seq_show,
+};
+
+static int sock_map_init_seq_private(void *priv_data,
+				     struct bpf_iter_aux_info *aux)
+{
+	struct sock_map_seq_info *info = priv_data;
+
+	bpf_map_inc_with_uref(aux->map);
+	info->map = aux->map;
+	return 0;
+}
+
+static void sock_map_fini_seq_private(void *priv_data)
+{
+	struct sock_map_seq_info *info = priv_data;
+
+	bpf_map_put_with_uref(info->map);
+}
+
+static const struct bpf_iter_seq_info sock_map_iter_seq_info = {
+	.seq_ops		= &sock_map_seq_ops,
+	.init_seq_private	= sock_map_init_seq_private,
+	.fini_seq_private	= sock_map_fini_seq_private,
+	.seq_priv_size		= sizeof(struct sock_map_seq_info),
 };
 
 static int sock_map_btf_id;
@@ -742,6 +856,7 @@ const struct bpf_map_ops sock_map_ops = {
 	.map_check_btf		= map_check_no_btf,
 	.map_btf_name		= "bpf_stab",
 	.map_btf_id		= &sock_map_btf_id,
+	.iter_seq_info		= &sock_map_iter_seq_info,
 };
 
 struct bpf_shtab_elem {
@@ -1178,6 +1293,9 @@ BPF_CALL_4(bpf_msg_redirect_hash, struct sk_msg *, msg,
 	if (unlikely(!sk || !sock_map_redirect_allowed(sk)))
 		return SK_DROP;
 
+	if (!(flags & BPF_F_INGRESS) && !sk_is_tcp(sk))
+		return SK_DROP;
+
 	msg->flags = flags;
 	msg->sk_redir = sk;
 	return SK_PASS;
@@ -1191,6 +1309,130 @@ const struct bpf_func_proto bpf_msg_redirect_hash_proto = {
 	.arg2_type      = ARG_CONST_MAP_PTR,
 	.arg3_type      = ARG_PTR_TO_MAP_KEY,
 	.arg4_type      = ARG_ANYTHING,
+};
+
+struct sock_hash_seq_info {
+	struct bpf_map *map;
+	struct bpf_shtab *htab;
+	u32 bucket_id;
+};
+
+static void *sock_hash_seq_find_next(struct sock_hash_seq_info *info,
+				     struct bpf_shtab_elem *prev_elem)
+{
+	const struct bpf_shtab *htab = info->htab;
+	struct bpf_shtab_bucket *bucket;
+	struct bpf_shtab_elem *elem;
+	struct hlist_node *node;
+
+	/* try to find next elem in the same bucket */
+	if (prev_elem) {
+		node = rcu_dereference(hlist_next_rcu(&prev_elem->node));
+		elem = hlist_entry_safe(node, struct bpf_shtab_elem, node);
+		if (elem)
+			return elem;
+
+		/* no more elements, continue in the next bucket */
+		info->bucket_id++;
+	}
+
+	for (; info->bucket_id < htab->buckets_num; info->bucket_id++) {
+		bucket = &htab->buckets[info->bucket_id];
+		node = rcu_dereference(hlist_first_rcu(&bucket->head));
+		elem = hlist_entry_safe(node, struct bpf_shtab_elem, node);
+		if (elem)
+			return elem;
+	}
+
+	return NULL;
+}
+
+static void *sock_hash_seq_start(struct seq_file *seq, loff_t *pos)
+	__acquires(rcu)
+{
+	struct sock_hash_seq_info *info = seq->private;
+
+	if (*pos == 0)
+		++*pos;
+
+	/* pairs with sock_hash_seq_stop */
+	rcu_read_lock();
+	return sock_hash_seq_find_next(info, NULL);
+}
+
+static void *sock_hash_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+	__must_hold(rcu)
+{
+	struct sock_hash_seq_info *info = seq->private;
+
+	++*pos;
+	return sock_hash_seq_find_next(info, v);
+}
+
+static int sock_hash_seq_show(struct seq_file *seq, void *v)
+	__must_hold(rcu)
+{
+	struct sock_hash_seq_info *info = seq->private;
+	struct bpf_iter__sockmap ctx = {};
+	struct bpf_shtab_elem *elem = v;
+	struct bpf_iter_meta meta;
+	struct bpf_prog *prog;
+
+	meta.seq = seq;
+	prog = bpf_iter_get_info(&meta, !elem);
+	if (!prog)
+		return 0;
+
+	ctx.meta = &meta;
+	ctx.map = info->map;
+	if (elem) {
+		ctx.key = elem->key;
+		ctx.sk = elem->sk;
+	}
+
+	return bpf_iter_run_prog(prog, &ctx);
+}
+
+static void sock_hash_seq_stop(struct seq_file *seq, void *v)
+	__releases(rcu)
+{
+	if (!v)
+		(void)sock_hash_seq_show(seq, NULL);
+
+	/* pairs with sock_hash_seq_start */
+	rcu_read_unlock();
+}
+
+static const struct seq_operations sock_hash_seq_ops = {
+	.start	= sock_hash_seq_start,
+	.next	= sock_hash_seq_next,
+	.stop	= sock_hash_seq_stop,
+	.show	= sock_hash_seq_show,
+};
+
+static int sock_hash_init_seq_private(void *priv_data,
+				      struct bpf_iter_aux_info *aux)
+{
+	struct sock_hash_seq_info *info = priv_data;
+
+	bpf_map_inc_with_uref(aux->map);
+	info->map = aux->map;
+	info->htab = container_of(aux->map, struct bpf_shtab, map);
+	return 0;
+}
+
+static void sock_hash_fini_seq_private(void *priv_data)
+{
+	struct sock_hash_seq_info *info = priv_data;
+
+	bpf_map_put_with_uref(info->map);
+}
+
+static const struct bpf_iter_seq_info sock_hash_iter_seq_info = {
+	.seq_ops		= &sock_hash_seq_ops,
+	.init_seq_private	= sock_hash_init_seq_private,
+	.fini_seq_private	= sock_hash_fini_seq_private,
+	.seq_priv_size		= sizeof(struct sock_hash_seq_info),
 };
 
 static int sock_hash_map_btf_id;
@@ -1207,6 +1449,7 @@ const struct bpf_map_ops sock_hash_ops = {
 	.map_check_btf		= map_check_no_btf,
 	.map_btf_name		= "bpf_shtab",
 	.map_btf_id		= &sock_hash_map_btf_id,
+	.iter_seq_info		= &sock_hash_iter_seq_info,
 };
 
 static struct sk_psock_progs *sock_map_progs(struct bpf_map *map)
@@ -1291,18 +1534,19 @@ void sock_map_unhash(struct sock *sk)
 
 	rcu_read_lock();
 	psock = sk_psock(sk);
-	if (unlikely(!psock)) {
-		rcu_read_unlock();
-		if (sk->sk_prot->unhash)
-			sk->sk_prot->unhash(sk);
-		return;
+	if (psock) {
+		saved_unhash = psock->saved_unhash;
+		sock_map_remove_links(sk, psock);
+	} else {
+		saved_unhash = READ_ONCE(sk->sk_prot)->unhash;
 	}
-
-	saved_unhash = psock->saved_unhash;
-	sock_map_remove_links(sk, psock);
 	rcu_read_unlock();
-	saved_unhash(sk);
+	if (WARN_ON_ONCE(saved_unhash == sock_map_unhash))
+		return;
+	if (saved_unhash)
+		saved_unhash(sk);
 }
+EXPORT_SYMBOL_GPL(sock_map_unhash);
 
 void sock_map_destroy(struct sock *sk)
 {
@@ -1313,8 +1557,9 @@ void sock_map_destroy(struct sock *sk)
 	psock = sk_psock_get(sk);
 	if (unlikely(!psock)) {
 		rcu_read_unlock();
-		if (sk->sk_prot->destroy)
-			sk->sk_prot->destroy(sk);
+		saved_destroy = READ_ONCE(sk->sk_prot)->destroy;
+		if (!WARN_ON_ONCE(saved_destroy == sock_map_destroy) && saved_destroy)
+			saved_destroy(sk);
 		return;
 	}
 
@@ -1322,7 +1567,8 @@ void sock_map_destroy(struct sock *sk)
 	sock_map_remove_links(sk, psock);
 	rcu_read_unlock();
 	sk_psock_put(sk, psock);
-	saved_destroy(sk);
+	if (!WARN_ON_ONCE(saved_destroy == sock_map_destroy) && saved_destroy)
+		saved_destroy(sk);
 }
 EXPORT_SYMBOL_GPL(sock_map_destroy);
 
@@ -1333,16 +1579,85 @@ void sock_map_close(struct sock *sk, long timeout)
 
 	lock_sock(sk);
 	rcu_read_lock();
-	psock = sk_psock(sk);
-	if (unlikely(!psock)) {
-		rcu_read_unlock();
-		release_sock(sk);
-		return sk->sk_prot->close(sk, timeout);
+	psock = sk_psock_get(sk);
+	if (psock) {
+		saved_close = psock->saved_close;
+		/* Keep the psock alive until its worker is drained. In particular UNIX
+		 * release must not clear sk_socket while an unlocked send is active.
+		 */
+		sk_psock_clear_state(psock, SK_PSOCK_TX_ENABLED);
+		sock_map_remove_links(sk, psock);
+	} else {
+		saved_close = READ_ONCE(sk->sk_prot)->close;
 	}
-
-	saved_close = psock->saved_close;
-	sock_map_remove_links(sk, psock);
 	rcu_read_unlock();
 	release_sock(sk);
-	saved_close(sk, timeout);
+	if (psock) {
+		cancel_work_sync(&psock->work);
+		sk_psock_put(sk, psock);
+	}
+	if (WARN_ON_ONCE(saved_close == sock_map_close))
+		return;
+	if (saved_close)
+		saved_close(sk, timeout);
 }
+EXPORT_SYMBOL_GPL(sock_map_close);
+
+static int sock_map_iter_attach_target(struct bpf_prog *prog,
+				       union bpf_iter_link_info *linfo,
+				       struct bpf_iter_aux_info *aux)
+{
+	struct bpf_map *map;
+	int err = -EINVAL;
+
+	if (!linfo->map.map_fd)
+		return -EBADF;
+
+	map = bpf_map_get_with_uref(linfo->map.map_fd);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+
+	if (map->map_type != BPF_MAP_TYPE_SOCKMAP &&
+	    map->map_type != BPF_MAP_TYPE_SOCKHASH)
+		goto put_map;
+
+	if (prog->aux->max_rdonly_access > map->key_size) {
+		err = -EACCES;
+		goto put_map;
+	}
+
+	aux->map = map;
+	return 0;
+
+put_map:
+	bpf_map_put_with_uref(map);
+	return err;
+}
+
+static void sock_map_iter_detach_target(struct bpf_iter_aux_info *aux)
+{
+	bpf_map_put_with_uref(aux->map);
+}
+
+static struct bpf_iter_reg sock_map_iter_reg = {
+	.target			= "sockmap",
+	.attach_target		= sock_map_iter_attach_target,
+	.detach_target		= sock_map_iter_detach_target,
+	.show_fdinfo		= bpf_iter_map_show_fdinfo,
+	.fill_link_info		= bpf_iter_map_fill_link_info,
+	.ctx_arg_info_size	= 2,
+	.ctx_arg_info		= {
+		{ offsetof(struct bpf_iter__sockmap, key),
+		  PTR_TO_BUF | PTR_MAYBE_NULL | MEM_RDONLY },
+		{ offsetof(struct bpf_iter__sockmap, sk),
+		  PTR_TO_BTF_ID_OR_NULL },
+	},
+};
+
+static int __init bpf_sockmap_iter_init(void)
+{
+	sock_map_iter_reg.ctx_arg_info[1].btf_id =
+		btf_sock_ids[BTF_SOCK_TYPE_SOCK];
+	return bpf_iter_reg_target(&sock_map_iter_reg);
+}
+late_initcall(bpf_sockmap_iter_init);

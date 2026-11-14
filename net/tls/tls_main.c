@@ -285,6 +285,7 @@ static void tls_sk_proto_close(struct sock *sk, long timeout)
 #endif
 		if (sk->sk_write_space == tls_write_space)
 			sk->sk_write_space = ctx->sk_write_space;
+		inet_csk(sk)->icsk_ulp_data = NULL;
 		tls_ctx_free(ctx);
 		ctx = NULL;
 	}
@@ -295,8 +296,10 @@ skip_tx_cleanup:
 	/* free ctx for TLS_HW_RECORD, used by tcp_set_state
 	 * for sk->sk_prot->unhash [tls_hw_unhash]
 	 */
-	if (free_ctx)
+	if (free_ctx) {
+		inet_csk(sk)->icsk_ulp_data = NULL;
 		tls_ctx_free(ctx);
+	}
 }
 
 static int do_tls_getsockopt_tx(struct sock *sk, char __user *optval,
@@ -706,12 +709,28 @@ void tls_unregister_device(struct tls_device *device)
 }
 EXPORT_SYMBOL(tls_unregister_device);
 
+static void tls_update(struct sock *sk, struct proto *p,
+		       void (*write_space)(struct sock *sk))
+{
+	struct tls_context *ctx = tls_get_ctx(sk);
+
+	if (ctx) {
+		ctx->sk_write_space = write_space;
+		ctx->sk_proto_close = p->close;
+		ctx->unhash = p->unhash;
+	} else {
+		WRITE_ONCE(sk->sk_prot, p);
+		sk->sk_write_space = write_space;
+	}
+}
+
 static struct tcp_ulp_ops tcp_tls_ulp_ops __read_mostly = {
 	.name			= "tls",
 	.uid			= TCP_ULP_TLS,
 	.user_visible		= true,
 	.owner			= THIS_MODULE,
 	.init			= tls_init,
+	.update			= tls_update,
 };
 
 static int __init tls_register(void)

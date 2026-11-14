@@ -2002,6 +2002,9 @@ void tcp6_proc_exit(struct net *net)
 #endif
 
 struct proto tcpv6_prot = {
+#ifdef CONFIG_BPF_SYSCALL
+	.psock_update_sk_prot = tcp_bpf_update_proto,
+#endif
 	.name			= "TCPv6",
 	.owner			= THIS_MODULE,
 	.close			= tcp_close,

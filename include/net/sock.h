@@ -1141,7 +1141,10 @@ static inline void sk_prot_clear_nulls(struct sock *sk, int size)
 /* Networking protocol blocks we attach to sockets.
  * socket layer -> transport layer interface
  */
+struct sk_psock;
+
 struct proto {
+	int (*psock_update_sk_prot)(struct sock *, struct sk_psock *, bool);
 	void			(*close)(struct sock *sk,
 					long timeout);
 	int			(*pre_connect)(struct sock *sk,

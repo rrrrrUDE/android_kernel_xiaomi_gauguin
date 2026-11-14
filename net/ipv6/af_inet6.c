@@ -656,6 +656,7 @@ const struct proto_ops inet6_dgram_ops = {
 	.compat_setsockopt = compat_sock_common_setsockopt,
 	.compat_getsockopt = compat_sock_common_getsockopt,
 #endif
+	.read_sock = udp_read_sock,
 };
 
 static const struct net_proto_family inet6_family_ops = {

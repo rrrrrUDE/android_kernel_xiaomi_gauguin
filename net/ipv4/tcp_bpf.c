@@ -8,6 +8,7 @@
 #include <linux/wait.h>
 
 #include <net/inet_common.h>
+#include <net/af_unix.h>
 #include <net/tls.h>
 
 static bool tcp_bpf_stream_read(const struct sock *sk)
@@ -168,6 +169,8 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 		return -ENOMEM;
 
 	lock_sock(sk);
+	if (sk->sk_family == AF_UNIX)
+		mutex_lock(&unix_sk(sk)->iolock);
 	tmp->sg.start = msg->sg.start;
 	i = msg->sg.start;
 	do {
@@ -189,21 +192,29 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 		tmp->sg.end = i;
 		if (apply) {
 			apply_bytes -= size;
-			if (!apply_bytes)
+			if (!apply_bytes) {
+				if (sge->length)
+					sk_msg_iter_var_prev(i);
 				break;
+			}
 		}
 	} while (i != msg->sg.end);
 
 	if (!ret) {
 		msg->sg.start = i;
-		msg->sg.size -= apply_bytes;
+		msg->sg.size -= copied;
 		sk_psock_queue_msg(psock, tmp);
-		sk->sk_data_ready(sk);
+		if (psock->parser.verdict_enabled)
+			psock->parser.saved_data_ready(sk);
+		else
+			sk->sk_data_ready(sk);
 	} else {
 		sk_msg_free(sk, tmp);
 		kfree(tmp);
 	}
 
+	if (sk->sk_family == AF_UNIX)
+		mutex_unlock(&unix_sk(sk)->iolock);
 	release_sock(sk);
 	return ret;
 }
@@ -283,10 +294,8 @@ int tcp_bpf_sendmsg_redir(struct sock *sk, struct sk_msg *msg,
 	struct sk_psock *psock = sk_psock_get(sk);
 	int ret;
 
-	if (unlikely(!psock)) {
-		sk_msg_free(sk, msg);
-		return 0;
-	}
+	if (unlikely(!psock))
+		return -EPIPE;
 	ret = ingress ? bpf_tcp_ingress(sk, psock, msg, bytes, flags) :
 			tcp_bpf_push_locked(sk, msg, bytes, flags, false);
 	sk_psock_put(sk, psock);
@@ -520,7 +529,7 @@ out_err:
 	return copied ? copied : err;
 }
 
-#ifdef CONFIG_BPF_STREAM_PARSER
+#ifdef CONFIG_BPF_SYSCALL
 enum {
 	TCP_BPF_IPV4,
 	TCP_BPF_IPV6,
@@ -588,7 +597,8 @@ struct proto *tcp_bpf_get_proto(struct sock *sk, struct sk_psock *psock)
 	int family = sk->sk_family == AF_INET6 ? TCP_BPF_IPV6 : TCP_BPF_IPV4;
 	int config = psock->progs.msg_parser   ? TCP_BPF_TX   : TCP_BPF_BASE;
 
-	if (!psock->sk_proto) {
+	if (sk->sk_prot != &tcp_bpf_prots[family][TCP_BPF_BASE] &&
+	    sk->sk_prot != &tcp_bpf_prots[family][TCP_BPF_TX]) {
 		struct proto *ops = READ_ONCE(sk->sk_prot);
 
 		if (tcp_bpf_assert_proto_ops(ops))
@@ -600,6 +610,29 @@ struct proto *tcp_bpf_get_proto(struct sock *sk, struct sk_psock *psock)
 	return &tcp_bpf_prots[family][config];
 }
 
+int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
+{
+	struct proto *prot;
+
+	if (restore) {
+		if (inet_csk(sk)->icsk_ulp_ops) {
+			WRITE_ONCE(sk->sk_prot->unhash, psock->saved_unhash);
+			tcp_update_ulp(sk, psock->sk_proto,
+				       psock->saved_write_space);
+		} else {
+			sk->sk_write_space = psock->saved_write_space;
+			WRITE_ONCE(sk->sk_prot, psock->sk_proto);
+		}
+		return 0;
+	}
+	prot = tcp_bpf_get_proto(sk, psock);
+	if (IS_ERR(prot))
+		return PTR_ERR(prot);
+	sk_psock_update_proto(sk, psock, prot);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tcp_bpf_update_proto);
+
 /* If a child got cloned from a listening socket that had tcp_bpf
  * protocol callbacks installed, we need to restore the callbacks to
  * the default ones because the child does not inherit the psock state
@@ -610,7 +643,8 @@ void tcp_bpf_clone(const struct sock *sk, struct sock *newsk)
 	int family = sk->sk_family == AF_INET6 ? TCP_BPF_IPV6 : TCP_BPF_IPV4;
 	struct proto *prot = newsk->sk_prot;
 
-	if (prot == &tcp_bpf_prots[family][TCP_BPF_BASE])
+	if (prot == &tcp_bpf_prots[family][TCP_BPF_BASE] ||
+	    prot == &tcp_bpf_prots[family][TCP_BPF_TX])
 		newsk->sk_prot = sk->sk_prot_creator;
 }
-#endif /* CONFIG_BPF_STREAM_PARSER */
+#endif /* CONFIG_BPF_SYSCALL */

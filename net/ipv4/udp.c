@@ -79,6 +79,7 @@
 
 #define pr_fmt(fmt) "UDP: " fmt
 
+#include <linux/skmsg.h>
 #include <linux/uaccess.h>
 #include <asm/ioctls.h>
 #include <linux/bootmem.h>
@@ -1690,6 +1691,36 @@ busy_check:
 }
 EXPORT_SYMBOL(__skb_recv_udp);
 
+int udp_read_sock(struct sock *sk, read_descriptor_t *desc,
+		  sk_read_actor_t recv_actor)
+{
+	int copied = 0;
+	for (;;) {
+		struct sk_buff *skb;
+		int err, used, peeked = 0, off = 0;
+		skb = __skb_recv_udp(sk, 0, 1, &peeked, &off, &err);
+		if (!skb)
+			return copied ? copied : err;
+		if (udp_lib_checksum_complete(skb)) {
+			__UDP_INC_STATS(sock_net(sk), UDP_MIB_CSUMERRORS,
+					IS_UDPLITE(sk));
+			__UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS,
+					IS_UDPLITE(sk));
+			atomic_inc(&sk->sk_drops);
+			skb_consume_udp(sk, skb, skb->len);
+			continue;
+		}
+		used = recv_actor(desc, skb, 0, skb->len);
+		skb_consume_udp(sk, skb, skb->len);
+		if (used <= 0)
+			return copied ? copied : used;
+		copied += used;
+		if (!desc->count)
+			return copied;
+	}
+}
+EXPORT_SYMBOL(udp_read_sock);
+
 /*
  * 	This should be easy, if there is something there we
  * 	return it, otherwise we block.
@@ -2741,6 +2772,12 @@ __poll_t udp_poll(struct file *file, struct socket *sock, poll_table *wait)
 	    !(sk->sk_shutdown & RCV_SHUTDOWN) && first_packet_length(sk) == -1)
 		mask &= ~(EPOLLIN | EPOLLRDNORM);
 
+#ifdef CONFIG_BPF_SYSCALL
+	rcu_read_lock();
+	if (sk_msg_is_readable(sk))
+		mask |= EPOLLIN | EPOLLRDNORM;
+	rcu_read_unlock();
+#endif
 	return mask;
 
 }
@@ -2768,6 +2805,9 @@ out:
 EXPORT_SYMBOL_GPL(udp_abort);
 
 struct proto udp_prot = {
+#ifdef CONFIG_BPF_SYSCALL
+	.psock_update_sk_prot = udp_bpf_update_proto,
+#endif
 	.name			= "UDP",
 	.owner			= THIS_MODULE,
 	.close			= udp_lib_close,

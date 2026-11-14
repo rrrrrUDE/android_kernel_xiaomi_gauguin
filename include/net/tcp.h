@@ -2167,6 +2167,9 @@ struct tcp_ulp_ops {
 	int (*init)(struct sock *sk);
 	/* cleanup ulp */
 	void (*release)(struct sock *sk);
+	/* Restore the underlying protocol after a psock is detached. */
+	void (*update)(struct sock *sk, struct proto *proto,
+		       void (*write_space)(struct sock *sk));
 
 	int		uid;
 	char		name[TCP_ULP_NAME_MAX];
@@ -2178,6 +2181,8 @@ void tcp_unregister_ulp(struct tcp_ulp_ops *type);
 int tcp_set_ulp(struct sock *sk, const char *name);
 void tcp_get_available_ulp(char *buf, size_t len);
 void tcp_cleanup_ulp(struct sock *sk);
+void tcp_update_ulp(struct sock *sk, struct proto *proto,
+		    void (*write_space)(struct sock *sk));
 
 #define MODULE_ALIAS_TCP_ULP(name)				\
 	__MODULE_INFO(alias, alias_userspace, name);		\
@@ -2186,14 +2191,16 @@ void tcp_cleanup_ulp(struct sock *sk);
 struct sk_msg;
 struct sk_psock;
 
-#ifdef CONFIG_BPF_STREAM_PARSER
+int tcp_set_window_clamp(struct sock *sk, int val);
+
+#ifdef CONFIG_BPF_SYSCALL
 struct proto *tcp_bpf_get_proto(struct sock *sk, struct sk_psock *psock);
 void tcp_bpf_clone(const struct sock *sk, struct sock *newsk);
 #else
 static inline void tcp_bpf_clone(const struct sock *sk, struct sock *newsk)
 {
 }
-#endif /* CONFIG_BPF_STREAM_PARSER */
+#endif /* CONFIG_BPF_SYSCALL */
 
 int tcp_bpf_sendmsg_redir(struct sock *sk, struct sk_msg *msg, u32 bytes,
 			  int flags);
@@ -2361,4 +2368,6 @@ void clean_acked_data_disable(struct inet_connection_sock *icsk);
 void clean_acked_data_flush(void);
 #endif
 
+struct sk_psock;
+int tcp_bpf_update_proto(struct sock *, struct sk_psock *, bool);
 #endif	/* _TCP_H */

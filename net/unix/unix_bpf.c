@@ -7,6 +7,7 @@
 #include <net/af_unix.h>
 
 extern struct proto unix_proto;
+extern struct proto unix_stream_proto;
 extern int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
 			      size_t size, int flags);
 extern int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg,
@@ -52,9 +53,9 @@ static int __unix_recvmsg(struct sock *sk, struct msghdr *msg,
 	if (!sock)
 		return -EINVAL;
 	if (sk->sk_type == SOCK_DGRAM)
-		return unix_dgram_recvmsg(sock, msg, len, flags);
+		return __unix_dgram_recvmsg(sock, msg, len, flags);
 	else
-		return unix_stream_recvmsg(sock, msg, len, flags);
+		return __unix_stream_recvmsg(sock, msg, len, flags);
 }
 
 static int unix_bpf_recvmsg(struct sock *sk, struct msghdr *msg,
@@ -67,6 +68,8 @@ static int unix_bpf_recvmsg(struct sock *sk, struct msghdr *msg,
 
 	if (!len)
 		return 0;
+	if (nonblock)
+		flags |= MSG_DONTWAIT;
 
 	psock = sk_psock_get(sk);
 	if (unlikely(!psock))
@@ -182,6 +185,6 @@ int unix_stream_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool r
 void __init unix_bpf_build_proto(void)
 {
 	unix_dgram_bpf_rebuild_protos(&unix_dgram_bpf_prot, &unix_proto);
-	unix_stream_bpf_rebuild_protos(&unix_stream_bpf_prot, &unix_proto);
-
+	unix_stream_bpf_rebuild_protos(&unix_stream_bpf_prot,
+				       &unix_stream_proto);
 }

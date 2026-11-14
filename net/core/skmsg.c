@@ -8,6 +8,7 @@
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <net/tls.h>
+#include <net/af_unix.h>
 
 #define SK_PSOCK_SKB_STRP	(1U << 31)
 
@@ -508,10 +509,39 @@ static int sk_psock_skb_ingress(struct sk_psock *psock, struct sk_buff *skb,
 static int sk_psock_handle_skb(struct sk_psock *psock, struct sk_buff *skb,
 			       u32 off, u32 len, bool ingress)
 {
-	if (ingress)
-		return sk_psock_skb_ingress(psock, skb, off, len);
-	else
-		return skb_send_sock_locked(psock->sk, skb, off, len);
+	struct sock *sk = psock->sk;
+	struct socket *sock = sk->sk_socket;
+	struct msghdr msg = { .msg_flags = MSG_DONTWAIT };
+	struct kvec vec;
+	void *data;
+	int ret;
+
+	if (ingress) {
+		if (sk->sk_family == AF_UNIX)
+			mutex_lock(&unix_sk(sk)->iolock);
+		ret = sk_psock_skb_ingress(psock, skb, off, len);
+		if (sk->sk_family == AF_UNIX)
+			mutex_unlock(&unix_sk(sk)->iolock);
+		return ret;
+	}
+	if (sock->ops->sendmsg_locked)
+		return skb_send_sock_locked(sk, skb, off, len);
+	/* UDP and UNIX do not provide the TCP-only sendmsg_locked operation.
+	 * Flatten one skb into one sendmsg, preserving datagram boundaries.
+	 */
+	data = kvmalloc(len, GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+	ret = skb_copy_bits(skb, off, data, len);
+	if (!ret) {
+		vec.iov_base = data;
+		vec.iov_len = len;
+		release_sock(sk);
+		ret = kernel_sendmsg(sock, &msg, &vec, 1, len);
+		lock_sock(sk);
+	}
+	kvfree(data);
+	return ret;
 }
 
 static void sk_psock_backlog(struct work_struct *work)
@@ -519,12 +549,25 @@ static void sk_psock_backlog(struct work_struct *work)
 	struct sk_psock *psock = container_of(work, struct sk_psock, work);
 	struct sk_psock_work_state *state = &psock->work_state;
 	struct sk_buff *skb;
+	struct sk_psock *current_psock;
 	bool ingress;
 	u32 len, off;
 	int ret;
 
-	/* Lock sock to avoid losing sk_socket during loop. */
+	/* Hold the psock across unlocked UDP/UNIX sends. */
+	if (!sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
+		return;
+	current_psock = sk_psock_get(psock->sk);
+	if (current_psock != psock) {
+		if (current_psock)
+			sk_psock_put(psock->sk, current_psock);
+		return;
+	}
+
+	/* Serialize ingress messages with recvmsg. */
 	lock_sock(psock->sk);
+	if (!sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
+		goto end;
 	if (state->skb) {
 		skb = state->skb;
 		len = state->len;
@@ -571,6 +614,7 @@ start:
 	}
 end:
 	release_sock(psock->sk);
+	sk_psock_put(psock->sk, psock);
 }
 
 struct sk_psock *sk_psock_init(struct sock *sk, int node)
@@ -585,6 +629,10 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
 	psock->sk = sk;
 	psock->eval =  __SK_NONE;
 	psock->saved_destroy = prot->destroy;
+	psock->saved_unhash = prot->unhash;
+	psock->saved_close = prot->close;
+	psock->saved_write_space = sk->sk_write_space;
+	psock->sk_proto = prot;
 
 	INIT_LIST_HEAD(&psock->link);
 	spin_lock_init(&psock->link_lock);
@@ -630,6 +678,8 @@ void __sk_psock_purge_ingress_msg(struct sk_psock *psock)
 static void sk_psock_zap_ingress(struct sk_psock *psock)
 {
 	__skb_queue_purge(&psock->ingress_skb);
+	kfree_skb(psock->work_state.skb);
+	psock->work_state.skb = NULL;
 	__sk_psock_purge_ingress_msg(psock);
 }
 

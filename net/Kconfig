@@ -424,6 +424,7 @@ config SOCK_VALIDATE_XMIT
 	bool
 
 config NET_SOCK_MSG
+	select STREAM_PARSER
 	bool
 	default n
 	help

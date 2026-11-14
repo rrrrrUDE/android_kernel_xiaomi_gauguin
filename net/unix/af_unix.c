@@ -82,6 +82,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/skmsg.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/signal.h>
@@ -699,6 +700,48 @@ static int unix_set_peek_off(struct sock *sk, int val)
 	return 0;
 }
 
+static int unix_read_sock(struct sock *sk, read_descriptor_t *desc,
+			  sk_read_actor_t recv_actor)
+{
+	int copied = 0;
+
+	while (1) {
+		struct unix_sock *u = unix_sk(sk);
+		struct sk_buff *skb;
+		int used, err;
+
+		mutex_lock(&u->iolock);
+		skb = skb_recv_datagram(sk, 0, 1, &err);
+		mutex_unlock(&u->iolock);
+		if (!skb)
+			return err;
+
+		used = recv_actor(desc, skb, 0, skb->len);
+		if (used <= 0) {
+			if (!copied)
+				copied = used;
+			kfree_skb(skb);
+			break;
+		} else if (used <= skb->len) {
+			copied += used;
+		}
+
+		kfree_skb(skb);
+		if (!desc->count)
+			break;
+	}
+
+	return copied;
+}
+
+static int unix_stream_read_sock(struct sock *sk, read_descriptor_t *desc,
+				 sk_read_actor_t recv_actor)
+{
+	if (unlikely(READ_ONCE(sk->sk_state) != TCP_ESTABLISHED))
+		return -ENOTCONN;
+
+	return unix_read_sock(sk, desc, recv_actor);
+}
 
 static const struct proto_ops unix_stream_ops = {
 	.family =	PF_UNIX,
@@ -720,6 +763,7 @@ static const struct proto_ops unix_stream_ops = {
 	.getsockopt =	sock_no_getsockopt,
 	.sendmsg =	unix_stream_sendmsg,
 	.recvmsg =	unix_stream_recvmsg,
+	.read_sock = unix_stream_read_sock,
 	.mmap =		sock_no_mmap,
 	.sendpage =	unix_stream_sendpage,
 	.splice_read =	unix_stream_splice_read,
@@ -746,6 +790,7 @@ static const struct proto_ops unix_dgram_ops = {
 	.getsockopt =	sock_no_getsockopt,
 	.sendmsg =	unix_dgram_sendmsg,
 	.recvmsg =	unix_dgram_recvmsg,
+	.read_sock = unix_read_sock,
 	.mmap =		sock_no_mmap,
 	.sendpage =	sock_no_sendpage,
 	.set_peek_off =	unix_set_peek_off,
@@ -776,13 +821,36 @@ static const struct proto_ops unix_seqpacket_ops = {
 	.set_peek_off =	unix_set_peek_off,
 };
 
+static void unix_close(struct sock *sk, long timeout)
+{
+}
+static void unix_unhash(struct sock *sk)
+{
+}
+
+struct proto unix_stream_proto = {
+	.name = "UNIX-STREAM",
+	.owner = THIS_MODULE,
+	.obj_size = sizeof(struct unix_sock),
+	.close = unix_close,
+	.unhash = unix_unhash,
+#ifdef CONFIG_BPF_SYSCALL
+	.psock_update_sk_prot = unix_stream_bpf_update_proto,
+#endif
+};
+
 struct proto unix_proto = {
+	.close = unix_close,
+#ifdef CONFIG_BPF_SYSCALL
+	.psock_update_sk_prot = unix_dgram_bpf_update_proto,
+#endif
 	.name			= "UNIX",
 	.owner			= THIS_MODULE,
 	.obj_size		= sizeof(struct unix_sock),
 };
 
-static struct sock *unix_create1(struct net *net, struct socket *sock, int kern)
+static struct sock *unix_create1(struct net *net, struct socket *sock, int kern,
+				 int type)
 {
 	struct sock *sk = NULL;
 	struct unix_sock *u;
@@ -791,7 +859,9 @@ static struct sock *unix_create1(struct net *net, struct socket *sock, int kern)
 	if (atomic_long_read(&unix_nr_socks) > 2 * get_max_files())
 		goto out;
 
-	sk = sk_alloc(net, PF_UNIX, GFP_KERNEL, &unix_proto, kern);
+	sk = sk_alloc(net, PF_UNIX, GFP_KERNEL,
+		      type == SOCK_STREAM ? &unix_stream_proto : &unix_proto,
+		      kern);
 	if (!sk)
 		goto out;
 
@@ -852,7 +922,7 @@ static int unix_create(struct net *net, struct socket *sock, int protocol,
 		return -ESOCKTNOSUPPORT;
 	}
 
-	return unix_create1(net, sock, kern) ? 0 : -ENOMEM;
+	return unix_create1(net, sock, kern, sock->type) ? 0 : -ENOMEM;
 }
 
 static int unix_release(struct socket *sock)
@@ -862,6 +932,7 @@ static int unix_release(struct socket *sock)
 	if (!sk)
 		return 0;
 
+	sk->sk_prot->close(sk, 0);
 	unix_release_sock(sk, 0);
 	sock->sk = NULL;
 
@@ -1262,7 +1333,7 @@ static int unix_stream_connect(struct socket *sock, struct sockaddr *uaddr,
 	err = -ENOMEM;
 
 	/* create new sock for complete connection */
-	newsk = unix_create1(sock_net(sk), NULL, 0);
+	newsk = unix_create1(sock_net(sk), NULL, 0, SOCK_STREAM);
 	if (newsk == NULL)
 		goto out;
 
@@ -2105,8 +2176,18 @@ static void unix_copy_addr(struct msghdr *msg, struct sock *sk)
 	}
 }
 
-int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
-			      size_t size, int flags)
+int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
+		       int flags)
+{
+	const struct proto *prot = READ_ONCE(sock->sk->sk_prot);
+	if (prot->recvmsg)
+		return prot->recvmsg(sock->sk, msg, size, flags & MSG_DONTWAIT,
+				     flags & ~MSG_DONTWAIT, NULL);
+	return __unix_dgram_recvmsg(sock, msg, size, flags);
+}
+
+int __unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
+			 int flags)
 {
 	struct scm_cookie scm;
 	struct sock *sk = sock->sk;
@@ -2475,8 +2556,18 @@ static int unix_stream_read_actor(struct sk_buff *skb,
 	return ret ?: chunk;
 }
 
-int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg,
-			       size_t size, int flags)
+int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
+			int flags)
+{
+	const struct proto *prot = READ_ONCE(sock->sk->sk_prot);
+	if (prot->recvmsg)
+		return prot->recvmsg(sock->sk, msg, size, flags & MSG_DONTWAIT,
+				     flags & ~MSG_DONTWAIT, NULL);
+	return __unix_stream_recvmsg(sock, msg, size, flags);
+}
+
+int __unix_stream_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
+			  int flags)
 {
 	struct unix_stream_read_state state = {
 		.recv_actor = unix_stream_read_actor,
@@ -2546,6 +2637,10 @@ static int unix_shutdown(struct socket *sock, int mode)
 		(sk->sk_type == SOCK_STREAM || sk->sk_type == SOCK_SEQPACKET)) {
 
 		int peer_mode = 0;
+		const struct proto *prot = READ_ONCE(other->sk_prot);
+
+		if (prot->unhash)
+			prot->unhash(other);
 
 		if (mode&RCV_SHUTDOWN)
 			peer_mode |= SEND_SHUTDOWN;
@@ -2687,6 +2782,12 @@ static __poll_t unix_poll(struct file *file, struct socket *sock, poll_table *wa
 	if (shutdown & RCV_SHUTDOWN)
 		mask |= EPOLLRDHUP | EPOLLIN | EPOLLRDNORM;
 
+#ifdef CONFIG_BPF_SYSCALL
+	rcu_read_lock();
+	if (sk_msg_is_readable(sk))
+		mask |= EPOLLIN | EPOLLRDNORM;
+	rcu_read_unlock();
+#endif
 	/* readable? */
 	if (!skb_queue_empty_lockless(&sk->sk_receive_queue))
 		mask |= EPOLLIN | EPOLLRDNORM;
@@ -2730,6 +2831,12 @@ static __poll_t unix_dgram_poll(struct file *file, struct socket *sock,
 	if (shutdown == SHUTDOWN_MASK)
 		mask |= EPOLLHUP;
 
+#ifdef CONFIG_BPF_SYSCALL
+	rcu_read_lock();
+	if (sk_msg_is_readable(sk))
+		mask |= EPOLLIN | EPOLLRDNORM;
+	rcu_read_unlock();
+#endif
 	/* readable? */
 	if (!skb_queue_empty_lockless(&sk->sk_receive_queue))
 		mask |= EPOLLIN | EPOLLRDNORM;
@@ -2944,6 +3051,14 @@ static int __init af_unix_init(void)
 		goto out;
 	}
 
+	rc = proto_register(&unix_stream_proto, 1);
+	if (rc) {
+		proto_unregister(&unix_proto);
+		goto out;
+	}
+#ifdef CONFIG_BPF_SYSCALL
+	unix_bpf_build_proto();
+#endif
 	sock_register(&unix_family_ops);
 	register_pernet_subsys(&unix_net_ops);
 out:
@@ -2953,6 +3068,7 @@ out:
 static void __exit af_unix_exit(void)
 {
 	sock_unregister(PF_UNIX);
+	proto_unregister(&unix_stream_proto);
 	proto_unregister(&unix_proto);
 	unregister_pernet_subsys(&unix_net_ops);
 }
