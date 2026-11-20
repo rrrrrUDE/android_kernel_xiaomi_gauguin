@@ -2105,13 +2105,17 @@ EXPORT_SYMBOL(unlock_page_memcg);
 struct obj_stock {
 	struct obj_cgroup *cached_objcg;
 	unsigned long nr_bytes;
+	int cached_nid;
+	int nr_slab_reclaimable_b;
+	int nr_slab_unreclaimable_b;
 };
 static void drain_obj_stock(struct obj_stock *stock);
 #endif
 
 struct memcg_stock_pcp {
 #ifdef CONFIG_MEMCG_KMEM
-	struct obj_stock obj;
+	struct obj_stock task_obj;
+	struct obj_stock irq_obj;
 #endif
 	struct mem_cgroup *cached; /* this never be root cgroup */
 	unsigned int nr_pages;
@@ -2121,6 +2125,27 @@ struct memcg_stock_pcp {
 };
 static DEFINE_PER_CPU(struct memcg_stock_pcp, memcg_stock);
 static DEFINE_MUTEX(percpu_charge_mutex);
+
+#ifdef CONFIG_MEMCG_KMEM
+static struct obj_stock *get_obj_stock(unsigned long *flags)
+{
+	if (likely(in_task())) {
+		*flags = 0;
+		preempt_disable();
+		return &this_cpu_ptr(&memcg_stock)->task_obj;
+	}
+	local_irq_save(*flags);
+	return &this_cpu_ptr(&memcg_stock)->irq_obj;
+}
+
+static void put_obj_stock(unsigned long flags)
+{
+	if (likely(in_task()))
+		preempt_enable();
+	else
+		local_irq_restore(flags);
+}
+#endif
 
 /**
  * consume_stock: Try to consume stocked charge on this cpu.
@@ -2191,7 +2216,10 @@ static void drain_local_stock(struct work_struct *dummy)
 	stock = this_cpu_ptr(&memcg_stock);
 	drain_stock(stock);
 #ifdef CONFIG_MEMCG_KMEM
-	drain_obj_stock(&stock->obj);
+	drain_obj_stock(&stock->irq_obj);
+	/* An IRQ may have interrupted a task using its stock. */
+	if (in_task())
+		drain_obj_stock(&stock->task_obj);
 #endif
 	clear_bit(FLUSHING_CACHED_CHARGE, &stock->flags);
 
@@ -2253,7 +2281,8 @@ static void drain_all_stock(struct mem_cgroup *root_memcg)
 			flush = true;
 #ifdef CONFIG_MEMCG_KMEM
 		/* Ownership may reparent concurrently: drain object credits too. */
-		if (READ_ONCE(stock->obj.cached_objcg))
+		if (READ_ONCE(stock->task_obj.cached_objcg) ||
+		    READ_ONCE(stock->irq_obj.cached_objcg))
 			flush = true;
 #endif
 		rcu_read_unlock();
@@ -2278,7 +2307,8 @@ static int memcg_hotplug_cpu_dead(unsigned int cpu)
 	stock = &per_cpu(memcg_stock, cpu);
 	drain_stock(stock);
 #ifdef CONFIG_MEMCG_KMEM
-	drain_obj_stock(&stock->obj);
+	drain_obj_stock(&stock->task_obj);
+	drain_obj_stock(&stock->irq_obj);
 #endif
 
 	for_each_mem_cgroup(memcg) {
@@ -2938,7 +2968,7 @@ struct mem_cgroup *mem_cgroup_from_obj(void *ptr)
 }
 
 /* Physical backing pages are accounted separately by the slab allocator. */
-void mod_objcg_slab_state(struct obj_cgroup *objcg, int nid,
+static void mod_objcg_slab_state_flush(struct obj_cgroup *objcg, int nid,
 			 bool reclaimable, int bytes)
 {
 	struct mem_cgroup *memcg;
@@ -2956,6 +2986,58 @@ void mod_objcg_slab_state(struct obj_cgroup *objcg, int nid,
 	atomic_long_add(bytes, reclaimable ? &pn->slab_reclaimable_bytes :
 			&pn->slab_unreclaimable_bytes);
 	spin_unlock_irqrestore(&objcg_lock, flags);
+}
+
+static void flush_obj_stock_stats(struct obj_stock *stock)
+{
+	if (stock->nr_slab_reclaimable_b) {
+		mod_objcg_slab_state_flush(stock->cached_objcg, stock->cached_nid,
+					  true, stock->nr_slab_reclaimable_b);
+		stock->nr_slab_reclaimable_b = 0;
+	}
+	if (stock->nr_slab_unreclaimable_b) {
+		mod_objcg_slab_state_flush(stock->cached_objcg, stock->cached_nid,
+					  false, stock->nr_slab_unreclaimable_b);
+		stock->nr_slab_unreclaimable_b = 0;
+	}
+}
+
+void mod_objcg_slab_state(struct obj_cgroup *objcg, int nid,
+			 bool reclaimable, int bytes)
+{
+	struct obj_stock *stock;
+	unsigned long flags;
+	int *delta;
+
+	stock = get_obj_stock(&flags);
+	if (stock->cached_objcg != objcg) {
+		drain_obj_stock(stock);
+		obj_cgroup_get(objcg);
+		stock->cached_objcg = objcg;
+		stock->nr_bytes = atomic_long_xchg(&objcg->nr_charged_bytes, 0);
+	}
+	if (stock->cached_nid != nid) {
+		flush_obj_stock_stats(stock);
+		stock->cached_nid = nid;
+	}
+	delta = reclaimable ? &stock->nr_slab_reclaimable_b :
+		&stock->nr_slab_unreclaimable_b;
+	/* Cache even a large first update, matching the 5.15 stock policy. */
+	if (!*delta) {
+		*delta = bytes;
+		bytes = 0;
+	} else {
+		*delta += bytes;
+		if (*delta > (int)PAGE_SIZE || *delta < -(int)PAGE_SIZE) {
+			bytes = *delta;
+			*delta = 0;
+		} else {
+			bytes = 0;
+		}
+	}
+	if (bytes)
+		mod_objcg_slab_state_flush(objcg, nid, reclaimable, bytes);
+	put_obj_stock(flags);
 }
 
 int memcg_alloc_page_obj_cgroups(struct page *page, struct kmem_cache *s,
@@ -3013,20 +3095,18 @@ static void obj_cgroup_refill_bytes(struct obj_cgroup *objcg, size_t size)
 		obj_cgroup_uncharge_pages(objcg, pages);
 }
 
-/* Local IRQ exclusion also serializes process and interrupt allocations. */
 static bool consume_obj_stock(struct obj_cgroup *objcg, size_t size)
 {
 	struct obj_stock *stock;
 	unsigned long flags;
 	bool consumed = false;
 
-	local_irq_save(flags);
-	stock = &this_cpu_ptr(&memcg_stock)->obj;
+	stock = get_obj_stock(&flags);
 	if (stock->cached_objcg == objcg && stock->nr_bytes >= size) {
 		stock->nr_bytes -= size;
 		consumed = true;
 	}
-	local_irq_restore(flags);
+	put_obj_stock(flags);
 	return consumed;
 }
 
@@ -3037,6 +3117,7 @@ static void drain_obj_stock(struct obj_stock *stock)
 
 	if (!objcg)
 		return;
+	flush_obj_stock_stats(stock);
 	stock->cached_objcg = NULL;
 	stock->nr_bytes = 0;
 	obj_cgroup_refill_bytes(objcg, bytes);
@@ -3050,8 +3131,7 @@ static void refill_obj_stock(struct obj_cgroup *objcg, size_t bytes,
 	unsigned long flags;
 	unsigned int pages = 0;
 
-	local_irq_save(flags);
-	stock = &this_cpu_ptr(&memcg_stock)->obj;
+	stock = get_obj_stock(&flags);
 	if (stock->cached_objcg != objcg) {
 		drain_obj_stock(stock);
 		obj_cgroup_get(objcg);
@@ -3064,7 +3144,7 @@ static void refill_obj_stock(struct obj_cgroup *objcg, size_t bytes,
 		pages = stock->nr_bytes >> PAGE_SHIFT;
 		stock->nr_bytes &= PAGE_SIZE - 1;
 	}
-	local_irq_restore(flags);
+	put_obj_stock(flags);
 	if (pages)
 		obj_cgroup_uncharge_pages(objcg, pages);
 }
