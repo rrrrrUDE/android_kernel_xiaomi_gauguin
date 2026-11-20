@@ -274,22 +274,17 @@ static inline struct kmem_cache *memcg_root_cache(struct kmem_cache *s)
 }
 
 static __always_inline int memcg_charge_slab(struct page *page,
-					     gfp_t gfp, int order,
-					     struct kmem_cache *s)
+		gfp_t gfp, int order, struct kmem_cache *s)
 {
-	if (!memcg_kmem_enabled())
-		return 0;
-	if (is_root_cache(s))
-		return 0;
-	return memcg_kmem_charge_memcg(page, gfp, order, s->memcg_params.memcg);
+	page->slab_objcgs = NULL;
+	return 0;
 }
 
 static __always_inline void memcg_uncharge_slab(struct page *page, int order,
-						struct kmem_cache *s)
+					       struct kmem_cache *s)
 {
-	if (!memcg_kmem_enabled())
-		return;
-	memcg_kmem_uncharge(page, order);
+	kfree(page->slab_objcgs);
+	page->slab_objcgs = NULL;
 }
 
 extern void slab_init_memcg_params(struct kmem_cache *);
@@ -411,8 +406,105 @@ static inline size_t slab_ksize(const struct kmem_cache *s)
 #endif
 }
 
+struct obj_cgroup;
+
+#ifdef CONFIG_MEMCG_KMEM
+int memcg_alloc_page_obj_cgroups(struct page *page, struct kmem_cache *s,
+				 gfp_t gfp);
+
+static inline size_t obj_full_size(struct kmem_cache *s)
+{
+	return s->size + sizeof(struct obj_cgroup *);
+}
+
+static inline void memcg_slab_cancel_charge(struct kmem_cache *s,
+		struct obj_cgroup *objcg, size_t objects)
+{
+	if (objcg)
+		obj_cgroup_uncharge(objcg, objects * obj_full_size(s));
+}
+
+static inline bool memcg_slab_pre_alloc_hook(struct kmem_cache *s,
+		struct obj_cgroup **objcgp, size_t objects, gfp_t flags)
+{
+	struct obj_cgroup *objcg;
+
+	if (!memcg_kmem_enabled() ||
+	    (!(flags & __GFP_ACCOUNT) && !(s->flags & SLAB_ACCOUNT)))
+		return true;
+	objcg = get_obj_cgroup_from_current();
+	if (!objcg)
+		return true;
+	if (objects > INT_MAX / obj_full_size(s) ||
+	    obj_cgroup_charge(objcg, flags, objects * obj_full_size(s))) {
+		obj_cgroup_put(objcg);
+		return false;
+	}
+	*objcgp = objcg;
+	return true;
+}
+
+static inline void memcg_slab_post_alloc_hook(struct kmem_cache *s,
+		struct obj_cgroup *objcg, gfp_t flags, size_t size, void **p)
+{
+	size_t i;
+
+	if (!objcg)
+		return;
+	for (i = 0; i < size; i++) {
+		struct page *page;
+
+		if (!p[i]) {
+			obj_cgroup_uncharge(objcg, obj_full_size(s));
+			continue;
+		}
+		page = virt_to_head_page(p[i]);
+		if (!READ_ONCE(page->slab_objcgs) &&
+		    memcg_alloc_page_obj_cgroups(page, s, flags)) {
+			obj_cgroup_uncharge(objcg, obj_full_size(s));
+			continue;
+		}
+		obj_cgroup_get(objcg);
+		page->slab_objcgs[obj_to_index(s, page, p[i])] = objcg;
+		mod_objcg_slab_state(objcg, page_to_nid(page),
+			!!(s->flags & SLAB_RECLAIM_ACCOUNT), obj_full_size(s));
+	}
+	obj_cgroup_put(objcg);
+}
+
+static inline void memcg_slab_free_hook(struct kmem_cache *s, void *p)
+{
+	struct obj_cgroup *objcg;
+	struct page *page = virt_to_head_page(p);
+	unsigned int off;
+
+	if (!memcg_kmem_enabled() || !READ_ONCE(page->slab_objcgs))
+		return;
+	off = obj_to_index(s, page, p);
+	objcg = page->slab_objcgs[off];
+	if (!objcg)
+		return;
+	page->slab_objcgs[off] = NULL;
+	obj_cgroup_uncharge(objcg, obj_full_size(s));
+	mod_objcg_slab_state(objcg, page_to_nid(page),
+		!!(s->flags & SLAB_RECLAIM_ACCOUNT), -(int)obj_full_size(s));
+	obj_cgroup_put(objcg);
+}
+#else
+static inline void memcg_slab_cancel_charge(struct kmem_cache *s,
+		struct obj_cgroup *objcg, size_t objects) { }
+static inline bool memcg_slab_pre_alloc_hook(struct kmem_cache *s,
+		struct obj_cgroup **objcgp, size_t objects, gfp_t flags)
+{
+	return true;
+}
+static inline void memcg_slab_post_alloc_hook(struct kmem_cache *s,
+		struct obj_cgroup *objcg, gfp_t flags, size_t size, void **p) { }
+static inline void memcg_slab_free_hook(struct kmem_cache *s, void *p) { }
+#endif
+
 static inline struct kmem_cache *slab_pre_alloc_hook(struct kmem_cache *s,
-						     gfp_t flags)
+		struct obj_cgroup **objcgp, size_t objects, gfp_t flags)
 {
 	flags &= gfp_allowed_mask;
 
@@ -424,14 +516,14 @@ static inline struct kmem_cache *slab_pre_alloc_hook(struct kmem_cache *s,
 	if (should_failslab(s, flags))
 		return NULL;
 
-	if (memcg_kmem_enabled() &&
-	    ((flags & __GFP_ACCOUNT) || (s->flags & SLAB_ACCOUNT)))
-		return memcg_kmem_get_cache(s);
+	if (!memcg_slab_pre_alloc_hook(s, objcgp, objects, flags))
+		return NULL;
 
 	return s;
 }
 
-static inline void slab_post_alloc_hook(struct kmem_cache *s, gfp_t flags,
+static inline void slab_post_alloc_hook(struct kmem_cache *s,
+				struct obj_cgroup *objcg, gfp_t flags,
 					size_t size, void **p)
 {
 	size_t i;
@@ -443,8 +535,7 @@ static inline void slab_post_alloc_hook(struct kmem_cache *s, gfp_t flags,
 					 s->flags, flags);
 	}
 
-	if (memcg_kmem_enabled())
-		memcg_kmem_put_cache(s);
+	memcg_slab_post_alloc_hook(s, objcg, flags, size, p);
 }
 
 #ifndef CONFIG_SLOB

@@ -14,21 +14,22 @@ Offline creators fall back to their nearest online ancestor.
 
 4.19 dependencies:
 
-* Prime per-memcg kmalloc caches before map/program creation. The old slab
-  allocator otherwise allows initial allocations into global caches while
-  asynchronously creating cgroup caches. Failed preparation rejects creation.
-* Per-CPU objects share backing pages. The allocator tracks accounted objects
-  and charges their CPU-expanded, page-rounded logical sizes to the native
-  memory/kmem counters. Metadata failure or allocation failure rolls back;
-  free_percpu releases the charge regardless of the freeing task's cgroup.
-  This intentionally uses 4.19 page granularity, rather than importing 5.15's
-  byte-granular obj_cgroup allocator. Small objects can cost more than 5.15.
-* Native 4.19 slab accounting releases slab pages when caches release them;
-  usage need not fall immediately when a single object is freed. Removed
-  cgroups can retain outstanding charges until the allocations are freed.
+* SLAB and SLUB charge individual objects, including their ownership pointer
+  overhead. Shared backing pages no longer require separate memcg caches.
+  Per-CPU object credit stocks reduce contention and drain on reclaim and
+  CPU removal. IRQ exclusion protects local credit access. Object statistics
+  are updated directly under the ownership lock rather than deferred in stock.
+  Offline transfers surviving object charges and per-node statistics to the
+  parent, including charges which complete concurrently with offline.
+* Per-CPU objects share backing pages. The allocator charges their
+  CPU-expanded logical size through the objcg byte stock and stores ownership
+  by allocation offset in each chunk. Failed allocations roll back the charge;
+  free_percpu releases it regardless of the freeing task's cgroup. Per-CPU
+  byte statistics and outstanding charges follow objcg ownership on offline.
 
 Host regression (kernel allocators, CSS and locks are stubbed):
 
+  python3 tools/testing/selftests/bpf/test_memcg_slab.py
   python3 tools/testing/selftests/bpf/test_memcg_scopes.py
   python3 tools/testing/selftests/bpf/test_memcg_percpu.py
 

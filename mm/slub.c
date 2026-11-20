@@ -1408,6 +1408,7 @@ static __always_inline void kfree_hook(void *x)
 
 static __always_inline bool slab_free_hook(struct kmem_cache *s, void *x)
 {
+	memcg_slab_free_hook(s, x);
 	kmemleak_free_recursive(x, s->flags);
 
 	/*
@@ -2747,12 +2748,13 @@ static __always_inline void maybe_wipe_obj_freeptr(struct kmem_cache *s,
 static __always_inline void *slab_alloc_node(struct kmem_cache *s,
 		gfp_t gfpflags, int node, unsigned long addr)
 {
+	struct obj_cgroup *objcg = NULL;
 	void *object;
 	struct kmem_cache_cpu *c;
 	struct page *page;
 	unsigned long tid;
 
-	s = slab_pre_alloc_hook(s, gfpflags);
+	s = slab_pre_alloc_hook(s, &objcg, 1, gfpflags);
 	if (!s)
 		return NULL;
 redo:
@@ -2828,7 +2830,7 @@ redo:
 	if (unlikely(slab_want_init_on_alloc(gfpflags, s)) && object)
 		memset(object, 0, s->object_size);
 
-	slab_post_alloc_hook(s, gfpflags, 1, &object);
+	slab_post_alloc_hook(s, objcg, gfpflags, 1, &object);
 
 	return object;
 }
@@ -3212,11 +3214,12 @@ EXPORT_SYMBOL(kmem_cache_free_bulk);
 int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
 			  void **p)
 {
+	struct obj_cgroup *objcg = NULL;
 	struct kmem_cache_cpu *c;
 	int i;
 
 	/* memcg and kmem_cache debug support */
-	s = slab_pre_alloc_hook(s, flags);
+	s = slab_pre_alloc_hook(s, &objcg, size, flags);
 	if (unlikely(!s))
 		return false;
 	/*
@@ -3270,11 +3273,12 @@ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
 	}
 
 	/* memcg and kmem_cache debug support */
-	slab_post_alloc_hook(s, flags, size, p);
+	slab_post_alloc_hook(s, objcg, flags, size, p);
 	return i;
 error:
 	local_irq_enable();
-	slab_post_alloc_hook(s, flags, i, p);
+	memcg_slab_cancel_charge(s, objcg, size - i);
+	slab_post_alloc_hook(s, objcg, flags, i, p);
 	__kmem_cache_free_bulk(s, i, p);
 	return 0;
 }

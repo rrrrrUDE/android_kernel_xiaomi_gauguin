@@ -1,68 +1,77 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0
-"""Exercise production per-CPU charging wrapper, rollback and free with host stubs."""
+"""Exercise the production per-CPU objcg hooks with host stubs."""
 from pathlib import Path
-import subprocess,tempfile
-root=Path(__file__).resolve().parents[4]
-s=(root/'mm/percpu.c').read_text();a=s.index('struct pcpu_memcg_record {');b=s.index('\n#else',a)
-c=r'''
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parents[4]
+source = (root / "mm/percpu.c").read_text()
+start = source.index("static bool pcpu_memcg_pre_alloc_hook")
+end = source.index("#else\nstatic bool pcpu_memcg_pre_alloc_hook", start)
+hooks = source[start:end]
+
+program = r"""
 #include <assert.h>
 #include <stdbool.h>
-#include <stdint.h>
-#include <stdlib.h>
+#include <stddef.h>
 #include <stdio.h>
-#define __percpu
-typedef unsigned gfp_t;typedef uint64_t u64;
 #define __GFP_ACCOUNT 128
-#define PAGE_SIZE 4096
-#define PCPU_MIN_ALLOC_SIZE 4
-#define PCPU_MIN_UNIT_SIZE 32768
-#define ALIGN(x,a) (((x)+(a)-1)&~((a)-1))
-#define DIV_ROUND_UP_ULL(x,y) (((x)+(y)-1)/(y))
-#define is_power_of_2(x) ((x)&&!((x)&((x)-1)))
-#define num_possible_cpus() 8
-#define IS_ERR(p) ((uintptr_t)(p)>(uintptr_t)-4096)
-#define DEFINE_HASHTABLE(n,b) int n
-#define DEFINE_SPINLOCK(n) int n
-#define spin_lock_irqsave(l,f) ((void)0)
-#define spin_unlock_irqrestore(l,f) ((void)0)
-struct hlist_node { int unused; };
-struct mem_cgroup { int id; } owner;
-static bool enabled=true,fail_charge,fail_metadata,fail_alloc;
-static unsigned charged,uncharge_calls;
-struct pcpu_memcg_record;
-static struct pcpu_memcg_record *head;
-#define hash_add(t,n,k) (head=(struct pcpu_memcg_record *)(n))
-#define hash_del(n) (head=NULL)
-#define hash_for_each_possible(t,r,n,k) for((r)=head;(r);(r)=NULL)
+#define PCPU_MIN_ALLOC_SHIFT 2
+#define likely(x) (x)
+typedef unsigned gfp_t;
+struct obj_cgroup { int refs; long bytes; } owner = { .refs = 1 };
+struct pcpu_chunk { struct obj_cgroup *obj_cgroups[16]; } chunk;
+static bool enabled = true, fail_charge = false;
+static long charged, stats;
 static bool memcg_kmem_enabled(void) { return enabled; }
-static struct mem_cgroup *memcg_kmem_charge_percpu(gfp_t f,unsigned n) { if(fail_charge)return (void *)-12;charged+=n;return &owner; }
-static void memcg_kmem_uncharge_percpu(struct mem_cgroup *m,unsigned n) { assert(m==&owner && charged>=n);charged-=n;uncharge_calls++; }
-static void *kmalloc(size_t n,gfp_t f) { return fail_metadata?NULL:malloc(n); }
-#define kfree(p) free(p)
-static void *pcpu_alloc_unaccounted(size_t n,size_t a,bool r,gfp_t f) { return fail_alloc?NULL:malloc(n*8); }
-'''+s[a:b]+r'''
-int main(void) {
- for(unsigned mode=0;mode<4;mode++) {
-  charged=uncharge_calls=0;
-  fail_charge=mode==1;fail_metadata=mode==2;fail_alloc=mode==3;
-  void *p=pcpu_alloc(64,8,false,__GFP_ACCOUNT);
-  if(mode) { assert(!p && !charged && !head);assert(uncharge_calls==(mode>=2)); }
-  else { assert(p && charged==1 && head);pcpu_memcg_free(p);assert(!charged&&!head&&uncharge_calls==1);free(p); }
- }
- fail_charge=fail_metadata=fail_alloc=false;
- assert(!pcpu_alloc(0,8,false,__GFP_ACCOUNT));
- assert(!pcpu_alloc(32769,8,false,__GFP_ACCOUNT));
- assert(!pcpu_alloc(16,6,false,__GFP_ACCOUNT));
- for(unsigned align=0;align<4;align++) {
-  void *p=pcpu_alloc(16,align,false,__GFP_ACCOUNT);
-  assert(p&&charged==1);pcpu_memcg_free(p);assert(!charged);free(p);
- }
- void *p=pcpu_alloc(1024,8,false,__GFP_ACCOUNT);
- assert(p&&charged==2);pcpu_memcg_free(p);assert(!charged);free(p);
- enabled=false;p=pcpu_alloc(64,8,false,__GFP_ACCOUNT);assert(p&&!head&&!charged);pcpu_memcg_free(p);free(p);
- puts("PASS: production per-CPU charge/free, allocation and metadata rollback, invalid sizes and disabled accounting");
+static int num_possible_cpus(void) { return 8; }
+static struct obj_cgroup *get_obj_cgroup_from_current(void) {
+ owner.refs++; return &owner;
 }
-'''
-with tempfile.TemporaryDirectory() as d:
- p=Path(d)/'test.c';p.write_text(c);subprocess.run(['cc',str(p),'-o',d+'/test'],check=True);subprocess.run([d+'/test'],check=True)
+static int obj_cgroup_charge(struct obj_cgroup *o, gfp_t g, size_t n) {
+ if (fail_charge) return -1;
+ charged += n; return 0;
+}
+static void obj_cgroup_uncharge(struct obj_cgroup *o, size_t n) {
+ assert(charged >= (long)n); charged -= n;
+}
+static void obj_cgroup_put(struct obj_cgroup *o) {
+ assert(o->refs > 1); o->refs--;
+}
+static void mod_objcg_percpu_state(struct obj_cgroup *o, long n) {
+ o->bytes += n; stats += n;
+}
+""" + hooks + r"""
+int main(void) {
+ struct obj_cgroup *o = NULL;
+ assert(pcpu_memcg_pre_alloc_hook(16, __GFP_ACCOUNT, &o));
+ assert(o == &owner && charged == 128 && owner.refs == 2);
+ pcpu_memcg_post_alloc_hook(o, &chunk, 4, 16);
+ assert(chunk.obj_cgroups[1] == &owner && stats == 128);
+ pcpu_memcg_free_hook(&chunk, 4, 16);
+ assert(!charged && !stats && !owner.bytes && owner.refs == 1);
+ assert(!chunk.obj_cgroups[1]);
+
+ o = NULL; fail_charge = true;
+ assert(!pcpu_memcg_pre_alloc_hook(16, __GFP_ACCOUNT, &o));
+ assert(!o && !charged && owner.refs == 1);
+ fail_charge = false;
+
+ assert(pcpu_memcg_pre_alloc_hook(16, __GFP_ACCOUNT, &o));
+ pcpu_memcg_post_alloc_hook(o, NULL, 0, 16);
+ assert(!charged && !stats && owner.refs == 1);
+
+ enabled = false; o = NULL;
+ assert(pcpu_memcg_pre_alloc_hook(16, __GFP_ACCOUNT, &o));
+ assert(!o && !charged);
+ puts("PASS: byte charge, ownership, free, charge failure, rollback, disabled accounting");
+ return 0;
+}
+"""
+
+with tempfile.TemporaryDirectory() as temp:
+    test = Path(temp) / "test.c"
+    test.write_text(program)
+    subprocess.run(["cc", str(test), "-o", str(Path(temp) / "test")], check=True)
+    subprocess.run([str(Path(temp) / "test")], check=True)

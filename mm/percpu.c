@@ -1028,7 +1028,7 @@ static int pcpu_alloc_area(struct pcpu_chunk *chunk, int alloc_bits,
  * This function determines the size of an allocation to free using
  * the boundary bitmap and clears the allocation map.
  */
-static void pcpu_free_area(struct pcpu_chunk *chunk, int off)
+static int pcpu_free_area(struct pcpu_chunk *chunk, int off)
 {
 	int bit_off, bits, end, oslot;
 
@@ -1054,6 +1054,7 @@ static void pcpu_free_area(struct pcpu_chunk *chunk, int off)
 	pcpu_block_update_hint_free(chunk, bit_off, bits);
 
 	pcpu_chunk_relocate(chunk, oslot);
+	return bits * PCPU_MIN_ALLOC_SIZE;
 }
 
 static void pcpu_init_md_blocks(struct pcpu_chunk *chunk)
@@ -1192,6 +1193,13 @@ static struct pcpu_chunk *pcpu_alloc_chunk(gfp_t gfp)
 	if (!chunk->md_blocks)
 		goto md_blocks_fail;
 
+#ifdef CONFIG_MEMCG_KMEM
+	chunk->obj_cgroups = pcpu_mem_zalloc(region_bits *
+					   sizeof(*chunk->obj_cgroups), gfp);
+	if (!chunk->obj_cgroups)
+		goto objcg_fail;
+#endif
+
 	pcpu_init_md_blocks(chunk);
 
 	/* init metadata */
@@ -1200,6 +1208,10 @@ static struct pcpu_chunk *pcpu_alloc_chunk(gfp_t gfp)
 
 	return chunk;
 
+#ifdef CONFIG_MEMCG_KMEM
+objcg_fail:
+	pcpu_mem_free(chunk->md_blocks);
+#endif
 md_blocks_fail:
 	pcpu_mem_free(chunk->bound_map);
 bound_map_fail:
@@ -1214,6 +1226,9 @@ static void pcpu_free_chunk(struct pcpu_chunk *chunk)
 {
 	if (!chunk)
 		return;
+#ifdef CONFIG_MEMCG_KMEM
+	pcpu_mem_free(chunk->obj_cgroups);
+#endif
 	pcpu_mem_free(chunk->md_blocks);
 	pcpu_mem_free(chunk->bound_map);
 	pcpu_mem_free(chunk->alloc_map);
@@ -1336,6 +1351,8 @@ static struct pcpu_chunk *pcpu_chunk_addr_search(void *addr)
 	return pcpu_get_page_chunk(pcpu_addr_to_page(addr));
 }
 
+struct obj_cgroup;
+
 /**
  * pcpu_alloc - the percpu allocator
  * @size: size of area to allocate in bytes
@@ -1351,7 +1368,66 @@ static struct pcpu_chunk *pcpu_chunk_addr_search(void *addr)
  * RETURNS:
  * Percpu pointer to the allocated area on success, NULL on failure.
  */
-static void __percpu *pcpu_alloc_unaccounted(size_t size, size_t align, bool reserved,
+#ifdef CONFIG_MEMCG_KMEM
+static bool pcpu_memcg_pre_alloc_hook(size_t size, gfp_t gfp,
+				      struct obj_cgroup **objcgp)
+{
+	struct obj_cgroup *objcg;
+
+	if (!memcg_kmem_enabled() || !(gfp & __GFP_ACCOUNT))
+		return true;
+	objcg = get_obj_cgroup_from_current();
+	if (!objcg)
+		return true;
+	if (obj_cgroup_charge(objcg, gfp, size * num_possible_cpus())) {
+		obj_cgroup_put(objcg);
+		return false;
+	}
+	*objcgp = objcg;
+	return true;
+}
+
+static void pcpu_memcg_post_alloc_hook(struct obj_cgroup *objcg,
+				       struct pcpu_chunk *chunk, int off,
+				       size_t size)
+{
+	if (!objcg)
+		return;
+	if (likely(chunk && chunk->obj_cgroups)) {
+		chunk->obj_cgroups[off >> PCPU_MIN_ALLOC_SHIFT] = objcg;
+		mod_objcg_percpu_state(objcg, size * num_possible_cpus());
+	} else {
+		obj_cgroup_uncharge(objcg, size * num_possible_cpus());
+		obj_cgroup_put(objcg);
+	}
+}
+
+static void pcpu_memcg_free_hook(struct pcpu_chunk *chunk, int off, int size)
+{
+	struct obj_cgroup *objcg;
+
+	if (!chunk->obj_cgroups)
+		return;
+	objcg = chunk->obj_cgroups[off >> PCPU_MIN_ALLOC_SHIFT];
+	if (!objcg)
+		return;
+	chunk->obj_cgroups[off >> PCPU_MIN_ALLOC_SHIFT] = NULL;
+	obj_cgroup_uncharge(objcg, size * num_possible_cpus());
+	mod_objcg_percpu_state(objcg, -(long)size * num_possible_cpus());
+	obj_cgroup_put(objcg);
+}
+#else
+static bool pcpu_memcg_pre_alloc_hook(size_t size, gfp_t gfp,
+				      struct obj_cgroup **objcgp)
+{
+	return true;
+}
+static void pcpu_memcg_post_alloc_hook(struct obj_cgroup *objcg,
+				       struct pcpu_chunk *chunk, int off, size_t size) { }
+static void pcpu_memcg_free_hook(struct pcpu_chunk *chunk, int off, int size) { }
+#endif
+
+static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
 				 gfp_t gfp)
 {
 	/* whitelisted flags that can be passed to the backing allocators */
@@ -1365,6 +1441,7 @@ static void __percpu *pcpu_alloc_unaccounted(size_t size, size_t align, bool res
 	unsigned long flags;
 	void __percpu *ptr;
 	size_t bits, bit_align;
+	struct obj_cgroup *objcg = NULL;
 
 	/*
 	 * There is now a minimum allocation size of PCPU_MIN_ALLOC_SIZE,
@@ -1385,6 +1462,8 @@ static void __percpu *pcpu_alloc_unaccounted(size_t size, size_t align, bool res
 		     size, align);
 		return NULL;
 	}
+	if (unlikely(!pcpu_memcg_pre_alloc_hook(size, gfp, &objcg)))
+		return NULL;
 
 	if (!is_atomic) {
 		/*
@@ -1394,8 +1473,10 @@ static void __percpu *pcpu_alloc_unaccounted(size_t size, size_t align, bool res
 		 */
 		if (gfp & __GFP_NOFAIL)
 			mutex_lock(&pcpu_alloc_mutex);
-		else if (mutex_lock_killable(&pcpu_alloc_mutex))
+		else if (mutex_lock_killable(&pcpu_alloc_mutex)) {
+			pcpu_memcg_post_alloc_hook(objcg, NULL, 0, size);
 			return NULL;
+		}
 	}
 
 	spin_lock_irqsave(&pcpu_lock, flags);
@@ -1499,6 +1580,7 @@ area_found:
 		memset((void *)pcpu_chunk_addr(chunk, cpu, 0) + off, 0, size);
 
 	ptr = __addr_to_pcpu_ptr(chunk->base_addr + off);
+	pcpu_memcg_post_alloc_hook(objcg, chunk, off, size);
 	kmemleak_alloc_percpu(ptr, size, gfp);
 
 	trace_percpu_alloc_percpu(reserved, is_atomic, size, align,
@@ -1509,6 +1591,7 @@ area_found:
 fail_unlock:
 	spin_unlock_irqrestore(&pcpu_lock, flags);
 fail:
+	pcpu_memcg_post_alloc_hook(objcg, NULL, 0, size);
 	trace_percpu_alloc_percpu_fail(reserved, is_atomic, size, align);
 
 	if (!is_atomic && do_warn && warn_limit) {
@@ -1527,91 +1610,6 @@ fail:
 	}
 	return NULL;
 }
-
-#ifdef CONFIG_MEMCG_KMEM
-struct pcpu_memcg_record {
-	struct hlist_node node;
-	void __percpu *ptr;
-	struct mem_cgroup *memcg;
-	unsigned int nr_pages;
-};
-
-static DEFINE_HASHTABLE(pcpu_memcg_records, 8);
-static DEFINE_SPINLOCK(pcpu_memcg_lock);
-
-static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
-				gfp_t gfp)
-{
-	struct pcpu_memcg_record *record;
-	struct mem_cgroup *memcg;
-	void __percpu *ptr;
-	unsigned long flags;
-	u64 bytes;
-	unsigned int pages;
-
-	if (!(gfp & __GFP_ACCOUNT) || !memcg_kmem_enabled())
-		return pcpu_alloc_unaccounted(size, align, reserved, gfp);
-	/* Preserve the native allocator's minimum-alignment convention. */
-	if (align < PCPU_MIN_ALLOC_SIZE)
-		align = PCPU_MIN_ALLOC_SIZE;
-	/* Validate before rounding/multiplying, including malicious map sizes. */
-	if (!size || size > PCPU_MIN_UNIT_SIZE || align > PAGE_SIZE ||
-	    !is_power_of_2(align))
-		return NULL;
-	bytes = (u64)ALIGN(size, PCPU_MIN_ALLOC_SIZE) * num_possible_cpus();
-	pages = DIV_ROUND_UP_ULL(bytes, PAGE_SIZE);
-	memcg = memcg_kmem_charge_percpu(gfp, pages);
-	if (IS_ERR(memcg))
-		return NULL;
-	if (!memcg)
-		return pcpu_alloc_unaccounted(size, align, reserved, gfp);
-	/* Metadata is private to the charge and must not recursively account. */
-	record = kmalloc(sizeof(*record), gfp & ~__GFP_ACCOUNT);
-	if (!record)
-		goto uncharge;
-	ptr = pcpu_alloc_unaccounted(size, align, reserved, gfp);
-	if (!ptr) {
-		kfree(record);
-		goto uncharge;
-	}
-	record->ptr = ptr;
-	record->memcg = memcg;
-	record->nr_pages = pages;
-	spin_lock_irqsave(&pcpu_memcg_lock, flags);
-	hash_add(pcpu_memcg_records, &record->node, (unsigned long)ptr);
-	spin_unlock_irqrestore(&pcpu_memcg_lock, flags);
-	return ptr;
-uncharge:
-	memcg_kmem_uncharge_percpu(memcg, pages);
-	return NULL;
-}
-
-static void pcpu_memcg_free(void __percpu *ptr)
-{
-	struct pcpu_memcg_record *record;
-	unsigned long flags;
-
-	spin_lock_irqsave(&pcpu_memcg_lock, flags);
-	hash_for_each_possible(pcpu_memcg_records, record, node, (unsigned long)ptr) {
-		if (record->ptr != ptr)
-			continue;
-		hash_del(&record->node);
-		spin_unlock_irqrestore(&pcpu_memcg_lock, flags);
-		memcg_kmem_uncharge_percpu(record->memcg, record->nr_pages);
-		kfree(record);
-		return;
-	}
-	spin_unlock_irqrestore(&pcpu_memcg_lock, flags);
-}
-#else
-static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
-				gfp_t gfp)
-{
-	return pcpu_alloc_unaccounted(size, align, reserved, gfp);
-}
-
-static void pcpu_memcg_free(void __percpu *ptr) { }
-#endif
 
 /**
  * __alloc_percpu_gfp - allocate dynamic percpu area
@@ -1807,13 +1805,12 @@ void free_percpu(void __percpu *ptr)
 	void *addr;
 	struct pcpu_chunk *chunk;
 	unsigned long flags;
-	int off;
+	int off, size;
 	bool need_balance = false;
 
 	if (!ptr)
 		return;
 
-	pcpu_memcg_free(ptr);
 	kmemleak_free_percpu(ptr);
 
 	addr = __pcpu_ptr_to_addr(ptr);
@@ -1823,7 +1820,8 @@ void free_percpu(void __percpu *ptr)
 	chunk = pcpu_chunk_addr_search(addr);
 	off = addr - chunk->base_addr;
 
-	pcpu_free_area(chunk, off);
+	size = pcpu_free_area(chunk, off);
+	pcpu_memcg_free_hook(chunk, off, size);
 
 	/* if there are more than one fully free chunks, wake up grim reaper */
 	if (chunk->free_bytes == pcpu_unit_size) {

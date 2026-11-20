@@ -182,4 +182,16 @@ static inline void *nearest_obj(struct kmem_cache *cache, struct page *page,
 	return result;
 }
 
+static inline unsigned int obj_to_index(const struct kmem_cache *cache,
+					const struct page *page, void *obj)
+{
+	return (obj - page_address(page)) / cache->size;
+}
+
+static inline unsigned int objs_per_slab_page(const struct kmem_cache *cache,
+					     const struct page *page)
+{
+	return page->objects;
+}
+
 #endif /* _LINUX_SLUB_DEF_H */

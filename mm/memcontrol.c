@@ -49,6 +49,7 @@
 #include <linux/mutex.h>
 #include <linux/rbtree.h>
 #include <linux/slab.h>
+#include <linux/kmemleak.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
 #include <linux/spinlock.h>
@@ -271,6 +272,125 @@ struct cgroup_subsys_state *vmpressure_to_css(struct vmpressure *vmpr)
 }
 
 #ifdef CONFIG_MEMCG_KMEM
+static DEFINE_SPINLOCK(objcg_lock);
+
+static void obj_cgroup_uncharge_pages(struct obj_cgroup *objcg,
+				      unsigned int nr_pages);
+
+static void obj_cgroup_release(struct percpu_ref *ref)
+{
+	struct obj_cgroup *objcg = container_of(ref, struct obj_cgroup, refcnt);
+	unsigned long bytes = atomic_long_read(&objcg->nr_charged_bytes);
+	unsigned long flags;
+
+	WARN_ON_ONCE(bytes & (PAGE_SIZE - 1));
+	if (bytes >> PAGE_SHIFT)
+		obj_cgroup_uncharge_pages(objcg, bytes >> PAGE_SHIFT);
+	spin_lock_irqsave(&objcg_lock, flags);
+	list_del(&objcg->list);
+	spin_unlock_irqrestore(&objcg_lock, flags);
+
+	percpu_ref_exit(ref);
+	mem_cgroup_put(objcg->charge_memcg);
+	kfree_rcu(objcg, rcu);
+}
+
+static struct obj_cgroup *obj_cgroup_alloc(void)
+{
+	struct obj_cgroup *objcg;
+	int ret;
+
+	objcg = kzalloc(sizeof(struct obj_cgroup), GFP_KERNEL);
+	if (!objcg)
+		return NULL;
+
+	ret = percpu_ref_init(&objcg->refcnt, obj_cgroup_release, 0,
+			      GFP_KERNEL);
+	if (ret) {
+		kfree(objcg);
+		return NULL;
+	}
+	INIT_LIST_HEAD(&objcg->list);
+	return objcg;
+}
+
+/* objcg_lock serializes charge ownership, page counts and node statistics. */
+static void objcg_move_pages(struct mem_cgroup *from, struct mem_cgroup *to,
+			     unsigned long pages)
+{
+	if (!pages)
+		return;
+	/* Force-charge the parent: migration must never fail on its limit. */
+	page_counter_charge(&to->memory, pages);
+	if (do_memsw_account())
+		page_counter_charge(&to->memsw, pages);
+	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys)) {
+		page_counter_charge(&to->kmem, pages);
+		page_counter_uncharge(&from->kmem, pages);
+	}
+	css_get_many(&to->css, pages);
+	page_counter_uncharge(&from->memory, pages);
+	if (do_memsw_account())
+		page_counter_uncharge(&from->memsw, pages);
+	css_put_many(&from->css, pages);
+}
+
+static void objcg_move_owner(struct obj_cgroup *objcg,
+			     struct mem_cgroup *parent)
+{
+	struct mem_cgroup *old = objcg->charge_memcg;
+	int nid, kind;
+
+	objcg_move_pages(old, parent, objcg->nr_pages);
+	atomic_long_sub(objcg->percpu_bytes, &old->stat[MEMCG_PERCPU_B]);
+	atomic_long_add(objcg->percpu_bytes, &parent->stat[MEMCG_PERCPU_B]);
+	for_each_node(nid) {
+		for (kind = 0; kind < 2; kind++) {
+			long bytes = objcg->slab_bytes[nid][kind];
+			int idx = kind ? MEMCG_SLAB_UNRECLAIMABLE_B :
+				MEMCG_SLAB_RECLAIMABLE_B;
+			atomic_long_t *src = kind ?
+				&old->nodeinfo[nid]->slab_unreclaimable_bytes :
+				&old->nodeinfo[nid]->slab_reclaimable_bytes;
+			atomic_long_t *dst = kind ?
+				&parent->nodeinfo[nid]->slab_unreclaimable_bytes :
+				&parent->nodeinfo[nid]->slab_reclaimable_bytes;
+
+			atomic_long_sub(bytes, src);
+			atomic_long_add(bytes, dst);
+			atomic_long_sub(bytes, &old->stat[idx]);
+			atomic_long_add(bytes, &parent->stat[idx]);
+		}
+	}
+	css_get(&parent->css);
+	objcg->charge_memcg = parent;
+	WRITE_ONCE(objcg->memcg, parent);
+	css_put(&old->css);
+}
+
+static void memcg_reparent_objcgs(struct mem_cgroup *memcg,
+				  struct mem_cgroup *parent)
+{
+	struct obj_cgroup *objcg, *iter;
+
+	objcg = rcu_dereference_protected(memcg->objcg, 1);
+	RCU_INIT_POINTER(memcg->objcg, NULL);
+
+	spin_lock_irq(&objcg_lock);
+
+	/* 1) Ready to reparent active objcg. */
+	list_add(&objcg->list, &memcg->objcg_list);
+	/* 2) Reparent active objcg and already reparented objcgs to parent. */
+	list_for_each_entry(iter, &memcg->objcg_list, list)
+		objcg_move_owner(iter, parent);
+	/* 3) Move already reparented objcgs to the parent's list */
+	list_splice_init(&memcg->objcg_list, &parent->objcg_list);
+
+	spin_unlock_irq(&objcg_lock);
+
+	percpu_ref_kill(&objcg->refcnt);
+}
+
 /*
  * This will be the memcg's index in each cache's ->memcg_params.memcg_caches.
  * The main reason for not using cgroup id for this:
@@ -1981,7 +2101,18 @@ void unlock_page_memcg(struct page *page)
 }
 EXPORT_SYMBOL(unlock_page_memcg);
 
+#ifdef CONFIG_MEMCG_KMEM
+struct obj_stock {
+	struct obj_cgroup *cached_objcg;
+	unsigned long nr_bytes;
+};
+static void drain_obj_stock(struct obj_stock *stock);
+#endif
+
 struct memcg_stock_pcp {
+#ifdef CONFIG_MEMCG_KMEM
+	struct obj_stock obj;
+#endif
 	struct mem_cgroup *cached; /* this never be root cgroup */
 	unsigned int nr_pages;
 	struct work_struct work;
@@ -2059,6 +2190,9 @@ static void drain_local_stock(struct work_struct *dummy)
 
 	stock = this_cpu_ptr(&memcg_stock);
 	drain_stock(stock);
+#ifdef CONFIG_MEMCG_KMEM
+	drain_obj_stock(&stock->obj);
+#endif
 	clear_bit(FLUSHING_CACHED_CHARGE, &stock->flags);
 
 	local_irq_restore(flags);
@@ -2117,6 +2251,11 @@ static void drain_all_stock(struct mem_cgroup *root_memcg)
 		if (memcg && stock->nr_pages &&
 		    mem_cgroup_is_descendant(memcg, root_memcg))
 			flush = true;
+#ifdef CONFIG_MEMCG_KMEM
+		/* Ownership may reparent concurrently: drain object credits too. */
+		if (READ_ONCE(stock->obj.cached_objcg))
+			flush = true;
+#endif
 		rcu_read_unlock();
 
 		if (flush &&
@@ -2138,6 +2277,9 @@ static int memcg_hotplug_cpu_dead(unsigned int cpu)
 
 	stock = &per_cpu(memcg_stock, cpu);
 	drain_stock(stock);
+#ifdef CONFIG_MEMCG_KMEM
+	drain_obj_stock(&stock->obj);
+#endif
 
 	for_each_mem_cgroup(memcg) {
 		int i;
@@ -2516,49 +2658,10 @@ static void memcg_free_cache_id(int id)
 	ida_simple_remove(&memcg_cache_ida, id);
 }
 
-/* BPF cannot let the first allocation escape into a global slab while
- * 4.19 asynchronously creates the per-cgroup cache. Prime kmalloc caches
- * before publishing a map or loading a program, including online ancestors
- * used when a pinned map's original cgroup is later removed.
- */
+/* Object charging no longer requires priming per-cgroup kmalloc caches. */
 int memcg_kmem_prepare_bpf(void)
 {
-	struct mem_cgroup *owner, *memcg;
-	struct kmem_cache *cache;
-	int type, index, id, ret = 0;
-
-	if (!memcg_kmem_enabled() || mem_cgroup_disabled())
-		return 0;
-	owner = get_mem_cgroup_from_current();
-	for (memcg = owner; memcg && !mem_cgroup_is_root(memcg);
-	     memcg = parent_mem_cgroup(memcg)) {
-		id = READ_ONCE(memcg->kmemcg_id);
-		if (id < 0)
-			continue;
-		for (type = 0; type < NR_KMALLOC_TYPES; type++) {
-			for (index = 0; index <= KMALLOC_SHIFT_HIGH; index++) {
-				cache = kmalloc_caches[type][index];
-				if (!cache)
-					continue;
-				rcu_read_lock();
-				if (cache_from_memcg_idx(cache, id)) {
-					rcu_read_unlock();
-					continue;
-				}
-				rcu_read_unlock();
-				memcg_create_kmem_cache(memcg, cache);
-				rcu_read_lock();
-				if (!cache_from_memcg_idx(cache, id))
-					ret = -ENOMEM;
-				rcu_read_unlock();
-				if (ret)
-					goto out;
-			}
-		}
-	}
-out:
-	mem_cgroup_put(owner);
-	return ret;
+	return 0;
 }
 
 struct memcg_kmem_cache_create_work {
@@ -2626,6 +2729,31 @@ static inline bool memcg_kmem_bypass(void)
 	    (in_interrupt() || !current->mm || (current->flags & PF_KTHREAD)))
 		return true;
 	return false;
+}
+
+__always_inline struct obj_cgroup *get_obj_cgroup_from_current(void)
+{
+	struct obj_cgroup *objcg = NULL;
+	struct mem_cgroup *memcg;
+
+	if (memcg_kmem_bypass())
+		return NULL;
+
+	rcu_read_lock();
+	if (unlikely(active_memcg()))
+		memcg = active_memcg();
+	else
+		memcg = mem_cgroup_from_task(current);
+
+	for (; memcg != root_mem_cgroup; memcg = parent_mem_cgroup(memcg)) {
+		objcg = rcu_dereference(memcg->objcg);
+		if (objcg && obj_cgroup_tryget(objcg))
+			break;
+		objcg = NULL;
+	}
+	rcu_read_unlock();
+
+	return objcg;
 }
 
 /**
@@ -2791,49 +2919,221 @@ void memcg_kmem_uncharge(struct page *page, int order)
 
 	css_put_many(&memcg->css, nr_pages);
 }
-/* Per-CPU objects share backing pages. Charge their logical allocation
- * separately, using the native 4.19 page counters and reference protocol.
- */
-struct mem_cgroup *memcg_kmem_charge_percpu(gfp_t gfp, unsigned int nr_pages)
+/* Caller protects the object and holds RCU or the list_lru lock. */
+struct mem_cgroup *mem_cgroup_from_obj(void *ptr)
 {
-	struct mem_cgroup *memcg;
-	struct page_counter *counter;
-	int ret;
+	struct page *page = virt_to_head_page(ptr);
+	struct obj_cgroup **objcgs;
+	struct obj_cgroup *objcg;
 
-	if (!memcg_kmem_enabled() || mem_cgroup_disabled() || memcg_kmem_bypass())
+	if (!memcg_kmem_enabled())
 		return NULL;
-	memcg = get_mem_cgroup_from_current();
-	if (mem_cgroup_is_root(memcg)) {
-		mem_cgroup_put(memcg);
+	if (!PageSlab(page))
+		return page->mem_cgroup;
+	objcgs = READ_ONCE(page->slab_objcgs);
+	if (!objcgs)
 		return NULL;
-	}
-	ret = try_charge(memcg, gfp, nr_pages);
-	if (ret)
-		goto out;
-	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys) &&
-	    !page_counter_try_charge(&memcg->kmem, nr_pages, &counter)) {
-		cancel_charge(memcg, nr_pages);
-		ret = -ENOMEM;
-		goto out;
-	}
-	/* try_charge holds nr_pages css references until uncharge. */
-	mem_cgroup_put(memcg);
-	return memcg;
-out:
-	mem_cgroup_put(memcg);
-	return ERR_PTR(ret);
+	objcg = READ_ONCE(objcgs[obj_to_index(page->slab_cache, page, ptr)]);
+	return objcg ? READ_ONCE(objcg->memcg) : NULL;
 }
 
-void memcg_kmem_uncharge_percpu(struct mem_cgroup *memcg, unsigned int nr_pages)
+/* Physical backing pages are accounted separately by the slab allocator. */
+void mod_objcg_slab_state(struct obj_cgroup *objcg, int nid,
+			 bool reclaimable, int bytes)
 {
-	if (!memcg)
-		return;
+	struct mem_cgroup *memcg;
+	struct mem_cgroup_per_node *pn;
+	unsigned long flags;
+	int kind = !reclaimable;
+	int idx = reclaimable ? MEMCG_SLAB_RECLAIMABLE_B :
+		MEMCG_SLAB_UNRECLAIMABLE_B;
+
+	spin_lock_irqsave(&objcg_lock, flags);
+	memcg = objcg->charge_memcg;
+	pn = memcg->nodeinfo[nid];
+	objcg->slab_bytes[nid][kind] += bytes;
+	atomic_long_add(bytes, &memcg->stat[idx]);
+	atomic_long_add(bytes, reclaimable ? &pn->slab_reclaimable_bytes :
+			&pn->slab_unreclaimable_bytes);
+	spin_unlock_irqrestore(&objcg_lock, flags);
+}
+
+int memcg_alloc_page_obj_cgroups(struct page *page, struct kmem_cache *s,
+				 gfp_t gfp)
+{
+	struct obj_cgroup **vec;
+
+	gfp &= ~(__GFP_DMA | __GFP_RECLAIMABLE | __GFP_ACCOUNT | __GFP_NOFAIL);
+	vec = kcalloc_node(objs_per_slab_page(s, page), sizeof(*vec),
+			   gfp, page_to_nid(page));
+	if (!vec)
+		return -ENOMEM;
+	if (cmpxchg(&page->slab_objcgs, NULL, vec))
+		kfree(vec);
+	else
+		kmemleak_not_leak(vec);
+	return 0;
+}
+
+/* Ownership is rechecked after reclaim, which may race cgroup offline. */
+static void obj_cgroup_uncharge_pages(struct obj_cgroup *objcg,
+				      unsigned int nr_pages)
+{
+	struct mem_cgroup *memcg;
+	unsigned long flags;
+
+	spin_lock_irqsave(&objcg_lock, flags);
+	memcg = objcg->charge_memcg;
+	objcg->nr_pages -= nr_pages;
 	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
 		page_counter_uncharge(&memcg->kmem, nr_pages);
 	page_counter_uncharge(&memcg->memory, nr_pages);
 	if (do_memsw_account())
 		page_counter_uncharge(&memcg->memsw, nr_pages);
 	css_put_many(&memcg->css, nr_pages);
+	spin_unlock_irqrestore(&objcg_lock, flags);
+}
+
+static void obj_cgroup_refill_bytes(struct obj_cgroup *objcg, size_t size)
+{
+	long old, new, seen;
+	unsigned int pages;
+
+	old = atomic_long_read(&objcg->nr_charged_bytes);
+	for (;;) {
+		new = old + size;
+		pages = new >> PAGE_SHIFT;
+		new &= PAGE_SIZE - 1;
+		seen = atomic_long_cmpxchg(&objcg->nr_charged_bytes, old, new);
+		if (seen == old)
+			break;
+		old = seen;
+	}
+	if (pages)
+		obj_cgroup_uncharge_pages(objcg, pages);
+}
+
+/* Local IRQ exclusion also serializes process and interrupt allocations. */
+static bool consume_obj_stock(struct obj_cgroup *objcg, size_t size)
+{
+	struct obj_stock *stock;
+	unsigned long flags;
+	bool consumed = false;
+
+	local_irq_save(flags);
+	stock = &this_cpu_ptr(&memcg_stock)->obj;
+	if (stock->cached_objcg == objcg && stock->nr_bytes >= size) {
+		stock->nr_bytes -= size;
+		consumed = true;
+	}
+	local_irq_restore(flags);
+	return consumed;
+}
+
+static void drain_obj_stock(struct obj_stock *stock)
+{
+	struct obj_cgroup *objcg = stock->cached_objcg;
+	unsigned long bytes = stock->nr_bytes;
+
+	if (!objcg)
+		return;
+	stock->cached_objcg = NULL;
+	stock->nr_bytes = 0;
+	obj_cgroup_refill_bytes(objcg, bytes);
+	obj_cgroup_put(objcg);
+}
+
+static void refill_obj_stock(struct obj_cgroup *objcg, size_t bytes,
+			     bool allow_uncharge)
+{
+	struct obj_stock *stock;
+	unsigned long flags;
+	unsigned int pages = 0;
+
+	local_irq_save(flags);
+	stock = &this_cpu_ptr(&memcg_stock)->obj;
+	if (stock->cached_objcg != objcg) {
+		drain_obj_stock(stock);
+		obj_cgroup_get(objcg);
+		stock->cached_objcg = objcg;
+		stock->nr_bytes = atomic_long_xchg(&objcg->nr_charged_bytes, 0);
+		allow_uncharge = true;
+	}
+	stock->nr_bytes += bytes;
+	if (allow_uncharge && stock->nr_bytes > PAGE_SIZE) {
+		pages = stock->nr_bytes >> PAGE_SHIFT;
+		stock->nr_bytes &= PAGE_SIZE - 1;
+	}
+	local_irq_restore(flags);
+	if (pages)
+		obj_cgroup_uncharge_pages(objcg, pages);
+}
+
+int obj_cgroup_charge(struct obj_cgroup *objcg, gfp_t gfp, size_t size)
+{
+	struct mem_cgroup *memcg;
+	struct page_counter *counter;
+	unsigned long flags;
+	unsigned int pages;
+	int ret;
+
+	if (size > INT_MAX - PAGE_SIZE)
+		return -E2BIG;
+	if (consume_obj_stock(objcg, size))
+		return 0;
+	pages = DIV_ROUND_UP(size, PAGE_SIZE);
+	spin_lock_irqsave(&objcg_lock, flags);
+	memcg = objcg->charge_memcg;
+	css_get(&memcg->css);
+	spin_unlock_irqrestore(&objcg_lock, flags);
+	ret = try_charge(memcg, gfp, pages);
+	if (ret) {
+		css_put(&memcg->css);
+		return ret;
+	}
+	/* Native try_charge skips the root counter and its page references. */
+	if (mem_cgroup_is_root(memcg)) {
+		page_counter_charge(&memcg->memory, pages);
+		if (do_memsw_account())
+			page_counter_charge(&memcg->memsw, pages);
+		css_get_many(&memcg->css, pages);
+	}
+	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys) &&
+	    !page_counter_try_charge(&memcg->kmem, pages, &counter)) {
+		if (gfp & __GFP_NOFAIL) {
+			page_counter_charge(&memcg->kmem, pages);
+		} else {
+			page_counter_uncharge(&memcg->memory, pages);
+			if (do_memsw_account())
+				page_counter_uncharge(&memcg->memsw, pages);
+			css_put_many(&memcg->css, pages);
+			css_put(&memcg->css);
+			return -ENOMEM;
+		}
+	}
+	spin_lock_irqsave(&objcg_lock, flags);
+	if (memcg != objcg->charge_memcg)
+		objcg_move_pages(memcg, objcg->charge_memcg, pages);
+	objcg->nr_pages += pages;
+	spin_unlock_irqrestore(&objcg_lock, flags);
+	css_put(&memcg->css);
+	refill_obj_stock(objcg, (size_t)pages * PAGE_SIZE - size, false);
+	return 0;
+}
+
+void obj_cgroup_uncharge(struct obj_cgroup *objcg, size_t size)
+{
+	refill_obj_stock(objcg, size, true);
+}
+
+void mod_objcg_percpu_state(struct obj_cgroup *objcg, long bytes)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&objcg_lock, flags);
+	objcg->percpu_bytes += bytes;
+	atomic_long_add(bytes, &objcg->charge_memcg->stat[MEMCG_PERCPU_B]);
+	spin_unlock_irqrestore(&objcg_lock, flags);
 }
 
 #endif /* CONFIG_MEMCG_KMEM */
@@ -3239,6 +3539,7 @@ static u64 mem_cgroup_read_u64(struct cgroup_subsys_state *css,
 #ifdef CONFIG_MEMCG_KMEM
 static int memcg_online_kmem(struct mem_cgroup *memcg)
 {
+	struct obj_cgroup *objcg;
 	int memcg_id;
 
 	if (cgroup_memory_nokmem)
@@ -3251,7 +3552,17 @@ static int memcg_online_kmem(struct mem_cgroup *memcg)
 	if (memcg_id < 0)
 		return memcg_id;
 
-	static_branch_inc(&memcg_kmem_enabled_key);
+	objcg = obj_cgroup_alloc();
+	if (!objcg) {
+		memcg_free_cache_id(memcg_id);
+		return -ENOMEM;
+	}
+	objcg->memcg = memcg;
+	objcg->charge_memcg = memcg;
+	css_get(&memcg->css);
+	rcu_assign_pointer(memcg->objcg, objcg);
+
+	static_branch_enable(&memcg_kmem_enabled_key);
 	/*
 	 * A memory cgroup is considered kmem-online as soon as it gets
 	 * kmemcg_id. Setting the id after enabling static branching will
@@ -3308,6 +3619,8 @@ static void memcg_offline_kmem(struct mem_cgroup *memcg)
 	}
 	rcu_read_unlock();
 
+	/* Publish compatible list IDs before changing object ownership. */
+	memcg_reparent_objcgs(memcg, parent);
 	memcg_drain_all_list_lrus(kmemcg_id, parent);
 
 	memcg_free_cache_id(kmemcg_id);
@@ -3321,7 +3634,7 @@ static void memcg_free_kmem(struct mem_cgroup *memcg)
 
 	if (memcg->kmem_state == KMEM_ALLOCATED) {
 		memcg_destroy_kmem_caches(memcg);
-		static_branch_dec(&memcg_kmem_enabled_key);
+		/* Shared slab pages can retain objcg entries after css offline. */
 		WARN_ON(page_counter_read(&memcg->kmem));
 	}
 }
@@ -4674,6 +4987,7 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 	memcg->socket_pressure = jiffies;
 #ifdef CONFIG_MEMCG_KMEM
 	memcg->kmemcg_id = -1;
+	INIT_LIST_HEAD(&memcg->objcg_list);
 #endif
 #ifdef CONFIG_CGROUP_WRITEBACK
 	INIT_LIST_HEAD(&memcg->cgwb_list);
@@ -5785,8 +6099,8 @@ static int memory_stat_show(struct seq_file *m, void *v)
 	seq_printf(m, "kernel_stack %llu\n",
 		   (u64)acc.stat[MEMCG_KERNEL_STACK_KB] * 1024);
 	seq_printf(m, "slab %llu\n",
-		   (u64)(acc.stat[NR_SLAB_RECLAIMABLE] +
-			 acc.stat[NR_SLAB_UNRECLAIMABLE]) * PAGE_SIZE);
+		   (u64)(acc.stat[MEMCG_SLAB_RECLAIMABLE_B] +
+			 acc.stat[MEMCG_SLAB_UNRECLAIMABLE_B]));
 	seq_printf(m, "sock %llu\n",
 		   (u64)acc.stat[MEMCG_SOCK] * PAGE_SIZE);
 
@@ -5804,9 +6118,10 @@ static int memory_stat_show(struct seq_file *m, void *v)
 			   (u64)acc.lru_pages[i] * PAGE_SIZE);
 
 	seq_printf(m, "slab_reclaimable %llu\n",
-		   (u64)acc.stat[NR_SLAB_RECLAIMABLE] * PAGE_SIZE);
+		   (u64)acc.stat[MEMCG_SLAB_RECLAIMABLE_B]);
 	seq_printf(m, "slab_unreclaimable %llu\n",
-		   (u64)acc.stat[NR_SLAB_UNRECLAIMABLE] * PAGE_SIZE);
+		   (u64)acc.stat[MEMCG_SLAB_UNRECLAIMABLE_B]);
+	seq_printf(m, "percpu %llu\n", (u64)acc.stat[MEMCG_PERCPU_B]);
 
 	/* Accumulated memory events */
 

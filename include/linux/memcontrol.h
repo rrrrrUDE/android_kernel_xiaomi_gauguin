@@ -30,6 +30,7 @@
 #include <linux/vmstat.h>
 #include <linux/writeback.h>
 #include <linux/page-flags.h>
+#include <linux/percpu-refcount.h>
 
 struct mem_cgroup;
 struct page;
@@ -45,6 +46,9 @@ enum memcg_stat_item {
 	MEMCG_SOCK,
 	/* XXX: why are these zone and not node counters? */
 	MEMCG_KERNEL_STACK_KB,
+	MEMCG_SLAB_RECLAIMABLE_B,
+	MEMCG_SLAB_UNRECLAIMABLE_B,
+	MEMCG_PERCPU_B,
 	MEMCG_NR_STAT,
 };
 
@@ -128,6 +132,11 @@ struct mem_cgroup_per_node {
 
 	struct lruvec_stat __percpu *lruvec_stat_cpu;
 	atomic_long_t		lruvec_stat[NR_VM_NODE_STAT_ITEMS];
+#ifdef CONFIG_MEMCG_KMEM
+	/* Object bytes; global node slab counters still describe backing pages. */
+	atomic_long_t slab_reclaimable_bytes;
+	atomic_long_t slab_unreclaimable_bytes;
+#endif
 
 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
 
@@ -186,6 +195,32 @@ struct memcg_padding {
 #define MEMCG_PADDING(name)      struct memcg_padding name;
 #else
 #define MEMCG_PADDING(name)
+#endif
+
+/* Object ownership survives the removal of the allocating cgroup. */
+#ifdef CONFIG_MEMCG_KMEM
+struct obj_cgroup {
+	struct percpu_ref refcnt;
+	struct mem_cgroup *memcg;
+	/* Protected by objcg_lock; charges follow ownership on offline. */
+	struct mem_cgroup *charge_memcg;
+	atomic_long_t nr_charged_bytes;
+	unsigned long nr_pages;
+	long slab_bytes[MAX_NUMNODES][2];
+	long percpu_bytes;
+	union {
+		struct list_head list;
+		struct rcu_head rcu;
+	};
+};
+
+struct obj_cgroup *get_obj_cgroup_from_current(void);
+int obj_cgroup_charge(struct obj_cgroup *objcg, gfp_t gfp, size_t size);
+void obj_cgroup_uncharge(struct obj_cgroup *objcg, size_t size);
+struct mem_cgroup *mem_cgroup_from_obj(void *ptr);
+void mod_objcg_slab_state(struct obj_cgroup *objcg, int nid,
+			 bool reclaimable, int bytes);
+void mod_objcg_percpu_state(struct obj_cgroup *objcg, long bytes);
 #endif
 
 /*
@@ -292,6 +327,8 @@ struct mem_cgroup {
         /* Index in the kmem_cache->memcg_params.memcg_caches array */
 	int kmemcg_id;
 	enum memcg_kmem_state kmem_state;
+	struct obj_cgroup __rcu *objcg;
+	struct list_head objcg_list;
 	struct list_head kmem_caches;
 #endif
 
@@ -1283,9 +1320,21 @@ int memcg_kmem_charge(struct page *page, gfp_t gfp, int order);
 void memcg_kmem_uncharge(struct page *page, int order);
 
 #ifdef CONFIG_MEMCG_KMEM
+static inline bool obj_cgroup_tryget(struct obj_cgroup *objcg)
+{
+	return percpu_ref_tryget(&objcg->refcnt);
+}
+
+static inline void obj_cgroup_get(struct obj_cgroup *objcg)
+{
+	percpu_ref_get(&objcg->refcnt);
+}
+
+static inline void obj_cgroup_put(struct obj_cgroup *objcg)
+{
+	percpu_ref_put(&objcg->refcnt);
+}
 int memcg_kmem_prepare_bpf(void);
-struct mem_cgroup *memcg_kmem_charge_percpu(gfp_t gfp, unsigned int nr_pages);
-void memcg_kmem_uncharge_percpu(struct mem_cgroup *memcg, unsigned int nr_pages);
 extern struct static_key_false memcg_kmem_enabled_key;
 extern struct workqueue_struct *memcg_kmem_cache_wq;
 

@@ -191,6 +191,9 @@ struct page {
 
 #ifdef CONFIG_MEMCG
 	struct mem_cgroup *mem_cgroup;
+#ifdef CONFIG_MEMCG_KMEM
+	struct obj_cgroup **slab_objcgs;
+#endif
 #endif
 
 	/*

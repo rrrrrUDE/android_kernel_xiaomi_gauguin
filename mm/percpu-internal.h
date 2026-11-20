@@ -37,6 +37,9 @@ struct pcpu_chunk {
 	unsigned long		*alloc_map;	/* allocation map */
 	unsigned long		*bound_map;	/* boundary map */
 	struct pcpu_block_md	*md_blocks;	/* metadata blocks */
+#ifdef CONFIG_MEMCG_KMEM
+	struct obj_cgroup	**obj_cgroups;	/* ownership by allocation offset */
+#endif
 
 	void			*data;		/* chunk data */
 	int			first_bit;	/* no free below this */
