@@ -63,6 +63,7 @@ typedef u32 __le32;
 #define BPF_TRAMP_F_CALL_ORIG 2
 #define BPF_TRAMP_F_SKIP_FRAME 4
 #define BPF_TRAMP_F_IP_ARG 8
+#define BPF_TRAMP_F_RET_FENTRY_RET 16
 #define IS_ENABLED(x) 1
 struct bpf_prog_aux { bool sleepable; unsigned int stack_depth, func_idx; };
 struct bpf_prog { bool jited, is_func; void *bpf_func; void *insnsi;
@@ -81,8 +82,10 @@ int aarch64_insn_patch_text(void *addrs[], u32 insns[], int cnt) {
  return 0;
 }
 struct bpf_prog;
-void __bpf_prog_enter(void) {} void __bpf_prog_exit(void) {}
-void __bpf_prog_enter_sleepable(void) {} void __bpf_prog_exit_sleepable(void) {}
+u64 __bpf_prog_enter(struct bpf_prog *p) { return 1; }
+void __bpf_prog_exit(struct bpf_prog *p, u64 start) {}
+u64 __bpf_prog_enter_sleepable(struct bpf_prog *p) { return 1; }
+void __bpf_prog_exit_sleepable(struct bpf_prog *p, u64 start) {}
 void __bpf_tramp_enter(void) {} void __bpf_tramp_exit(void) {}
 static unsigned long ftrace_location(unsigned long ip) { return ip + 4; }
 static bool is_bpf_text_address(unsigned long ip) { return true; }
@@ -135,6 +138,9 @@ int generate(int nargs, int flags, int mods, int sleepable, int interpreted,
  if(flags & 2) { tp[1].nr_progs=1; tp[1].progs[0]=&progs[3]; }
  tp[2].nr_progs=mods;
  for(i=0;i<mods;i++) tp[2].progs[i]=&progs[i+1];
+ if(flags == 16)
+  return arch_prepare_bpf_trampoline(NULL,image,(char *)image+capacity,
+                                     &model,flags,tp,NULL);
  return prepare_trampoline(&im,image,(char *)image+capacity,&model,flags,tp,
                            (void *)0x300000UL);
 }
@@ -147,7 +153,7 @@ def build(directory):
     macros = MACROS.replace('#include <asm/insn.h>', '')
     encoders = INSN[INSN.index('static int __kprobes aarch64_get_imm_shift_mask'):
                     INSN.index('s32 aarch64_get_branch_offset')]
-    emitter = JIT[JIT.index('struct jit_ctx {'):JIT.index('/* Struct_ops callbacks')]
+    emitter = JIT[JIT.index('struct jit_ctx {'):JIT.index('/*\n * This is an unoptimized 64 immediate')]
     poke = JIT[JIT.index('int bpf_arch_text_poke('):]
     registers = '\n'.join(f'#define BPF_REG_{i} {i}' for i in range(10))
     registers += '\n#define BPF_REG_FP 10\n#define BPF_REG_AX 11\n#define MAX_BPF_JIT_REG 12\n'
@@ -177,7 +183,7 @@ def signed(value, bits):
     return value - (1 << bits) if value & (1 << (bits - 1)) else value
 
 
-def execute(lib, nargs, flags, mods, sleepable, interpreted, results, detach=False):
+def execute(lib, nargs, flags, mods, sleepable, interpreted, results, detach=False, recursive=False):
     size = lib.generate(nargs, flags, mods, sleepable, interpreted, 4096)
     assert size > 0, size
     base = lib.code()
@@ -189,6 +195,7 @@ def execute(lib, nargs, flags, mods, sleepable, interpreted, results, detach=Fal
     initial = regs[:]
     sp = original_sp = 0x800000
     parent, resume = 0x400000, 0x500000
+    struct_ops = flags == 16
     regs[9], regs[30] = parent, resume
     mem = {}
     args = initial[:8] + [0xdead000000001000 + i for i in range(8, nargs)]
@@ -209,11 +216,14 @@ def execute(lib, nargs, flags, mods, sleepable, interpreted, results, detach=Fal
             assert sp == original_sp
             assert regs[19:30] == initial[19:30]
             assert refs == locks == 0
-            if flags & 2:
-                modified = next((x for x in results if x), None)
+            if struct_ops:
+                assert regs[0] == 0
+                assert ('entry' in events) == (not recursive)
+            elif flags & 2:
+                modified = None if recursive else next((x for x in results if x), None)
                 assert regs[0] == (modified if modified is not None else 0xabcdef)
                 assert ('orig' in events) == (modified is None)
-                assert ('exit' in events) == (not detach or modified is not None)
+                assert ('exit' in events) == (not recursive and (not detach or modified is not None))
             else:
                 assert regs[:9] == initial[:9]
             return
@@ -259,8 +269,8 @@ def execute(lib, nargs, flags, mods, sleepable, interpreted, results, detach=Fal
         elif insn & 0xffc00000 == 0xd3400000:
             assert ((insn >> 16) & 63) == 0
             regs[rd] = read(rn) & ((1 << (((insn >> 10) & 63) + 1)) - 1)
-        elif insn & 0xff000000 == 0xb5000000:
-            if read(rd):
+        elif insn & 0xfe000000 == 0xb4000000:
+            if bool(read(rd)) == bool(insn & (1 << 24)):
                 nxt = pc + signed((insn >> 5) & 0x7ffff, 19) * 4
         elif insn & 0xfc000000 == 0x14000000:
             nxt = pc + signed(insn & 0x3ffffff, 26) * 4
@@ -274,16 +284,17 @@ def execute(lib, nargs, flags, mods, sleepable, interpreted, results, detach=Fal
                 kind = hooks[target]
                 if kind in (0, 2):
                     locks += 1
-                    result = 0x123456 if kind == 0 else 0xbad
+                    assert regs[0] != 0
+                    result = 0 if recursive else 0x123456
                 elif kind in (1, 3):
                     locks -= 1
-                    if kind == 1:
-                        assert regs[1] == 0x123456
+                    assert regs[1] == (0 if recursive else 0x123456)
                 elif kind == 4:
                     refs += 1
                 else:
                     refs -= 1
             elif 0x100000 <= target < 0x100040:
+                assert not recursive
                 which = (target - 0x100000) // 16
                 ctx = regs[0]
                 assert [mem[ctx + i * 8] for i in range(nargs)] == expected
@@ -333,6 +344,13 @@ def main():
                                 execute(lib, nargs, 6 | ip, len(results), sleepable,
                                         interpreted, results, detach)
                                 count += 1
+                                execute(lib, nargs, 6 | ip, len(results), sleepable,
+                                        interpreted, results, detach, recursive=True)
+                                count += 1
+        for nargs in (0, 1, 5, 8):
+            for recursive in (False, True):
+                execute(lib, nargs, 16, 0, 0, 0, [], recursive=recursive)
+                count += 1
         assert lib.generate(12, 1, 0, 0, 0, 4096) == -524
         assert lib.generate(1, 7, 0, 0, 0, 4096) == -524
         assert lib.generate(1, 1, 0, 0, 0, 4) == -7

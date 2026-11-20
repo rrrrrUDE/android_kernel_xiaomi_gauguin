@@ -60,7 +60,10 @@ struct bpf_reg_state {
 			u32 map_uid;
 		};
 
-		u32 btf_id; /* for PTR_TO_BTF_ID */
+		struct {
+			struct btf *btf;
+			u32 btf_id; /* for PTR_TO_BTF_ID */
+		};
 
 		u32 mem_size; /* for PTR_TO_MEM | PTR_TO_MEM_OR_NULL */
 		u32 subprogno; /* for PTR_TO_FUNC */
@@ -360,6 +363,7 @@ struct bpf_insn_aux_data {
 		};
 		struct {
 			enum bpf_reg_type reg_type;	/* type of pseudo_btf_id */
+			struct btf *btf;
 			union {
 				u32 btf_id;	/* btf_id for struct typed var */
 				u32 mem_size;	/* mem_size for non-struct typed var */
@@ -378,6 +382,7 @@ struct bpf_insn_aux_data {
 	bool prune_point;
 };
 
+#define MAX_USED_BTFS 64
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
 
 #define BPF_VERIFIER_TMP_LOG_SIZE	1024
@@ -448,6 +453,8 @@ struct bpf_verifier_env {
 	struct bpf_verifier_state_list *free_list;
 	struct bpf_map *used_maps[MAX_USED_MAPS]; /* array of map's used by eBPF program */
 	bpfptr_t fd_array;
+	struct btf_mod_pair used_btfs[MAX_USED_BTFS];
+	u32 used_btf_cnt;
 	u32 used_map_cnt;		/* number of used maps */
 	u32 id_gen;			/* used to generate unique reg IDs */
 	bool explore_alu_limits;

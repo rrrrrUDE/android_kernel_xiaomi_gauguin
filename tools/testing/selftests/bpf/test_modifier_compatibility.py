@@ -38,12 +38,14 @@ struct bpf_reg_state { enum_placeholder unused; };
 '''.replace('struct bpf_reg_state { enum_placeholder unused; };','')
 pre += enum('bpf_type_flag') + enum('bpf_arg_type') + enum('bpf_reg_type')
 pre += r'''
-struct bpf_reg_state { enum bpf_reg_type type; int off; u32 btf_id; struct tnum var_off; };
+struct btf {};
+static struct btf *btf_vmlinux;
+struct bpf_reg_state { enum bpf_reg_type type; int off; struct btf *btf; u32 btf_id; struct tnum var_off; };
 struct bpf_verifier_env { int log; struct bpf_reg_state regs[11]; };
 #define cur_regs(env) ((env)->regs)
 static int tnum_is_const(struct tnum x) { return 1; }
-static int btf_struct_ids_match(void *l, int off, u32 id, u32 want) { return id == want; }
-static const char *kernel_type_name(u32 id) { return "stub"; }
+static int btf_struct_ids_match(void *l, const struct btf *btf, u32 id, int off, const struct btf *want_btf, u32 want) { return id == want && btf == want_btf; }
+static const char *kernel_type_name(const struct btf *btf, u32 id) { return "stub"; }
 static const char *reg_type_str(struct bpf_verifier_env *e, int type) { return "stub"; }
 '''
 a = s.index('struct bpf_reg_types {'); b = s.index('static int check_func_arg(', a)

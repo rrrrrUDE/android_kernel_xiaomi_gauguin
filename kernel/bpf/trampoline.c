@@ -528,58 +528,102 @@ out:
 	mutex_unlock(&trampoline_mutex);
 }
 
-/* The logic is similar to BPF_PROG_RUN, but with an explicit
+#define NO_START_TIME 1
+static u64 notrace bpf_prog_start_time(void)
+{
+	u64 start = NO_START_TIME;
+
+	if (static_branch_unlikely(&bpf_stats_enabled_key)) {
+		start = sched_clock();
+		if (unlikely(!start))
+			start = NO_START_TIME;
+	}
+	return start;
+}
+
+static void notrace inc_misses_counter(struct bpf_prog *prog)
+{
+	struct bpf_prog_stats *stats;
+	unsigned int flags;
+
+	stats = this_cpu_ptr(prog->aux->stats);
+	flags = u64_stats_update_begin_irqsave(&stats->syncp);
+	stats->misses++;
+	u64_stats_update_end_irqrestore(&stats->syncp, flags);
+}
+
+/* The logic is similar to bpf_prog_run(), but with an explicit
  * rcu_read_lock() and migrate_disable() which are required
  * for the trampoline. The macro is split into
- * call _bpf_prog_enter
+ * call __bpf_prog_enter
  * call prog->bpf_func
  * call __bpf_prog_exit
+ *
+ * __bpf_prog_enter returns:
+ * 0 - skip execution of the bpf prog
+ * 1 - execute bpf prog
+ * [2..MAX_U64] - execute bpf prog and record execution time.
+ *     This is start time.
  */
-u64 notrace __bpf_prog_enter(void)
+u64 notrace __bpf_prog_enter(struct bpf_prog *prog)
 	__acquires(RCU)
 {
-	u64 start = 0;
-
 	rcu_read_lock();
 	migrate_disable();
-	if (static_branch_unlikely(&bpf_stats_enabled_key))
-		start = sched_clock();
-	return start;
+	if (unlikely(__this_cpu_inc_return(*(prog->active)) != 1)) {
+		inc_misses_counter(prog);
+		return 0;
+	}
+	return bpf_prog_start_time();
+}
+
+static void notrace update_prog_stats(struct bpf_prog *prog,
+				      u64 start)
+{
+	struct bpf_prog_stats *stats;
+
+	if (static_branch_unlikely(&bpf_stats_enabled_key) &&
+	    /* static_key could be enabled in __bpf_prog_enter*
+	     * and disabled in __bpf_prog_exit*.
+	     * And vice versa.
+	     * Hence check that 'start' is valid.
+	     */
+	    start > NO_START_TIME) {
+		unsigned long flags;
+
+		stats = this_cpu_ptr(prog->aux->stats);
+		flags = u64_stats_update_begin_irqsave(&stats->syncp);
+		stats->cnt++;
+		stats->nsecs += sched_clock() - start;
+		u64_stats_update_end_irqrestore(&stats->syncp, flags);
+	}
 }
 
 void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
 	__releases(RCU)
 {
-	struct bpf_prog_stats *stats;
-
-	if (static_branch_unlikely(&bpf_stats_enabled_key) &&
-	    /* static_key could be enabled in __bpf_prog_enter
-	     * and disabled in __bpf_prog_exit.
-	     * And vice versa.
-	     * Hence check that 'start' is not zero.
-	     */
-	    start) {
-		preempt_disable();
-		stats = this_cpu_ptr(prog->aux->stats);
-		u64_stats_update_begin(&stats->syncp);
-		stats->cnt++;
-		stats->nsecs += sched_clock() - start;
-		u64_stats_update_end(&stats->syncp);
-		preempt_enable();
-	}
+	update_prog_stats(prog, start);
+	__this_cpu_dec(*(prog->active));
 	migrate_enable();
 	rcu_read_unlock();
 }
 
-void notrace __bpf_prog_enter_sleepable(void)
+u64 notrace __bpf_prog_enter_sleepable(struct bpf_prog *prog)
 {
 	rcu_read_lock_trace();
 	migrate_disable();
 	might_fault();
+	if (unlikely(__this_cpu_inc_return(*(prog->active)) != 1)) {
+		inc_misses_counter(prog);
+		return 0;
+	}
+	return bpf_prog_start_time();
 }
 
-void notrace __bpf_prog_exit_sleepable(void)
+void notrace __bpf_prog_exit_sleepable(struct bpf_prog *prog, u64 start)
 {
+	update_prog_stats(prog, start);
+	__this_cpu_dec(*(prog->active));
 	migrate_enable();
 	rcu_read_unlock_trace();
 }

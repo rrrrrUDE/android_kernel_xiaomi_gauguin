@@ -171,21 +171,25 @@ static void tramp_invoke(struct jit_ctx *ctx, struct bpf_prog *prog,
 			 bool save_ret)
 {
 	bool sleepable = prog->aux->sleepable;
+	int branch;
 
+	emit_a64_mov_i64(A64_R(0), (unsigned long)prog, ctx);
 	tramp_call(ctx, sleepable ? (unsigned long)__bpf_prog_enter_sleepable :
 		   (unsigned long)__bpf_prog_enter);
-	if (!sleepable)
-		emit(A64_MOV(1, A64_R(20), A64_R(0)), ctx);
+	emit(A64_MOV(1, A64_R(20), A64_R(0)), ctx);
+	branch = ctx->idx;
+	emit(A64_CBZ(1, A64_R(0), 0), ctx);
 	emit(A64_ADD_I(1, A64_R(0), A64_SP, ctx_off), ctx);
 	if (!prog->jited)
 		emit_a64_mov_i64(A64_R(1), (unsigned long)prog->insnsi, ctx);
 	tramp_call(ctx, (unsigned long)prog->bpf_func);
 	if (save_ret)
 		tramp_store(ctx, A64_R(0), ret_off);
-	if (!sleepable) {
-		emit_a64_mov_i64(A64_R(0), (unsigned long)prog, ctx);
-		emit(A64_MOV(1, A64_R(1), A64_R(20)), ctx);
-	}
+	if (ctx->image)
+		ctx->image[branch] = cpu_to_le32(A64_CBZ(1, A64_R(0),
+						       ctx->idx - branch));
+	emit_a64_mov_i64(A64_R(0), (unsigned long)prog, ctx);
+	emit(A64_MOV(1, A64_R(1), A64_R(20)), ctx);
 	tramp_call(ctx, sleepable ? (unsigned long)__bpf_prog_exit_sleepable :
 		   (unsigned long)__bpf_prog_exit);
 }
@@ -354,7 +358,7 @@ int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
 {
 	struct bpf_prog *prog;
 	struct jit_ctx ctx = { .image = image };
-	int i;
+	int i, branch;
 
 	if (im && orig_call)
 		return prepare_trampoline(im, image, image_end, m, flags,
@@ -392,13 +396,19 @@ int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
 	}
 
 	emit_a64_mov_i64(A64_R(19), (unsigned long)prog, &ctx);
+	emit(A64_MOV(1, A64_R(0), A64_R(19)), &ctx);
 	emit_a64_mov_i64(A64_R(10), (unsigned long)__bpf_prog_enter, &ctx);
 	emit(A64_BLR(A64_R(10)), &ctx);
 	emit(A64_MOV(1, A64_R(20), A64_R(0)), &ctx);
+	emit(A64_MOVZ(1, A64_R(21), 0, 0), &ctx);
+	branch = ctx.idx;
+	emit(A64_CBZ(1, A64_R(0), 0), &ctx);
 	emit(A64_MOV(1, A64_R(0), A64_SP), &ctx);
 	emit_a64_mov_i64(A64_R(10), (unsigned long)prog->bpf_func, &ctx);
 	emit(A64_BLR(A64_R(10)), &ctx);
 	emit(A64_MOV(1, A64_R(21), A64_R(0)), &ctx);
+	ctx.image[branch] = cpu_to_le32(A64_CBZ(1, A64_R(0),
+						ctx.idx - branch));
 	emit(A64_MOV(1, A64_R(0), A64_R(19)), &ctx);
 	emit(A64_MOV(1, A64_R(1), A64_R(20)), &ctx);
 	emit_a64_mov_i64(A64_R(10), (unsigned long)__bpf_prog_exit, &ctx);

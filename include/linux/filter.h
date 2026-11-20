@@ -570,6 +570,7 @@ struct bpf_binary_header {
 };
 
 struct bpf_prog {
+	int __percpu		*active;
 	u16			pages;		/* Number of allocated pages */
 	u16			jited:1,	/* Is our filter JIT'ed? */
 				jit_requested:1,/* archs need to JIT the prog */

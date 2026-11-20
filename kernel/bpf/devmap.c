@@ -473,12 +473,16 @@ static struct xdp_buff *dev_map_run_prog(struct net_device *dev,
 					 struct bpf_prog *xdp_prog)
 {
 	struct xdp_txq_info txq = { .dev = dev };
+	struct xdp_txq_info *old_txq = xdp->txq;
 	u32 act;
 
-	xdp_set_data_meta_invalid(xdp);
+	/* Frame conversion represents unsupported metadata as zero bytes. */
+	if (xdp_data_meta_unsupported(xdp))
+		xdp->data_meta = xdp->data;
 	xdp->txq = &txq;
 
 	act = bpf_prog_run_xdp(xdp_prog, xdp);
+	xdp->txq = old_txq;
 	switch (act) {
 	case XDP_PASS:
 		return xdp;
@@ -550,7 +554,7 @@ static int dev_map_enqueue_clone(struct bpf_dtab_netdev *dst,
 {
 	struct xdp_frame *clone = dev_map_clone_frame(source);
 	struct xdp_rxq_info rxq;
-	struct xdp_buff xdp;
+	struct xdp_buff xdp = {};
 
 	if (!clone)
 		return -ENOMEM;

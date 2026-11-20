@@ -25,6 +25,7 @@
 #include <linux/sched.h>
 #include <linux/workqueue.h>
 #include <linux/kthread.h>
+#include <linux/completion.h>
 #include <linux/capability.h>
 #include <trace/events/xdp.h>
 
@@ -62,6 +63,7 @@ struct bpf_cpu_map_entry {
 	/* Queue with potential multi-producers, and single-consumer kthread */
 	struct ptr_ring *queue;
 	struct task_struct *kthread;
+	struct completion kthread_running;
 
 	struct bpf_cpumap_val value;
 	struct bpf_prog *prog;
@@ -359,6 +361,7 @@ static int cpu_map_kthread_run(void *data)
 	struct bpf_cpu_map_entry *rcpu = data;
 	unsigned long last_qs = jiffies;
 
+	complete(&rcpu->kthread_running);
 	set_current_state(TASK_INTERRUPTIBLE);
 
 	/* When kthread gives stop order, then rcpu have been disconnected
@@ -534,6 +537,7 @@ __cpu_map_entry_alloc(struct bpf_map *map, struct bpf_cpumap_val *value,
 		goto free_ptr_ring;
 
 	/* Setup kthread */
+	init_completion(&rcpu->kthread_running);
 	rcpu->kthread = kthread_create_on_node(cpu_map_kthread_run, rcpu, numa,
 					       "cpumap/%d/map:%d", cpu, map_id);
 	if (IS_ERR(rcpu->kthread))
@@ -545,6 +549,8 @@ __cpu_map_entry_alloc(struct bpf_map *map, struct bpf_cpumap_val *value,
 	/* Make sure kthread runs on a single CPU */
 	kthread_bind(rcpu->kthread, cpu);
 	wake_up_process(rcpu->kthread);
+	/* A stopped thread must have entered threadfn to drop its reference. */
+	wait_for_completion(&rcpu->kthread_running);
 
 	return rcpu;
 
