@@ -765,6 +765,22 @@ int security_bprm_set_creds(struct linux_binprm *bprm)
 	return call_int_hook(bprm_set_creds, 0, bprm);
 }
 
+int security_bprm_creds_for_exec(struct linux_binprm *bprm)
+{
+	return call_int_hook(bprm_creds_for_exec, 0, bprm);
+}
+
+int security_bprm_creds_from_file(struct linux_binprm *bprm, struct file *file)
+{
+	return call_int_hook(bprm_creds_from_file, 0, bprm, file);
+}
+
+int security_path_notify(const struct path *path, u64 mask,
+			 unsigned int obj_type)
+{
+	return call_int_hook(path_notify, 0, path, mask, obj_type);
+}
+
 int security_bprm_check(struct linux_binprm *bprm)
 {
 	int ret;
@@ -1715,6 +1731,25 @@ void security_task_getsecid(struct task_struct *p, u32 *secid)
 	call_void_hook(task_getsecid, p, secid);
 }
 EXPORT_SYMBOL(security_task_getsecid);
+
+void security_task_getsecid_subj(struct task_struct *p, u32 *secid)
+{
+	*secid = 0;
+	call_void_hook(task_getsecid_subj, p, secid);
+}
+EXPORT_SYMBOL(security_task_getsecid_subj);
+
+void security_task_getsecid_obj(struct task_struct *p, u32 *secid)
+{
+	*secid = 0;
+	call_void_hook(task_getsecid_obj, p, secid);
+}
+EXPORT_SYMBOL(security_task_getsecid_obj);
+
+int security_create_user_ns(const struct cred *cred)
+{
+	return call_int_hook(userns_create, 0, cred);
+}
 
 int security_task_setnice(struct task_struct *p, int nice)
 {

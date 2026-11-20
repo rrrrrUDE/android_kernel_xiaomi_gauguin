@@ -874,6 +874,13 @@ static int do_fanotify_mark(int fanotify_fd, unsigned int flags, __u64 mask,
 	if (ret)
 		goto fput_and_out;
 
+	/* Match the 5.15 hook's object-type values, not 4.19's enum layout. */
+	ret = security_path_notify(&path, mask, flags & FAN_MARK_MOUNT ? 2 : 0);
+	if (ret) {
+		path_put(&path);
+		goto fput_and_out;
+	}
+
 	/* inode held in place by reference to path; group by fget on fd */
 	if (!(flags & FAN_MARK_MOUNT))
 		inode = path.dentry->d_inode;

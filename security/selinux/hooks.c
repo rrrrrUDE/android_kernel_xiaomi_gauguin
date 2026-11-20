@@ -4041,6 +4041,13 @@ static void selinux_task_getsecid(struct task_struct *p, u32 *secid)
 	*secid = task_sid(p);
 }
 
+static void selinux_task_getsecid_subj(struct task_struct *p, u32 *secid)
+{
+	rcu_read_lock();
+	*secid = cred_sid(rcu_dereference(p->cred));
+	rcu_read_unlock();
+}
+
 static int selinux_task_setnice(struct task_struct *p, int nice)
 {
 	return avc_has_perm(&selinux_state,
@@ -6949,6 +6956,8 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(task_getpgid, selinux_task_getpgid),
 	LSM_HOOK_INIT(task_getsid, selinux_task_getsid),
 	LSM_HOOK_INIT(task_getsecid, selinux_task_getsecid),
+	LSM_HOOK_INIT(task_getsecid_subj, selinux_task_getsecid_subj),
+	LSM_HOOK_INIT(task_getsecid_obj, selinux_task_getsecid),
 	LSM_HOOK_INIT(task_setnice, selinux_task_setnice),
 	LSM_HOOK_INIT(task_setioprio, selinux_task_setioprio),
 	LSM_HOOK_INIT(task_getioprio, selinux_task_getioprio),

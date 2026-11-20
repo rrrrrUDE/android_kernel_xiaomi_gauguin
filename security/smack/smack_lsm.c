@@ -45,6 +45,9 @@
 #include <linux/parser.h>
 #include "smack.h"
 
+static inline struct superblock_smack *
+smack_superblock(const struct super_block *sb);
+
 #define TRANS_TRUE	"TRUE"
 #define TRANS_TRUE_SIZE	4
 
@@ -2126,6 +2129,16 @@ static void smack_task_getsecid(struct task_struct *p, u32 *secid)
 	struct smack_known *skp = smk_of_task_struct(p);
 
 	*secid = skp->smk_secid;
+}
+
+static void smack_task_getsecid_subj(struct task_struct *p, u32 *secid)
+{
+	struct smack_known *skp;
+
+	rcu_read_lock();
+	skp = smk_of_task(smack_cred(rcu_dereference(p->cred)));
+	*secid = skp->smk_secid;
+	rcu_read_unlock();
 }
 
 /**
@@ -4702,6 +4715,8 @@ static struct security_hook_list smack_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(task_getpgid, smack_task_getpgid),
 	LSM_HOOK_INIT(task_getsid, smack_task_getsid),
 	LSM_HOOK_INIT(task_getsecid, smack_task_getsecid),
+	LSM_HOOK_INIT(task_getsecid_subj, smack_task_getsecid_subj),
+	LSM_HOOK_INIT(task_getsecid_obj, smack_task_getsecid),
 	LSM_HOOK_INIT(task_setnice, smack_task_setnice),
 	LSM_HOOK_INIT(task_setioprio, smack_task_setioprio),
 	LSM_HOOK_INIT(task_getioprio, smack_task_getioprio),

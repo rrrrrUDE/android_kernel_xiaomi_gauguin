@@ -464,16 +464,16 @@ s32 btf_find_by_name_kind(const struct btf *btf, const char *name, u8 kind)
 {
 	const struct btf_type *t;
 	const char *tname;
-	u32 i;
+	u32 i, total = btf->start_id + btf->nr_types + !btf->base_btf;
 
-	for (i = 1; i <= btf->nr_types; i++) {
-		t = btf->types[i];
+	for (i = 1; i < total; i++) {
+		t = btf_type_by_id(btf, i);
 		if (BTF_INFO_KIND(t->info) != kind)
 			continue;
 
 		tname = btf_name_by_offset(btf, t->name_off);
 		if (!strcmp(tname, name))
-			return btf->start_id + i - !!btf->base_btf;
+			return i;
 	}
 
 	return -ENOENT;

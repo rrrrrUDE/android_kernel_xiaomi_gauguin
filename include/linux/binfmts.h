@@ -50,6 +50,8 @@ struct linux_binprm {
 #endif
 	unsigned int recursion_depth; /* only for search_binary_handler() */
 	struct file * file;
+	/* File used by the most recent credential preparation (binfmt_misc C). */
+	struct file *cred_file;
 	struct cred *cred;	/* new credentials */
 	int unsafe;		/* how unsafe this exec is (mask of LSM_UNSAFE_*) */
 	unsigned int per_clear;	/* bits to clear in current->personality */

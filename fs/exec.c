@@ -1269,6 +1269,12 @@ int flush_old_exec(struct linux_binprm * bprm)
 {
 	int retval;
 
+	/* The final executable is known before the old image is torn down. */
+	retval = security_bprm_creds_from_file(bprm,
+					     bprm->cred_file ?: bprm->file);
+	if (retval)
+		return retval;
+
 	/*
 	 * Make sure we have a private signal table and that
 	 * we are unassociated from the previous thread group.
@@ -1435,6 +1441,8 @@ int prepare_bprm_creds(struct linux_binprm *bprm)
 static void free_bprm(struct linux_binprm *bprm)
 {
 	free_arg_pages(bprm);
+	if (bprm->cred_file)
+		fput(bprm->cred_file);
 	if (bprm->cred) {
 		mutex_unlock(&current->signal->cred_guard_mutex);
 		abort_creds(bprm->cred);
@@ -1602,6 +1610,9 @@ int prepare_binprm(struct linux_binprm *bprm)
 	if (retval)
 		return retval;
 	bprm->called_set_creds = 1;
+	if (bprm->cred_file)
+		fput(bprm->cred_file);
+	bprm->cred_file = get_file(bprm->file);
 
 	memset(bprm->buf, 0, BINPRM_BUF_SIZE);
 	return kernel_read(bprm->file, bprm->buf, BINPRM_BUF_SIZE, &pos);
@@ -1810,6 +1821,10 @@ static int __do_execve_file(int fd, struct filename *filename,
 		bprm->filename = pathbuf;
 	}
 	bprm->interp = bprm->filename;
+
+	retval = security_bprm_creds_for_exec(bprm);
+	if (retval)
+		goto out_unmark;
 
 	retval = bprm_mm_init(bprm);
 	if (retval)

@@ -13,6 +13,7 @@
 #include <linux/proc_ns.h>
 #include <linux/highuid.h>
 #include <linux/cred.h>
+#include <linux/security.h>
 #include <linux/securebits.h>
 #include <linux/keyctl.h>
 #include <linux/key-type.h>
@@ -104,6 +105,10 @@ int create_user_ns(struct cred *new)
 	ret = -EPERM;
 	if (!kuid_has_mapping(parent_ns, owner) ||
 	    !kgid_has_mapping(parent_ns, group))
+		goto fail_dec;
+
+	ret = security_create_user_ns(new);
+	if (ret)
 		goto fail_dec;
 
 	ret = -ENOMEM;

@@ -50,6 +50,9 @@ LSM_HOOK(int, 0, settime, const struct timespec64 *ts,
 	 const struct timezone *tz)
 LSM_HOOK(int, 1, vm_enough_memory, struct mm_struct *mm, long pages)
 LSM_HOOK(int, 0, bprm_set_creds, struct linux_binprm *bprm)
+LSM_HOOK(int, 0, bprm_creds_for_exec, struct linux_binprm *bprm)
+LSM_HOOK(int, 0, bprm_creds_from_file, struct linux_binprm *bprm,
+	 struct file *file)
 LSM_HOOK(int, 0, bprm_check_security, struct linux_binprm *bprm)
 LSM_HOOK(void, LSM_RET_VOID, bprm_committing_creds, struct linux_binprm *bprm)
 LSM_HOOK(void, LSM_RET_VOID, bprm_committed_creds, struct linux_binprm *bprm)
@@ -97,6 +100,9 @@ LSM_HOOK(int, 0, path_chmod, const struct path *path, umode_t mode)
 LSM_HOOK(int, 0, path_chown, const struct path *path, kuid_t uid, kgid_t gid)
 LSM_HOOK(int, 0, path_chroot, const struct path *path)
 #endif /* CONFIG_SECURITY_PATH */
+
+LSM_HOOK(int, 0, path_notify, const struct path *path, u64 mask,
+	 unsigned int obj_type)
 
 /* Needed for inode based security check */
 LSM_HOOK(int, 0, inode_alloc_security, struct inode *inode)
@@ -190,6 +196,11 @@ LSM_HOOK(int, 0, task_setpgid, struct task_struct *p, pid_t pgid)
 LSM_HOOK(int, 0, task_getpgid, struct task_struct *p)
 LSM_HOOK(int, 0, task_getsid, struct task_struct *p)
 LSM_HOOK(void, LSM_RET_VOID, task_getsecid, struct task_struct *p, u32 *secid)
+LSM_HOOK(void, LSM_RET_VOID, task_getsecid_subj, struct task_struct *p,
+	 u32 *secid)
+LSM_HOOK(void, LSM_RET_VOID, task_getsecid_obj, struct task_struct *p,
+	 u32 *secid)
+LSM_HOOK(int, 0, userns_create, const struct cred *cred)
 LSM_HOOK(int, 0, task_setnice, struct task_struct *p, int nice)
 LSM_HOOK(int, 0, task_setioprio, struct task_struct *p, int ioprio)
 LSM_HOOK(int, 0, task_getioprio, struct task_struct *p)

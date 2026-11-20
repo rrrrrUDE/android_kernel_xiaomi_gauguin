@@ -263,6 +263,10 @@ int security_syslog(int type);
 int security_settime64(const struct timespec64 *ts, const struct timezone *tz);
 int security_vm_enough_memory_mm(struct mm_struct *mm, long pages);
 int security_bprm_set_creds(struct linux_binprm *bprm);
+int security_bprm_creds_for_exec(struct linux_binprm *bprm);
+int security_bprm_creds_from_file(struct linux_binprm *bprm, struct file *file);
+int security_path_notify(const struct path *path, u64 mask,
+			 unsigned int obj_type);
 int security_bprm_check(struct linux_binprm *bprm);
 void security_bprm_committing_creds(struct linux_binprm *bprm);
 void security_bprm_committed_creds(struct linux_binprm *bprm);
@@ -384,6 +388,9 @@ int security_task_setpgid(struct task_struct *p, pid_t pgid);
 int security_task_getpgid(struct task_struct *p);
 int security_task_getsid(struct task_struct *p);
 void security_task_getsecid(struct task_struct *p, u32 *secid);
+void security_task_getsecid_subj(struct task_struct *p, u32 *secid);
+void security_task_getsecid_obj(struct task_struct *p, u32 *secid);
+int security_create_user_ns(const struct cred *cred);
 int security_task_setnice(struct task_struct *p, int nice);
 int security_task_setioprio(struct task_struct *p, int ioprio);
 int security_task_getioprio(struct task_struct *p);
@@ -564,6 +571,23 @@ static inline int security_bprm_set_creds(struct linux_binprm *bprm)
 }
 
 static inline int security_bprm_check(struct linux_binprm *bprm)
+{
+	return 0;
+}
+
+static inline int security_bprm_creds_for_exec(struct linux_binprm *bprm)
+{
+	return 0;
+}
+
+static inline int security_bprm_creds_from_file(struct linux_binprm *bprm,
+					     struct file *file)
+{
+	return 0;
+}
+
+static inline int security_path_notify(const struct path *path, u64 mask,
+				       unsigned int obj_type)
 {
 	return 0;
 }
@@ -1039,6 +1063,21 @@ static inline int security_task_getsid(struct task_struct *p)
 static inline void security_task_getsecid(struct task_struct *p, u32 *secid)
 {
 	*secid = 0;
+}
+
+static inline void security_task_getsecid_subj(struct task_struct *p, u32 *secid)
+{
+	*secid = 0;
+}
+
+static inline void security_task_getsecid_obj(struct task_struct *p, u32 *secid)
+{
+	*secid = 0;
+}
+
+static inline int security_create_user_ns(const struct cred *cred)
+{
+	return 0;
 }
 
 static inline int security_task_setnice(struct task_struct *p, int nice)
