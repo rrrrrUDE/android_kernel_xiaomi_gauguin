@@ -1184,10 +1184,43 @@ int bpf_prog_array_copy(struct bpf_prog_array *old_array,
 			u64 bpf_cookie,
 			struct bpf_prog_array **new_array);
 
+struct bpf_run_ctx {};
+
+struct bpf_cg_run_ctx {
+	struct bpf_run_ctx run_ctx;
+	const struct bpf_prog_array_item *prog_item;
+};
+
+struct bpf_trace_run_ctx {
+	struct bpf_run_ctx run_ctx;
+	u64 bpf_cookie;
+};
+
+static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
+{
+	struct bpf_run_ctx *old_ctx = NULL;
+
+#ifdef CONFIG_BPF_SYSCALL
+	old_ctx = current->bpf_ctx;
+	current->bpf_ctx = new_ctx;
+#endif
+	return old_ctx;
+}
+
+static inline void bpf_reset_run_ctx(struct bpf_run_ctx *old_ctx)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	current->bpf_ctx = old_ctx;
+#endif
+}
+
 #define __BPF_PROG_RUN_ARRAY(array, ctx, func, check_non_null, set_cg_storage) \
 	({						\
+		__label__ _out; \
 		struct bpf_prog_array_item *_item;	\
 		struct bpf_prog *_prog;			\
+		struct bpf_run_ctx *_old_ctx; \
+		struct bpf_cg_run_ctx _run_ctx; \
 		struct bpf_prog_array *_array;		\
 		u32 _ret = 1;				\
 		migrate_disable();			\
@@ -1195,18 +1228,18 @@ int bpf_prog_array_copy(struct bpf_prog_array *old_array,
 		_array = rcu_dereference(array);	\
 		if (unlikely(check_non_null && !_array))\
 			goto _out;			\
+		_old_ctx = NULL; \
+		if (set_cg_storage) \
+			_old_ctx = bpf_set_run_ctx(&_run_ctx.run_ctx); \
 		_item = &_array->items[0];		\
 		while ((_prog = READ_ONCE(_item->prog))) {		\
-			if (!set_cg_storage) {			\
-				_ret &= func(_prog, ctx);	\
-			} else {				\
-				if (unlikely(bpf_cgroup_storage_set(_item->cgroup_storage)))	\
-					break;			\
-				_ret &= func(_prog, ctx);	\
-				bpf_cgroup_storage_unset();	\
-			}				\
+			if (set_cg_storage)		\
+				_run_ctx.prog_item = _item;	\
+			_ret &= func(_prog, ctx);		\
 			_item++;			\
 		}					\
+		if (set_cg_storage) \
+			bpf_reset_run_ctx(_old_ctx); \
 _out:							\
 		rcu_read_unlock();			\
 		migrate_enable();			\
@@ -1239,6 +1272,8 @@ _out:							\
 	({						\
 		struct bpf_prog_array_item *_item;	\
 		struct bpf_prog *_prog;			\
+		struct bpf_run_ctx *_old_ctx; \
+		struct bpf_cg_run_ctx _run_ctx; \
 		struct bpf_prog_array *_array;		\
 		u32 ret;				\
 		u32 _ret = 1;				\
@@ -1246,16 +1281,16 @@ _out:							\
 		migrate_disable();			\
 		rcu_read_lock();			\
 		_array = rcu_dereference(array);	\
+		_old_ctx = bpf_set_run_ctx(&_run_ctx.run_ctx); \
 		_item = &_array->items[0];		\
 		while ((_prog = READ_ONCE(_item->prog))) {		\
-			if (unlikely(bpf_cgroup_storage_set(_item->cgroup_storage)))	\
-				break;			\
+			_run_ctx.prog_item = _item;			\
 			ret = func(_prog, ctx);		\
-			bpf_cgroup_storage_unset();	\
 			_ret &= (ret & 1);		\
 			_cn |= (ret & 2);		\
 			_item++;			\
 		}					\
+		bpf_reset_run_ctx(_old_ctx); \
 		rcu_read_unlock();			\
 		migrate_enable();			\
 		if (_ret)				\
@@ -1278,21 +1313,23 @@ _out:							\
 	({							\
 		struct bpf_prog_array_item *_item;			\
 		struct bpf_prog *_prog;				\
+		struct bpf_run_ctx *_old_ctx; \
+		struct bpf_cg_run_ctx _run_ctx; \
 		struct bpf_prog_array *_array;			\
 		u32 _ret = 1, _func_ret;				\
 		migrate_disable();					\
 		rcu_read_lock();					\
 		_array = rcu_dereference(array);			\
+		_old_ctx = bpf_set_run_ctx(&_run_ctx.run_ctx); \
 		_item = &_array->items[0];				\
 		while ((_prog = READ_ONCE(_item->prog))) {		\
-			if (unlikely(bpf_cgroup_storage_set(_item->cgroup_storage)))\
-				break;					\
+			_run_ctx.prog_item = _item;					\
 			_func_ret = func(_prog, ctx);			\
 			_ret &= _func_ret & 1;				\
 			*(ret_flags) |= _func_ret >> 1;			\
-			bpf_cgroup_storage_unset();			\
 			_item++;					\
 		}						\
+		bpf_reset_run_ctx(_old_ctx); \
 		rcu_read_unlock();					\
 		migrate_enable();					\
 		_ret;						\
@@ -1477,8 +1514,10 @@ typedef int (*bpf_iter_fill_link_info_t)(const struct bpf_iter_aux_info *aux,
 					 struct bpf_link_info *info);
 
 #define BPF_ITER_CTX_ARG_MAX 2
+#define BPF_ITER_RESCHED BIT(0)
 struct bpf_iter_reg {
 	const char *target;
+	u32 feature;
 	bpf_iter_attach_target_t attach_target;
 	bpf_iter_detach_target_t detach_target;
 	bpf_iter_show_fdinfo_t show_fdinfo;

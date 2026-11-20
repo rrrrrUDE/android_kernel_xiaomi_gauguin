@@ -146,6 +146,7 @@ bool bpf_selem_unlink_storage_nolock(struct bpf_local_storage *local_storage,
 
 static void __bpf_selem_unlink_storage(struct bpf_local_storage_elem *selem)
 {
+	unsigned long flags;
 	struct bpf_local_storage *local_storage;
 	bool free_local_storage = false;
 
@@ -154,11 +155,11 @@ static void __bpf_selem_unlink_storage(struct bpf_local_storage_elem *selem)
 		return;
 
 	local_storage = rcu_dereference(selem->local_storage);
-	raw_spin_lock_bh(&local_storage->lock);
+	raw_spin_lock_irqsave(&local_storage->lock, flags);
 	if (likely(selem_linked_to_storage(selem)))
 		free_local_storage = bpf_selem_unlink_storage_nolock(
 			local_storage, selem, true);
-	raw_spin_unlock_bh(&local_storage->lock);
+	raw_spin_unlock_irqrestore(&local_storage->lock, flags);
 
 	if (free_local_storage)
 		kfree_rcu(local_storage, rcu);
@@ -173,6 +174,7 @@ void bpf_selem_link_storage_nolock(struct bpf_local_storage *local_storage,
 
 void bpf_selem_unlink_map(struct bpf_local_storage_elem *selem)
 {
+	unsigned long flags;
 	struct bpf_local_storage_map *smap;
 	struct bpf_local_storage_map_bucket *b;
 
@@ -182,21 +184,22 @@ void bpf_selem_unlink_map(struct bpf_local_storage_elem *selem)
 
 	smap = rcu_dereference(SDATA(selem)->smap);
 	b = select_bucket(smap, selem);
-	raw_spin_lock_bh(&b->lock);
+	raw_spin_lock_irqsave(&b->lock, flags);
 	if (likely(selem_linked_to_map(selem)))
 		hlist_del_init_rcu(&selem->map_node);
-	raw_spin_unlock_bh(&b->lock);
+	raw_spin_unlock_irqrestore(&b->lock, flags);
 }
 
 void bpf_selem_link_map(struct bpf_local_storage_map *smap,
 			struct bpf_local_storage_elem *selem)
 {
+	unsigned long flags;
 	struct bpf_local_storage_map_bucket *b = select_bucket(smap, selem);
 
-	raw_spin_lock_bh(&b->lock);
+	raw_spin_lock_irqsave(&b->lock, flags);
 	RCU_INIT_POINTER(SDATA(selem)->smap, smap);
 	hlist_add_head_rcu(&selem->map_node, &b->list);
-	raw_spin_unlock_bh(&b->lock);
+	raw_spin_unlock_irqrestore(&b->lock, flags);
 }
 
 void bpf_selem_unlink(struct bpf_local_storage_elem *selem)
@@ -232,16 +235,18 @@ bpf_local_storage_lookup(struct bpf_local_storage *local_storage,
 
 	sdata = SDATA(selem);
 	if (cacheit_lockit) {
+		unsigned long flags;
+
 		/* spinlock is needed to avoid racing with the
 		 * parallel delete.  Otherwise, publishing an already
 		 * deleted sdata to the cache will become a use-after-free
 		 * problem in the next bpf_local_storage_lookup().
 		 */
-		raw_spin_lock_bh(&local_storage->lock);
+		raw_spin_lock_irqsave(&local_storage->lock, flags);
 		if (selem_linked_to_storage(selem))
 			rcu_assign_pointer(local_storage->cache[smap->cache_idx],
 					   sdata);
-		raw_spin_unlock_bh(&local_storage->lock);
+		raw_spin_unlock_irqrestore(&local_storage->lock, flags);
 	}
 
 	return sdata;
@@ -331,6 +336,7 @@ struct bpf_local_storage_data *
 bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
 			 void *value, u64 map_flags)
 {
+	unsigned long flags;
 	struct bpf_local_storage_data *old_sdata = NULL;
 	struct bpf_local_storage_elem *selem;
 	struct bpf_local_storage *local_storage;
@@ -381,7 +387,7 @@ bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
 		}
 	}
 
-	raw_spin_lock_bh(&local_storage->lock);
+	raw_spin_lock_irqsave(&local_storage->lock, flags);
 
 	/* Recheck local_storage->list under local_storage->lock */
 	if (unlikely(hlist_empty(&local_storage->list))) {
@@ -435,11 +441,11 @@ bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
 	}
 
 unlock:
-	raw_spin_unlock_bh(&local_storage->lock);
+	raw_spin_unlock_irqrestore(&local_storage->lock, flags);
 	return SDATA(selem);
 
 unlock_err:
-	raw_spin_unlock_bh(&local_storage->lock);
+	raw_spin_unlock_irqrestore(&local_storage->lock, flags);
 	return ERR_PTR(err);
 }
 

@@ -77,13 +77,6 @@ static int bpf_btf_printf_prepare(struct btf_ptr *ptr, u32 btf_ptr_size,
 				  u64 flags, const struct btf **btf,
 				  s32 *btf_id);
 
-struct bpf_run_ctx { };
-
-struct bpf_trace_run_ctx {
-	struct bpf_run_ctx run_ctx;
-	u64 bpf_cookie;
-};
-
 static unsigned int run_trace_prog_array(struct bpf_prog_array __rcu *array,
 					void *ctx)
 {
